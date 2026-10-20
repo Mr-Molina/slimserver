@@ -185,7 +185,7 @@ sub startDaemon { if (!main::ISWINDOWS) {
 
 	my $command = Slim::Utils::OSDetect::getOS->gdresized();
 
-	if ($command =~ /\.pl$/i) {
+	if ($command =~ /\.pl$/i || (-f $command && -T $command)) {
 		if ($Config{'perlpath'} && -x $Config{'perlpath'}) {
 			unshift @daemonArgs, $command;
 			$command  = $Config{'perlpath'};

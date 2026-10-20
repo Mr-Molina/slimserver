@@ -102,6 +102,16 @@ sub scanner {
 }
 
 sub gdresized {
+	if ( $ENV{LMS_USE_RUST} // 1 ) {
+		for my $p (
+			'/usr/share/squeezeboxserver/Bin/aarch64-linux/gdresized',
+			'/usr/share/squeezeboxserver/Bin/x86_64-linux/gdresized',
+			"$Bin/Bin/aarch64-linux/gdresized",
+			"$Bin/Bin/x86_64-linux/gdresized",
+		) {
+			return $p if -x $p;
+		}
+	}
 	return "/usr/sbin/squeezeboxserver-resized";
 }
 

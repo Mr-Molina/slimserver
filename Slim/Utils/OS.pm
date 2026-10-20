@@ -236,8 +236,16 @@ sub scanner {
 
 sub gdresized {
 	if ( $ENV{LMS_USE_RUST} // 1 ) {
-		my $rustBin = "$Bin/Bin/x86_64-linux/gdresized";
-		return $rustBin if -x $rustBin;
+		require Config;
+		my $arch = ($Config::Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+		for my $p (
+			"$Bin/Bin/$arch/gdresized",
+			"/usr/share/squeezeboxserver/Bin/$arch/gdresized",
+			"$Bin/Bin/x86_64-linux/gdresized",
+			"$Bin/Bin/aarch64-linux/gdresized",
+		) {
+			return $p if -x $p;
+		}
 	}
 	return "$Bin/gdresized.pl";
 }

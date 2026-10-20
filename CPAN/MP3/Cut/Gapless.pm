@@ -99,7 +99,19 @@ sub write {
 
 sub _rust_bin {
     return undef unless ($ENV{LMS_USE_RUST} // 1);
-    for my $dir ($FindBin::Bin ? "$FindBin::Bin/Bin/x86_64-linux" : (), '/home/console-admin/Github/slimserver/Bin/x86_64-linux') {
+    require Config;
+    my $arch = ($Config::Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+    for my $dir (
+        $FindBin::Bin ? "$FindBin::Bin/Bin/$arch" : (),
+        "/usr/share/squeezeboxserver/Bin/$arch",
+        "/home/console-admin/Github/slimserver/Bin/$arch",
+        $FindBin::Bin ? "$FindBin::Bin/Bin/x86_64-linux" : (),
+        "/usr/share/squeezeboxserver/Bin/x86_64-linux",
+        "/home/console-admin/Github/slimserver/Bin/x86_64-linux",
+        $FindBin::Bin ? "$FindBin::Bin/Bin/aarch64-linux" : (),
+        "/usr/share/squeezeboxserver/Bin/aarch64-linux",
+        "/home/console-admin/Github/slimserver/Bin/aarch64-linux",
+    ) {
         my $bin = "$dir/lms-mp3cut";
         return $bin if -x $bin;
     }

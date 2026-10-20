@@ -33,8 +33,17 @@ Returns an array with the resized image data as a scalar ref, and the image form
 
 sub rust_gdresized_bin {
 	return undef unless ($ENV{LMS_USE_RUST} // 1);
-	my $bin = "$FindBin::Bin/Bin/x86_64-linux/gdresized";
-	return -x $bin ? $bin : undef;
+	require Config;
+	my $arch = ($Config::Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+	for my $p (
+		"$FindBin::Bin/Bin/$arch/gdresized",
+		"/usr/share/squeezeboxserver/Bin/$arch/gdresized",
+		"$FindBin::Bin/Bin/x86_64-linux/gdresized",
+		"$FindBin::Bin/Bin/aarch64-linux/gdresized",
+	) {
+		return $p if -x $p;
+	}
+	return undef;
 }
 
 sub resize {

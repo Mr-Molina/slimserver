@@ -12,8 +12,16 @@ use DBI;
 use constant RESIZER => 1;
 use Test::More tests => 9;
 
+use Config;
+
 my $root = "$Bin/..";
-my $bin_dir = "$root/Bin/x86_64-linux";
+my $arch = ($Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+my $bin_dir = "$root/Bin/$arch";
+if ( !-d $bin_dir && -d "/usr/share/squeezeboxserver/Bin/$arch" ) {
+    $bin_dir = "/usr/share/squeezeboxserver/Bin/$arch";
+}
+
+my $html_root = -d "$root/HTML" ? "$root/HTML" : "/usr/share/squeezeboxserver/HTML";
 
 ok( -x "$bin_dir/gdresized",         "gdresized Rust binary exists and is executable" );
 ok( -x "$bin_dir/lms-transcode",     "lms-transcode Rust binary exists and is executable" );
@@ -37,9 +45,11 @@ for ( 1 .. 50 ) {
 
 require Image::Scale;
 require Slim::Utils::GDResizer;
-my $img_path = -f "$root/HTML/EN/html/images/b_delete.gif"
-    ? "$root/HTML/EN/html/images/b_delete.gif"
-    : "$root/HTML/Classic/html/images/b_delete.gif";
+my $img_path = -f "$html_root/EN/html/images/b_delete.gif"
+    ? "$html_root/EN/html/images/b_delete.gif"
+    : (-f "$html_root/Classic/html/images/b_delete.gif"
+        ? "$html_root/Classic/html/images/b_delete.gif"
+        : "/usr/share/squeezeboxserver/HTML/Classic/html/images/b_delete.gif");
 my ($src_ref, undef) = Slim::Utils::GDResizer->resize(
     file   => $img_path,
     width  => 40,
