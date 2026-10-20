@@ -14,4 +14,5 @@ thiserror = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+image = { workspace = true }
 tempfile = { workspace = true }

@@ -114,6 +114,15 @@ sub find {
 	}
 }
 
+sub rustScannerAccelBin {
+	return undef unless ($ENV{LMS_USE_RUST} // 1);
+	for my $dir ($FindBin::Bin ? "$FindBin::Bin/Bin/x86_64-linux" : (), '/home/console-admin/Github/slimserver/Bin/x86_64-linux') {
+		my $bin = "$dir/lms-scanner-accel";
+		return $bin if -x $bin;
+	}
+	return undef;
+}
+
 sub rescan {
 	my ( $class, $paths, $args ) = @_;
 

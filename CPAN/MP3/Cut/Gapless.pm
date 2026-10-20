@@ -6,6 +6,7 @@ our $VERSION = '0.03';
 
 require XSLoader;
 XSLoader::load('MP3::Cut::Gapless', $VERSION);
+BEGIN { *__xs_read = \&read; }
 
 sub new {
     my ( $class, %args ) = @_;
@@ -85,16 +86,46 @@ sub write {
     close $fh;
 }
 
-# read() is implemented in XS
+sub _rust_bin {
+    return undef unless ($ENV{LMS_USE_RUST} // 1);
+    for my $dir ($FindBin::Bin ? "$FindBin::Bin/Bin/x86_64-linux" : (), '/home/console-admin/Github/slimserver/Bin/x86_64-linux') {
+        my $bin = "$dir/lms-mp3cut";
+        return $bin if -x $bin;
+    }
+    return undef;
+}
+
+sub read {
+    my $self = shift;
+    if ( $self->{_rust_fh} ) {
+        my $n = CORE::read( $self->{_rust_fh}, $_[0], $_[1] || 32768 );
+        return $n || 0;
+    }
+    return $self->__xs_read(@_);
+}
 
 sub _init {
     my $self = shift;
-    
+
+    if ( my $bin = _rust_bin() ) {
+        my @cmd = ( $bin, '--file', $self->{file} );
+        push @cmd, ( '--cache-dir', $self->{cache_dir} ) if $self->{cache_dir};
+        push @cmd, ( '--start-ms',  $self->{start_ms} )  if defined $self->{start_ms};
+        push @cmd, ( '--end-ms',    $self->{end_ms} )    if defined $self->{end_ms};
+        if ( !defined $self->{start_ms} && !defined $self->{end_ms} ) {
+            push @cmd, '--index-only';
+            system(@cmd);
+            return;
+        }
+        if ( open my $rfh, '-|', @cmd ) {
+            binmode $rfh;
+            $self->{_rust_fh} = $rfh;
+            return;
+        }
+    }
+
     open $self->{_fh}, '<', $self->{file} || die "Unable to open $self->{file} for reading";
-    
     binmode $self->{_fh};
-    
-    # XS init
     $self->{_mp3c} = $self->__init(@_);
 }
 
@@ -131,9 +162,10 @@ sub _parse_cue {
 
 sub DESTROY {
     my $self = shift;
-    
-    close $self->{_fh};
-    
+
+    close $self->{_rust_fh} if $self->{_rust_fh};
+    close $self->{_fh} if $self->{_fh};
+
     $self->__cleanup( $self->{_mp3c} ) if exists $self->{_mp3c};
 }
 
