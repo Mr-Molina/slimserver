@@ -235,6 +235,10 @@ sub scanner {
 }
 
 sub gdresized {
+	if ( $ENV{LMS_USE_RUST} // 1 ) {
+		my $rustBin = "$Bin/Bin/x86_64-linux/gdresized";
+		return $rustBin if -x $rustBin;
+	}
 	return "$Bin/gdresized.pl";
 }
 

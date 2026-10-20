@@ -2,6 +2,7 @@ package Slim::Utils::GDResizer;
 
 use strict;
 
+use FindBin;
 use Image::Scale;
 
 my $debug;
@@ -29,6 +30,12 @@ Supported args:
 Returns an array with the resized image data as a scalar ref, and the image format.
 
 =cut
+
+sub rust_gdresized_bin {
+	return undef unless ($ENV{LMS_USE_RUST} // 1);
+	my $bin = "$FindBin::Bin/Bin/x86_64-linux/gdresized";
+	return -x $bin ? $bin : undef;
+}
 
 sub resize {
 	my ( $class, %args ) = @_;
