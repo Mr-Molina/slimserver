@@ -10,7 +10,7 @@ use MIME::Base64 qw(encode_base64);
 use Digest::MD5 qw(md5_hex);
 use DBI;
 use constant RESIZER => 1;
-use Test::More tests => 7;
+use Test::More tests => 9;
 
 my $root = "$Bin/..";
 my $bin_dir = "$root/Bin/x86_64-linux";
@@ -79,3 +79,36 @@ $dbh->disconnect();
 my ($ct, $mtime, $pathlen) = unpack( 'A3LS', $blob );
 my $img_data = substr( $blob, 9 + $pathlen );
 is( $ct, 'jpg', "SQLite artwork.db row matches Perl DbCache key and A3LS jpg header" );
+
+# Test 8 & 9: Verify MP3::Cut::Gapless delegation to Rust and C XS fallback
+my $mp3_file = "$tmp/test_gapless.mp3";
+my $frame_data = pack( 'C4', 0xFF, 0xFB, 0x90, 0x64 ) . ( "\0" x ( 417 - 4 ) );
+open my $mp3_fh, '>', $mp3_file or die "Cannot write $mp3_file: $!";
+binmode $mp3_fh;
+print $mp3_fh $frame_data x 2;
+close $mp3_fh;
+
+require MP3::Cut::Gapless;
+
+{
+    local $ENV{LMS_USE_RUST} = 1;
+    my $cut = MP3::Cut::Gapless->new(
+        file      => $mp3_file,
+        cache_dir => "$tmp/cache",
+        start_ms  => 0,
+        end_ms    => 50,
+    );
+    my $n = $cut->read( my $buf, 4096 );
+    ok( $n > 0 && length($buf) > 0, 'MP3::Cut::Gapless->read delegates to Rust lms-mp3cut without SIGSEGV' );
+}
+
+{
+    local $ENV{LMS_USE_RUST} = 0;
+    my $cut_xs = MP3::Cut::Gapless->new(
+        file     => $mp3_file,
+        start_ms => 0,
+        end_ms   => 50,
+    );
+    my $n_xs = $cut_xs->read( my $buf_xs, 4096 );
+    ok( $n_xs > 0 && length($buf_xs) > 0, 'MP3::Cut::Gapless->read falls back cleanly to C XS when LMS_USE_RUST=0' );
+}

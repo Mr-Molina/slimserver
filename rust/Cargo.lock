@@ -411,6 +411,7 @@ dependencies = [
 name = "lms-scanner-accel"
 version = "0.1.0"
 dependencies = [
+ "image",
  "lms-audioscan",
  "lms-cache",
  "lms-image",
@@ -429,6 +430,7 @@ dependencies = [
  "anyhow",
  "rubato",
  "symphonia",
+ "tempfile",
  "thiserror",
 ]
 

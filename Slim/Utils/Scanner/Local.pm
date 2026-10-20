@@ -99,6 +99,23 @@ sub find {
 	elsif ( -d _ ) {
 		# Scan the directory for files
 		if ( $args->{no_async} ) {
+			if ( !$args->{dirs} && $args->{recursive} && ($args->{types} || 'audio') eq 'audio' && IS_SQLITE && (my $accel = rustScannerAccelBin()) ) {
+				my $dbname_str = eval { Slim::Schema->dbh->{Name} } || '';
+				if ( $dbname_str =~ /dbname=([^;]+)/ ) {
+					my $dbfile = $1;
+					if ( -f $dbfile ) {
+						if ( open my $afh, '-|', $accel, 'scan-dir', '--db', $dbfile, '--dir', $path ) {
+							my $out = do { local $/; <$afh> };
+							my ($count) = $out =~ /(\d+)/;
+							if ( close($afh) && defined $count && $count =~ /^\d+$/ ) {
+								$cb->(int($count), []);
+								return;
+							}
+						}
+					}
+				}
+			}
+
 			# Force the use of the async find class if not in async mode
 			# (it can run it a tight loop, AIO can't)
 			require Slim::Utils::Scanner::Local::Async;

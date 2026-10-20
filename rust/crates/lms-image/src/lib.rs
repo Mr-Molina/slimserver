@@ -505,7 +505,7 @@ pub fn gdresize_to_cache(
             });
         }
 
-        series.sort_by_key(|a| std::cmp::Reverse(a.width));
+        series.sort_by_key(|a| std::cmp::Reverse((a.width, a.height)));
 
         let mut current_bytes = src_bytes;
         let mut first_result: Option<(Vec<u8>, ImageFormat)> = None;

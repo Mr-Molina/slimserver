@@ -6,7 +6,11 @@ our $VERSION = '0.03';
 
 require XSLoader;
 XSLoader::load('MP3::Cut::Gapless', $VERSION);
-BEGIN { *__xs_read = \&read; }
+{
+    no warnings 'redefine';
+    *__xs_read = \&read;
+    *read = \&_perl_read;
+}
 
 sub new {
     my ( $class, %args ) = @_;
@@ -69,13 +73,20 @@ sub write {
     }
     
     # Reset XS counter for read()
-    $self->__reset_read();
+    $self->__reset_read() if exists $self->{_mp3c};
     
     delete $self->{start_ms};
     delete $self->{end_ms};
     
     $self->{start_ms} = $track->{start_ms};
     $self->{end_ms}   = $track->{end_ms} if $track->{end_ms};
+
+    if ( !exists $self->{_mp3c} ) {
+        if ( $self->{_rust_fh} ) {
+            close delete $self->{_rust_fh};
+        }
+        $self->_init;
+    }
     
     print "Writing $filename...\n";
     
@@ -95,7 +106,7 @@ sub _rust_bin {
     return undef;
 }
 
-sub read {
+sub _perl_read {
     my $self = shift;
     if ( $self->{_rust_fh} ) {
         my $n = CORE::read( $self->{_rust_fh}, $_[0], $_[1] || 32768 );

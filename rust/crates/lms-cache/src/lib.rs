@@ -123,6 +123,7 @@ impl DbArtworkStore {
         let db_filename = if is_imageproxy { "imgproxy.db" } else { "artwork.db" };
         let db_path = cache_root.join(db_filename);
         let conn = rusqlite::Connection::open(db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         conn.execute_batch(
             "PRAGMA locking_mode = NORMAL;
@@ -264,6 +265,17 @@ mod tests {
         store_proxy.set("proxy/test_key", &rec_proxy).unwrap();
         let loaded_proxy = store_proxy.get("proxy/test_key").unwrap().unwrap();
         assert_eq!(loaded_proxy, rec_proxy);
+
+        // Verify expired entry returns Ok(None)
+        let conn_direct = rusqlite::Connection::open(dir.path().join("imgproxy.db")).unwrap();
+        conn_direct
+            .execute(
+                "UPDATE cache SET t = 1 WHERE k = ?1",
+                rusqlite::params![md5_key_i64("proxy/test_key")],
+            )
+            .unwrap();
+        drop(conn_direct);
+        assert_eq!(store_proxy.get("proxy/test_key").unwrap(), None);
     }
 
     #[test]

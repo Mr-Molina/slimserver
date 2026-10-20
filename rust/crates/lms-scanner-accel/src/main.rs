@@ -18,21 +18,46 @@ pub enum AccelError {
     Arg(String),
 }
 
-fn path_to_file_url(path: &Path) -> String {
-    let p_str = path.to_string_lossy();
-    if p_str.starts_with("file://") {
-        p_str.into_owned()
-    } else if p_str.starts_with('/') {
-        format!("file://{}", p_str)
-    } else if let Ok(abs) = std::fs::canonicalize(path) {
-        let abs_str = abs.to_string_lossy();
-        if abs_str.starts_with('/') {
-            format!("file://{}", abs_str)
+fn percent_encode_path(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        if b == b'/'
+            || b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\''
+                    | b'(' | b')' | b':' | b'@' | b'&' | b'='
+                    | b'+' | b'$' | b',' | b'[' | b']'
+            )
+        {
+            out.push(b as char);
         } else {
-            format!("file:///{}", abs_str)
+            use std::fmt::Write;
+            let _ = write!(out, "%{:02X}", b);
         }
+    }
+    out
+}
+
+fn path_to_file_url(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let canon_buf = if path.is_absolute() {
+        None
     } else {
-        format!("file:///{}", p_str)
+        std::fs::canonicalize(path).ok()
+    };
+    let effective_path = canon_buf.as_deref().unwrap_or(path);
+    let target_bytes = effective_path.as_os_str().as_bytes();
+    let stripped = if target_bytes.starts_with(b"file://") {
+        &target_bytes[7..]
+    } else {
+        target_bytes
+    };
+    let encoded = percent_encode_path(stripped);
+    if encoded.starts_with('/') {
+        format!("file://{}", encoded)
+    } else {
+        format!("file:///{}", encoded)
     }
 }
 
@@ -270,13 +295,24 @@ mod tests {
         let music_dir = dir.path().join("music");
         std::fs::create_dir_all(&music_dir).unwrap();
         std::fs::write(music_dir.join("song1.mp3"), vec![0u8; 1024]).unwrap();
+        std::fs::write(music_dir.join("track 03.mp3"), vec![0u8; 2048]).unwrap();
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute("CREATE TABLE scanned_files (url text COLLATE NOCASE, timestamp int(10), filesize int(10))", []).unwrap();
         drop(conn);
 
         let count = populate_scanned_files(&db_path, &music_dir).unwrap();
-        assert!(count >= 2);
+        assert!(count >= 3);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT url FROM scanned_files WHERE url LIKE '%track%2003.mp3'")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        assert!(
+            rows.next().unwrap().is_some(),
+            "scanned_files.url must contain percent-encoded track%2003.mp3"
+        );
     }
 
     #[test]
