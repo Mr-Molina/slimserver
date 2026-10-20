@@ -185,14 +185,16 @@ sub startDaemon { if (!main::ISWINDOWS) {
 
 	my $command = Slim::Utils::OSDetect::getOS->gdresized();
 
-	if ($Config{'perlpath'} && -x $Config{'perlpath'}) {
-		unshift @daemonArgs, $command;
-		$command  = $Config{'perlpath'};
-	}
-	# pick up our custom Perl build if in use
-	elsif (main::ISMAC && -x $^X && $^X !~ m|/usr/bin/perl|) {
-		unshift @daemonArgs, $command;
-		$command = $^X;
+	if ($command =~ /\.pl$/i) {
+		if ($Config{'perlpath'} && -x $Config{'perlpath'}) {
+			unshift @daemonArgs, $command;
+			$command  = $Config{'perlpath'};
+		}
+		# pick up our custom Perl build if in use
+		elsif (main::ISMAC && -x $^X && $^X !~ m|/usr/bin/perl|) {
+			unshift @daemonArgs, $command;
+			$command = $^X;
+		}
 	}
 
 	eval {
