@@ -1,0 +1,18 @@
+[package]
+name = "lms-gdresized"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gdresized"
+path = "src/main.rs"
+
+[dependencies]
+base64 = { workspace = true }
+image = { workspace = true }
+lms-cache = { path = "../lms-cache" }
+lms-image = { path = "../lms-image" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

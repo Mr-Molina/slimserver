@@ -1,0 +1,13 @@
+[package]
+name = "lms-image"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { workspace = true }
+lofty = { workspace = true }
+lms-cache = { path = "../lms-cache" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

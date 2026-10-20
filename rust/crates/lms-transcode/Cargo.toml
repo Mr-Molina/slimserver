@@ -1,0 +1,10 @@
+[package]
+name = "lms-transcode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+rubato = { workspace = true }
+symphonia = { workspace = true }
+thiserror = { workspace = true }

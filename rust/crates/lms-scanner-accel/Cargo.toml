@@ -1,0 +1,17 @@
+[package]
+name = "lms-scanner-accel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lms-audioscan = { path = "../lms-audioscan" }
+lms-cache = { path = "../lms-cache" }
+lms-image = { path = "../lms-image" }
+lms-mp3cut = { path = "../lms-mp3cut" }
+rayon = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

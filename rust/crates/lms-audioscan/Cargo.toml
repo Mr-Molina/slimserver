@@ -1,0 +1,22 @@
+[package]
+name = "lms-audioscan"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "lms-audioscan"
+path = "src/main.rs"
+
+[dependencies]
+base64 = { workspace = true }
+lofty = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+symphonia = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

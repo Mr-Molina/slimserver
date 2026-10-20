@@ -1,0 +1,12 @@
+[package]
+name = "lms-cache"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+md-5 = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
