@@ -6,10 +6,15 @@ use lms_audioscan::{find_frame_offset, scan_file};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: lms-audioscan <subcommand> [args...]");
-        eprintln!("Subcommands: scan <path>, scan-tags <path>, find-frame <format> <path> <offset_or_ms>");
-        std::process::exit(1);
+    if args.len() < 2 || args[1..].iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+        println!("Usage: lms-audioscan <subcommand> [args...]");
+        println!("Subcommands: scan <path>, scan-tags <path>, find-frame <format> <path> <offset_or_ms>");
+        println!("Options: -h, --help  Display this help message");
+        if args.len() < 2 {
+            std::process::exit(1);
+        } else {
+            return;
+        }
     }
 
     let no_artwork = env::var("AUDIO_SCAN_NO_ARTWORK")

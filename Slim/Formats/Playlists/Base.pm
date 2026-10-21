@@ -52,6 +52,10 @@ sub _updateMetaData {
 	}
 
 	if ( !defined $track ) {
+		if ( Slim::Music::Info::isFileURL($entry) && scalar grep { $_ } @{ Slim::Utils::Misc::getAudioDirs() } ) {
+			return undef unless Slim::Utils::Misc::inMediaFolder($entry, 'audio') || Slim::Utils::Misc::inPlaylistFolder($entry);
+		}
+
 		$track = Slim::Schema->updateOrCreate( {
 			'url'        => $entry,
 			'attributes' => $attributes,

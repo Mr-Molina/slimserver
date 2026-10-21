@@ -4,13 +4,29 @@ use warnings;
 
 use FindBin qw($Bin);
 use lib "$Bin/..";
+use lib "$Bin/../lib";
 use File::Temp qw(tempdir);
 use IO::Socket::UNIX;
 use MIME::Base64 qw(encode_base64);
 use Digest::MD5 qw(md5_hex);
 use DBI;
-use constant RESIZER => 1;
-use Test::More tests => 9;
+use constant {
+    SCANNER         => 0,
+    RESIZER         => 1,
+    ISWINDOWS       => ( $^O =~ /^m?s?win/i ) ? 1 : 0,
+    ISMAC           => ( $^O =~ /darwin/i ) ? 1 : 0,
+    TRANSCODING     => 1,
+    PERFMON         => 0,
+    DEBUGLOG        => 0,
+    INFOLOG         => 0,
+    STATISTICS      => 1,
+    SB1SLIMP3SYNC   => 1,
+    WEBUI           => 1,
+    NOMYSB          => 1,
+    LOCALFILE       => 0,
+    NOBROWSECACHE   => 0,
+};
+use Test::More tests => 12;
 
 use Config;
 
@@ -122,3 +138,32 @@ require MP3::Cut::Gapless;
     my $n_xs = $cut_xs->read( my $buf_xs, 4096 );
     ok( $n_xs > 0 && length($buf_xs) > 0, 'MP3::Cut::Gapless->read falls back cleanly to C XS when LMS_USE_RUST=0' );
 }
+
+# Test 10: Verify all 5 Rust release binaries exit 0 on --help without blocking
+my @binaries = qw(gdresized lms-transcode lms-mp3cut lms-audioscan lms-scanner-accel);
+my $help_pass = 1;
+for my $b (@binaries) {
+    my $exit = system("$bin_dir/$b --help >/dev/null 2>&1");
+    if ($exit != 0) {
+        $help_pass = 0;
+        diag("$b --help exited with $exit");
+    }
+}
+ok( $help_pass, 'All 5 Rust release binaries exit 0 on --help without blocking' );
+
+# Test 11: Slim::Formats::Movie unwraps arrayref YEAR => ['1987', '1987'] to 1987 (Issue #1692)
+require Slim::bootstrap;
+require Slim::Utils::OSDetect;
+Slim::Utils::OSDetect::init();
+Slim::bootstrap->loadModules();
+require Slim::Formats::Movie;
+
+my $movie_tags = { DAY => [ '1987', '1987' ] };
+Slim::Formats::Movie->_doTagMapping($movie_tags);
+is( $movie_tags->{YEAR}, '1987', 'Slim::Formats::Movie unwraps arrayref YEAR to 1987 (Issue #1692)' );
+
+# Test 12: Slim::Formats::MP3::doTagMapping prioritizes TDRC over TDOR and preserves ORIGINALYEAR (Issue #1650)
+require Slim::Formats::MP3;
+my $mp3_tags = { TDRC => '2000', TDOR => '1966' };
+Slim::Formats::MP3->doTagMapping($mp3_tags);
+ok( $mp3_tags->{YEAR} eq '2000' && $mp3_tags->{ORIGINALYEAR} eq '1966', 'Slim::Formats::MP3::doTagMapping prioritizes TDRC over TDOR while preserving ORIGINALYEAR (Issue #1650)' );

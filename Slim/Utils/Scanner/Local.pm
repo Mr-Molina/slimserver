@@ -81,10 +81,13 @@ sub find {
 				(?, ?, ?)
 			} );
 
+			my @stat = stat $path;
+			my $mtime = $stat[9] || 0;
+			my $size  = $stat[7] || 0;
 			$sth->execute(
 				$file,
-				(stat _)[9], # mtime
-				(stat _)[7], # size
+				$mtime, # mtime
+				$size,  # size
 			);
 
 			# Callback that we found 1 file
@@ -765,6 +768,9 @@ sub deleted {
 					WHERE track = ?
 				} );
 				$sth->execute( $trackId );
+
+				my $psth = $dbh->prepare_cached('DELETE FROM playlist_track WHERE track = ?');
+				$psth->execute($url);
 
 				$sth = $dbh->prepare_cached( qq{
 					DELETE FROM tracks

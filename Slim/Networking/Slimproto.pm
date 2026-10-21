@@ -152,6 +152,7 @@ sub slimproto_accept {
 
 	# Use the Socket variables this way to silence a warning on perl 5.6
 	setsockopt ($clientsock, Socket::IPPROTO_TCP(), Socket::TCP_NODELAY(), 1);
+	setsockopt ($clientsock, Socket::SOL_SOCKET(), Socket::SO_KEEPALIVE(), 1);
 
 	my $peer;
 

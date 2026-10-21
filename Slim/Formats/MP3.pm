@@ -406,7 +406,8 @@ sub doTagMapping {
 	# prefer release date over recording time etc.
 	if (!$tags->{YEAR}) {
 		my $year;
-		foreach ( qw(TDOR XDOR TDRC TYER TDAT) ) {
+		$tags->{ORIGINALYEAR} ||= $tags->{TDOR} || $tags->{XDOR};
+		foreach ( qw(TDRC TYER TDOR XDOR TDAT) ) {
 			$year ||= $tags->{$_};
 			delete $tags->{$_};
 		}

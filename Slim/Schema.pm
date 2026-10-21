@@ -1503,9 +1503,11 @@ sub _createComments {
 }
 
 sub _createWork {
-	my ($self, $work, $workSort, $composerID, $create) = @_;
+	my ($self, $work, $workSort, $composerOrList, $create) = @_;
 
-	if ( $work && $composerID ) {
+	my @composerIDs = ref $composerOrList eq 'ARRAY' ? @$composerOrList : ($composerOrList ? ($composerOrList) : ());
+
+	if ( $work && @composerIDs ) {
 
 		# MusicBrainz (or users!) may create multiple WORK tags, which we get as an array. Flatten it.
 		if (ref $work eq 'ARRAY') {
@@ -1518,13 +1520,25 @@ sub _createWork {
 		$titlesort =~ s/(\d+)/sprintf"%04d",$1/eg unless $workSort; #Use the WORKSORT tag as is if provided, otherwise zero-pad numbers.
 		my $titlesearch = Slim::Utils::Text::ignoreCase($work, 1);
 
+		my $workID;
 		my $sth = $dbh->prepare_cached('SELECT id FROM works WHERE titlesearch = ? AND composer = ?');
-		$sth->execute($titlesearch, $composerID);
-		my ($workID) = $sth->fetchrow_array;
-		$sth->finish;
+		for my $cid (@composerIDs) {
+			$sth->execute($titlesearch, $cid);
+			($workID) = $sth->fetchrow_array;
+			$sth->finish;
+			last if $workID;
+		}
+
+		if ( !$workID && $lastAlbum && $lastAlbum->{id} ) {
+			my $sth_album = $dbh->prepare_cached('SELECT works.id FROM works JOIN tracks ON tracks.work = works.id WHERE works.titlesearch = ? AND tracks.album = ? LIMIT 1');
+			$sth_album->execute($titlesearch, $lastAlbum->{id});
+			($workID) = $sth_album->fetchrow_array;
+			$sth_album->finish;
+		}
 
 		if ( !$workID ) {
 
+			my $primaryComposer = $composerIDs[0];
 			my $sth_insert = $dbh->prepare_cached( qq{
 				INSERT INTO works
 				(composer, title, titlesort, titlesearch)
@@ -1532,7 +1546,7 @@ sub _createWork {
 				(?, ?, ?, ?)
 			} );
 
-			$sth_insert->execute( $composerID, $work, $titlesort, $titlesearch );
+			$sth_insert->execute( $primaryComposer, $work, $titlesort, $titlesearch );
 
 			main::DEBUGLOG && $log->is_debug && $log->debug("-- Inserted work '$work'");
 
@@ -1802,7 +1816,7 @@ sub _newTrack {
 	### Create Work rows
 	my $workID;
 	if ( _workRequired($deferredAttributes->{'GENRE'}) ) {
-		$workID = $self->_createWork($deferredAttributes->{'WORK'}, $deferredAttributes->{'WORKSORT'}, $contributors->{'COMPOSER'}->[0], 1);
+		$workID = $self->_createWork($deferredAttributes->{'WORK'}, $deferredAttributes->{'WORKSORT'}, $contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'}, 1);
 	}
 
 	### Find artwork column values for the Track
@@ -3070,7 +3084,7 @@ sub _postCheckAttributes {
 	#Work
 	if (defined $attributes->{'WORK'}) {
 		if ( _workRequired($attributes->{'GENRE'}) ) {
-			my $workID = $self->_createWork($attributes->{'WORK'}, $attributes->{'WORKSORT'}, $contributors->{'COMPOSER'}->[0], 1);
+			my $workID = $self->_createWork($attributes->{'WORK'}, $attributes->{'WORKSORT'}, $contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'}, 1);
 			if ($workID) {
 				$track->work($workID);
 			}

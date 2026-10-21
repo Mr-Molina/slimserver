@@ -344,7 +344,11 @@ sub albumsQuery {
 				unshift @{$w}, "albums.id = albumsSearch.id";
 
 				if ($tags ne 'CC') {
-					$order_by = $sort = "albumsSearch.fulltextweight DESC, LENGTH(albums.titlesearch)";
+					if (defined $sort && $sort ne 'album') {
+						$order_by = "albumsSearch.fulltextweight DESC, $sort";
+					} else {
+						$order_by = $sort = "albumsSearch.fulltextweight DESC, albums.titlesort";
+					}
 				}
 			}
 			else {

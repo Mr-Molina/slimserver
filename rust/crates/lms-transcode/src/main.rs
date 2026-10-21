@@ -1250,6 +1250,14 @@ fn run(argv0: &str, args: &[String]) -> Result<(), TranscodeError> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1..].iter().any(|a| a == "--help" || a == "-h") {
+        println!("Usage: lms-transcode [options] <input> [output]");
+        println!("Options:");
+        println!("  -s, -ss <offset>   Start time offset in seconds or mm:ss");
+        println!("  -u <offset>        End time offset in seconds or mm:ss");
+        println!("  -h, --help         Display this help message");
+        return;
+    }
     let argv0 = args.first().map(|s| s.as_str()).unwrap_or("lms-transcode");
     let cli_args = if args.len() > 1 { &args[1..] } else { &[] };
 

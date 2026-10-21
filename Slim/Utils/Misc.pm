@@ -770,8 +770,8 @@ sub getDirsPref {
 =cut
 
 sub inMediaFolder {
-	my $path = shift;
-	my $mediadirs = getMediaDirs();
+	my ($path, $type) = @_;
+	my $mediadirs = getMediaDirs($type);
 
 	foreach ( @$mediadirs ) {
 		return 1 if _checkInFolder($path, $_);

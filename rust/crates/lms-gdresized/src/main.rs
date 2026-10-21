@@ -216,7 +216,21 @@ pub fn run_server_n_requests(
 }
 
 fn main() {
-    let opts = parse_cli_args(std::env::args());
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() > 1 && raw_args[1..].iter().any(|a| a == "--help" || a == "-h") {
+        println!("Usage: gdresized [options]");
+        println!("Options:");
+        println!("  --socket <path>       UNIX domain socket path (default: /tmp/sbs_artwork)");
+        println!("  --faster              Use faster resizing algorithm");
+        println!("  --max-requests <num>  Exit after processing num requests");
+        println!("  --cli-resize          One-shot CLI resize mode");
+        println!("  --spec <spec>         Resize specification");
+        println!("  --file <path>         Input image file");
+        println!("  --stdin               Read input image from stdin");
+        println!("  -h, --help            Display this help message");
+        return;
+    }
+    let opts = parse_cli_args(raw_args);
 
     if opts.cli_resize {
         let spec = opts.spec.as_deref().unwrap_or("XxX");
