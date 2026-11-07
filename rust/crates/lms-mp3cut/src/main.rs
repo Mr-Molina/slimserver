@@ -111,13 +111,17 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        let mut cutter = match GaplessCutStream::open(Path::new(&file_path), cache_ref, start_ms, end_ms) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Error opening MP3 cut stream for {}: {e}", file_path.display());
-                return ExitCode::FAILURE;
-            }
-        };
+        let mut cutter =
+            match GaplessCutStream::open(Path::new(&file_path), cache_ref, start_ms, end_ms) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "Error opening MP3 cut stream for {}: {e}",
+                        file_path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
 
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();

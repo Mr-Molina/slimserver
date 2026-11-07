@@ -4,7 +4,7 @@ fn write_id3v2_mp3_with_apic(path: &std::path::Path, title: &str, artist: &str, 
     use lofty::config::WriteOptions;
     use lofty::id3::v2::Id3v2Tag;
     use lofty::picture::{MimeType, Picture, PictureType};
-    use lofty::prelude::*;
+    use lofty::tag::{Accessor, TagExt};
 
     let mut frame = vec![0u8; 417];
     frame[0] = 0xFF;

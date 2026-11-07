@@ -12,6 +12,7 @@ use strict;
 
 use Fcntl qw(SEEK_CUR);
 use Time::HiRes;
+use Scalar::Util;
 
 use Slim::Formats;
 use Slim::Formats::Playlists;
@@ -339,12 +340,15 @@ sub _readNextChunk {
 						# addRead because it will re-place itself in the select() loop, but it's not very elegant.
 						# The advice for future readers is to NOT use EWOULDBLOCK in your ProtocolHandler's sysread()
 						# use EINTR instead which is a bit slower but totally safe.
-						Slim::Networking::Select::addRead(${*$fd}{'pipeline_reader'} || $fd, sub {_wakeupOnReadable(shift, $client);}, 1);
+						my $weakClient = $client;
+						Scalar::Util::weaken($weakClient);
+
+						Slim::Networking::Select::addRead(${*$fd}{'pipeline_reader'} || $fd, sub { _wakeupOnReadable(shift, $weakClient) if $weakClient; }, 1);
 
 						# If this pipeline's input is full, also wake up when it drains. Until the pipeline
 						# produces its first output, the reader above cannot become readable.
 						if (${*$fd}{'pipeline_pending_size'} && defined ${*$fd}{'pipeline_writer'}) {
-							Slim::Networking::Select::addWrite(${*$fd}{'pipeline_writer'}, sub {_wakeupOnWritable(shift, $client);}, 1);
+							Slim::Networking::Select::addWrite(${*$fd}{'pipeline_writer'}, sub { _wakeupOnWritable(shift, $weakClient) if $weakClient; }, 1);
 						}
 					}
 					return undef;

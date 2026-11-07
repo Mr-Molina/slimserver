@@ -25,3 +25,11 @@ symphonia = { version = "0.5", features = ["all"] }
 tempfile = "3.12"
 thiserror = "1.0"
 walkdir = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+

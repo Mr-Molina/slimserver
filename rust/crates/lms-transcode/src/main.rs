@@ -73,42 +73,49 @@ pub fn parse_time_offset(val: &str) -> Result<f64, TranscodeError> {
     let parts: Vec<&str> = s.split(':').collect();
     match parts.len() {
         1 => {
-            let sec = parts[0]
-                .parse::<f64>()
-                .map_err(|e| TranscodeError::Parse(format!("invalid seconds '{}': {}", parts[0], e)))?;
+            let sec = parts[0].parse::<f64>().map_err(|e| {
+                TranscodeError::Parse(format!("invalid seconds '{}': {}", parts[0], e))
+            })?;
             if sec < 0.0 {
                 return Err(TranscodeError::Parse("seconds cannot be negative".into()));
             }
             Ok(sec)
         }
         2 => {
-            let m = parts[0]
-                .parse::<f64>()
-                .map_err(|e| TranscodeError::Parse(format!("invalid minutes '{}': {}", parts[0], e)))?;
-            let sec = parts[1]
-                .parse::<f64>()
-                .map_err(|e| TranscodeError::Parse(format!("invalid seconds '{}': {}", parts[1], e)))?;
+            let m = parts[0].parse::<f64>().map_err(|e| {
+                TranscodeError::Parse(format!("invalid minutes '{}': {}", parts[0], e))
+            })?;
+            let sec = parts[1].parse::<f64>().map_err(|e| {
+                TranscodeError::Parse(format!("invalid seconds '{}': {}", parts[1], e))
+            })?;
             if m < 0.0 || sec < 0.0 {
-                return Err(TranscodeError::Parse("time offset components cannot be negative".into()));
+                return Err(TranscodeError::Parse(
+                    "time offset components cannot be negative".into(),
+                ));
             }
             Ok(m * 60.0 + sec)
         }
         3 => {
-            let h = parts[0]
-                .parse::<f64>()
-                .map_err(|e| TranscodeError::Parse(format!("invalid hours '{}': {}", parts[0], e)))?;
-            let m = parts[1]
-                .parse::<f64>()
-                .map_err(|e| TranscodeError::Parse(format!("invalid minutes '{}': {}", parts[1], e)))?;
-            let sec = parts[2]
-                .parse::<f64>()
-                .map_err(|e| TranscodeError::Parse(format!("invalid seconds '{}': {}", parts[2], e)))?;
+            let h = parts[0].parse::<f64>().map_err(|e| {
+                TranscodeError::Parse(format!("invalid hours '{}': {}", parts[0], e))
+            })?;
+            let m = parts[1].parse::<f64>().map_err(|e| {
+                TranscodeError::Parse(format!("invalid minutes '{}': {}", parts[1], e))
+            })?;
+            let sec = parts[2].parse::<f64>().map_err(|e| {
+                TranscodeError::Parse(format!("invalid seconds '{}': {}", parts[2], e))
+            })?;
             if h < 0.0 || m < 0.0 || sec < 0.0 {
-                return Err(TranscodeError::Parse("time offset components cannot be negative".into()));
+                return Err(TranscodeError::Parse(
+                    "time offset components cannot be negative".into(),
+                ));
             }
             Ok(h * 3600.0 + m * 60.0 + sec)
         }
-        _ => Err(TranscodeError::Parse(format!("unrecognized time format '{}'", s))),
+        _ => Err(TranscodeError::Parse(format!(
+            "unrecognized time format '{}'",
+            s
+        ))),
     }
 }
 
@@ -167,7 +174,10 @@ pub fn parse_cli_invocation(argv0: &str, args: &[String]) -> Result<TranscodeJob
         "flac" => parse_flac(&filtered_args),
         "wvunpack" => parse_wvunpack(&filtered_args),
         "sox" => parse_sox(&filtered_args),
-        other => Err(TranscodeError::Parse(format!("unrecognized transcoder mode '{}'", other))),
+        other => Err(TranscodeError::Parse(format!(
+            "unrecognized transcoder mode '{}'",
+            other
+        ))),
     }
 }
 
@@ -809,8 +819,9 @@ impl<'a, W: Write> ContainerWriter<'a, W> {
     ) -> Result<(), TranscodeError> {
         match self.format {
             OutputContainer::RawPcmLe | OutputContainer::Wav => {
-                let mut buf =
-                    Vec::with_capacity(num_frames * self.channels as usize * (self.bps as usize / 8));
+                let mut buf = Vec::with_capacity(
+                    num_frames * self.channels as usize * (self.bps as usize / 8),
+                );
                 for f in 0..num_frames {
                     for ch_samples in samples_planar.iter().take(self.channels as usize) {
                         let s = ch_samples[f];
@@ -829,8 +840,9 @@ impl<'a, W: Write> ContainerWriter<'a, W> {
                 self.out.write_all(&buf)?;
             }
             OutputContainer::RawPcmBe => {
-                let mut buf =
-                    Vec::with_capacity(num_frames * self.channels as usize * (self.bps as usize / 8));
+                let mut buf = Vec::with_capacity(
+                    num_frames * self.channels as usize * (self.bps as usize / 8),
+                );
                 for f in 0..num_frames {
                     for ch_samples in samples_planar.iter().take(self.channels as usize) {
                         let s = ch_samples[f];
@@ -849,7 +861,11 @@ impl<'a, W: Write> ContainerWriter<'a, W> {
                 self.out.write_all(&buf)?;
             }
             OutputContainer::Flac => {
-                for (ch, ch_samples) in samples_planar.iter().enumerate().take(self.channels as usize) {
+                for (ch, ch_samples) in samples_planar
+                    .iter()
+                    .enumerate()
+                    .take(self.channels as usize)
+                {
                     self.flac_pending[ch].extend_from_slice(&ch_samples[..num_frames]);
                 }
                 while self.flac_pending[0].len() >= 4096 {
@@ -905,7 +921,13 @@ pub fn execute_transcode<R: Read + Seek + Send + Sync + 'static, W: Write>(
             .unwrap_or(2);
         let codec_params = track.codec_params.clone();
         let n_frames = track.codec_params.n_frames;
-        (track_id, src_sample_rate, src_channels, codec_params, n_frames)
+        (
+            track_id,
+            src_sample_rate,
+            src_channels,
+            codec_params,
+            n_frames,
+        )
     };
 
     let out_channels = job.target_channels.unwrap_or(src_channels);
@@ -989,7 +1011,7 @@ pub fn execute_transcode<R: Read + Seek + Send + Sync + 'static, W: Write>(
             FastFixedIn::<f32>::new(
                 ratio,
                 1.0,
-                PolynomialDegree::Linear,
+                PolynomialDegree::Cubic,
                 resample_chunk_size,
                 out_channels as usize,
             )
@@ -1228,18 +1250,40 @@ fn convert_f32_to_int(planar: &[Vec<f32>], bps: u16) -> Vec<Vec<i32>> {
     out
 }
 
+fn is_broken_pipe(err: &TranscodeError) -> bool {
+    let mut curr: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = curr {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+                return true;
+            }
+        }
+        curr = e.source();
+    }
+    match err {
+        TranscodeError::Io(io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => true,
+        TranscodeError::Symphonia(symphonia::core::errors::Error::IoError(io_err))
+            if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 fn run(argv0: &str, args: &[String]) -> Result<(), TranscodeError> {
     let job = parse_cli_invocation(argv0, args)?;
     let stdout = std::io::stdout();
-    let mut out_handle = std::io::BufWriter::new(stdout.lock());
+    let mut out_handle = std::io::BufWriter::with_capacity(65536, stdout.lock());
 
     if let Some(ref path) = job.input_path {
         let file = std::fs::File::open(path)?;
         execute_transcode(&job, file, &mut out_handle)?;
     } else {
-        let mut stdin = std::io::stdin();
+        let stdin = std::io::stdin();
         let mut temp = tempfile::tempfile()?;
-        std::io::copy(&mut stdin, &mut temp)?;
+        let mut limited_stdin = stdin.take(2 * 1024 * 1024 * 1024);
+        std::io::copy(&mut limited_stdin, &mut temp)?;
         temp.rewind()?;
         execute_transcode(&job, temp, &mut out_handle)?;
     }
@@ -1248,7 +1292,7 @@ fn run(argv0: &str, args: &[String]) -> Result<(), TranscodeError> {
     Ok(())
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1..].iter().any(|a| a == "--help" || a == "-h") {
         println!("Usage: lms-transcode [options] <input> [output]");
@@ -1256,15 +1300,19 @@ fn main() {
         println!("  -s, -ss <offset>   Start time offset in seconds or mm:ss");
         println!("  -u <offset>        End time offset in seconds or mm:ss");
         println!("  -h, --help         Display this help message");
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
     let argv0 = args.first().map(|s| s.as_str()).unwrap_or("lms-transcode");
     let cli_args = if args.len() > 1 { &args[1..] } else { &[] };
 
     if let Err(e) = run(argv0, cli_args) {
+        if is_broken_pipe(&e) {
+            return std::process::ExitCode::SUCCESS;
+        }
         eprintln!("lms-transcode error: {e}");
-        std::process::exit(1);
+        return std::process::ExitCode::FAILURE;
     }
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -1306,7 +1354,17 @@ mod tests {
         let job_faad = parse_cli_invocation(
             "faad",
             &[
-                "-q", "-w", "-f", "2", "-b", "1", "-j", "10", "-e", "30", "/tmp/in.m4a",
+                "-q",
+                "-w",
+                "-f",
+                "2",
+                "-b",
+                "1",
+                "-j",
+                "10",
+                "-e",
+                "30",
+                "/tmp/in.m4a",
             ]
             .map(String::from),
         )
@@ -1356,8 +1414,7 @@ mod tests {
     fn test_wvunpack_and_sox_parsing() {
         let job_wv = parse_cli_invocation(
             "wvunpack",
-            &["/tmp/in.wv", "-rq", "--skip=10", "--until=20", "-o", "-"]
-                .map(String::from),
+            &["/tmp/in.wv", "-rq", "--skip=10", "--until=20", "-o", "-"].map(String::from),
         )
         .unwrap();
         assert_eq!(job_wv.output_format, OutputContainer::RawPcmLe);
@@ -1514,7 +1571,11 @@ mod tests {
         // Expected ~0.5s * 48000 frames = 24000 frames * 4 bytes = 96000 bytes (within small window)
         let out_frames = out.len() / 4;
         let diff = (out_frames as i64 - 24000).abs();
-        assert!(diff < 50, "resampled frames {} deviates from expected 24000", out_frames);
+        assert!(
+            diff < 50,
+            "resampled frames {} deviates from expected 24000",
+            out_frames
+        );
     }
 
     #[test]
@@ -1533,5 +1594,17 @@ mod tests {
         execute_transcode(&job, std::io::Cursor::new(wav_bytes), &mut out).unwrap();
         // 0.25s * 44100 = 11025 frames * 1 channel * 2 bytes = 22050 bytes
         assert_eq!(out.len(), 22050);
+    }
+
+    #[test]
+    fn test_broken_pipe_detection() {
+        let err_io = TranscodeError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        assert!(is_broken_pipe(&err_io));
+
+        let err_other = TranscodeError::Other("random error".to_string());
+        assert!(!is_broken_pipe(&err_other));
     }
 }

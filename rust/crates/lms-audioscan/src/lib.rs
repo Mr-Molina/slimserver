@@ -1,11 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::path::Path;
 use base64::Engine;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::TagType;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -99,19 +99,27 @@ pub fn parse_mp3_header(bytes: &[u8]) -> Option<Mp3FrameHeader> {
 
     let bitrate_kbps: u32 = match (version, layer, bitrate_index) {
         (1, 3, idx) => {
-            const RATES: [u32; 15] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+            const RATES: [u32; 15] = [
+                0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ];
             RATES[idx as usize]
         }
         (1, 2, idx) => {
-            const RATES: [u32; 15] = [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384];
+            const RATES: [u32; 15] = [
+                0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+            ];
             RATES[idx as usize]
         }
         (1, 1, idx) => {
-            const RATES: [u32; 15] = [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448];
+            const RATES: [u32; 15] = [
+                0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+            ];
             RATES[idx as usize]
         }
         (_, 1, idx) => {
-            const RATES: [u32; 15] = [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256];
+            const RATES: [u32; 15] = [
+                0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+            ];
             RATES[idx as usize]
         }
         (_, _, idx) => {
@@ -362,11 +370,11 @@ pub fn scan_file(
     let mut tags_map = serde_json::Map::new();
 
     let tagged_file = Probe::open(path)?.read()?;
+    let audio_offset = compute_audio_offset(&file_bytes, path);
 
     if include_info {
         let props = tagged_file.properties();
         let song_length_ms = props.duration().as_millis() as u64;
-        let audio_offset = compute_audio_offset(&file_bytes, path);
         let audio_size = file_size.saturating_sub(audio_offset);
         let bitrate_bps = props
             .audio_bitrate()
@@ -376,20 +384,32 @@ pub fn scan_file(
         let channels = props.channels().unwrap_or(2) as u64;
         let bits_per_sample = props.bit_depth().unwrap_or(16) as u64;
 
-        info_map.insert("song_length_ms".to_string(), serde_json::json!(song_length_ms));
+        info_map.insert(
+            "song_length_ms".to_string(),
+            serde_json::json!(song_length_ms),
+        );
         info_map.insert("file_size".to_string(), serde_json::json!(file_size));
         info_map.insert("audio_offset".to_string(), serde_json::json!(audio_offset));
         info_map.insert("audio_size".to_string(), serde_json::json!(audio_size));
         info_map.insert("bitrate".to_string(), serde_json::json!(bitrate_bps));
         info_map.insert("samplerate".to_string(), serde_json::json!(samplerate));
         info_map.insert("channels".to_string(), serde_json::json!(channels));
-        info_map.insert("stereo".to_string(), serde_json::json!(if channels == 2 { 1 } else { 0 }));
-        info_map.insert("bits_per_sample".to_string(), serde_json::json!(bits_per_sample));
+        info_map.insert(
+            "stereo".to_string(),
+            serde_json::json!(if channels == 2 { 1 } else { 0 }),
+        );
+        info_map.insert(
+            "bits_per_sample".to_string(),
+            serde_json::json!(bits_per_sample),
+        );
 
         if file_bytes.len() >= 3 && &file_bytes[0..3] == b"ID3" {
             let major = file_bytes.get(3).copied().unwrap_or(4);
             let revision = file_bytes.get(4).copied().unwrap_or(0);
-            info_map.insert("id3_version".to_string(), serde_json::json!(format!("ID3v2.{major}.{revision}")));
+            info_map.insert(
+                "id3_version".to_string(),
+                serde_json::json!(format!("ID3v2.{major}.{revision}")),
+            );
             info_map.insert("layer".to_string(), serde_json::json!(3));
         } else if let Some((_, hdr)) = find_mp3_frame(&file_bytes, 0) {
             info_map.insert("layer".to_string(), serde_json::json!(hdr.layer));
@@ -439,15 +459,17 @@ pub fn scan_file(
                     TagType::Id3v2 | TagType::Id3v1 => {
                         let mut apic_entries = Vec::new();
                         for pic in pics {
-                            let mime = pic
-                                .mime_type()
-                                .map(|m| m.as_str())
-                                .unwrap_or("image/jpeg");
+                            let mime = pic.mime_type().map(|m| m.as_str()).unwrap_or("image/jpeg");
                             let type_u8 = pic_type_to_u8(pic.pic_type());
                             let desc = pic.description().unwrap_or("");
                             let data = pic.data();
-                            let offset = find_slice_offset(&file_bytes, data).unwrap_or(0);
-                            let entry = if no_artwork {
+                            let offset = find_slice_offset(
+                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                data,
+                            )
+                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .unwrap_or(0);
+                            let entry = if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 serde_json::json!([mime, type_u8, desc, data.len(), offset])
                             } else {
                                 let b64 = base64::engine::general_purpose::STANDARD.encode(data);
@@ -464,18 +486,22 @@ pub fn scan_file(
                     TagType::VorbisComments => {
                         let mut pic_objects = Vec::new();
                         for pic in pics {
-                            let mime = pic
-                                .mime_type()
-                                .map(|m| m.as_str())
-                                .unwrap_or("image/jpeg");
+                            let mime = pic.mime_type().map(|m| m.as_str()).unwrap_or("image/jpeg");
                             let type_u8 = pic_type_to_u8(pic.pic_type());
                             let desc = pic.description().unwrap_or("");
                             let data = pic.data();
-                            let offset = find_slice_offset(&file_bytes, data).unwrap_or(0);
-                            let img_data_val = if no_artwork {
+                            let offset = find_slice_offset(
+                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                data,
+                            )
+                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .unwrap_or(0);
+                            let img_data_val = if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 serde_json::json!(data.len())
                             } else {
-                                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(data))
+                                serde_json::json!(
+                                    base64::engine::general_purpose::STANDARD.encode(data)
+                                )
                             };
                             let mut obj = serde_json::json!({
                                 "mime_type": mime,
@@ -499,13 +525,20 @@ pub fn scan_file(
                     TagType::Mp4Ilst => {
                         if let Some(pic) = pics.first() {
                             let data = pic.data();
-                            let offset = find_slice_offset(&file_bytes, data).unwrap_or(0);
-                            if no_artwork {
+                            let offset = find_slice_offset(
+                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                data,
+                            )
+                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .unwrap_or(0);
+                            if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 tags_map.insert("COVR".to_string(), serde_json::json!(data.len()));
                             } else {
                                 tags_map.insert(
                                     "COVR".to_string(),
-                                    serde_json::json!(base64::engine::general_purpose::STANDARD.encode(data)),
+                                    serde_json::json!(
+                                        base64::engine::general_purpose::STANDARD.encode(data)
+                                    ),
                                 );
                             }
                             tags_map.insert("COVR_offset".to_string(), serde_json::json!(offset));
@@ -514,13 +547,23 @@ pub fn scan_file(
                     TagType::Ape => {
                         if let Some(pic) = pics.first() {
                             let data = pic.data();
-                            let offset = find_slice_offset(&file_bytes, data).unwrap_or(0);
-                            if no_artwork {
-                                tags_map.insert("COVER ART (FRONT)".to_string(), serde_json::json!(data.len()));
+                            let offset = find_slice_offset(
+                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                data,
+                            )
+                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .unwrap_or(0);
+                            if no_artwork || data.len() > 16 * 1024 * 1024 {
+                                tags_map.insert(
+                                    "COVER ART (FRONT)".to_string(),
+                                    serde_json::json!(data.len()),
+                                );
                             } else {
                                 tags_map.insert(
                                     "COVER ART (FRONT)".to_string(),
-                                    serde_json::json!(base64::engine::general_purpose::STANDARD.encode(data)),
+                                    serde_json::json!(
+                                        base64::engine::general_purpose::STANDARD.encode(data)
+                                    ),
                                 );
                             }
                             tags_map.insert(
@@ -532,15 +575,17 @@ pub fn scan_file(
                     _ => {
                         let mut apic_entries = Vec::new();
                         for pic in pics {
-                            let mime = pic
-                                .mime_type()
-                                .map(|m| m.as_str())
-                                .unwrap_or("image/jpeg");
+                            let mime = pic.mime_type().map(|m| m.as_str()).unwrap_or("image/jpeg");
                             let type_u8 = pic_type_to_u8(pic.pic_type());
                             let desc = pic.description().unwrap_or("");
                             let data = pic.data();
-                            let offset = find_slice_offset(&file_bytes, data).unwrap_or(0);
-                            let entry = if no_artwork {
+                            let offset = find_slice_offset(
+                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                data,
+                            )
+                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .unwrap_or(0);
+                            let entry = if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 serde_json::json!([mime, type_u8, desc, data.len(), offset])
                             } else {
                                 let b64 = base64::engine::general_purpose::STANDARD.encode(data);
@@ -565,21 +610,6 @@ pub fn scan_file(
     })
 }
 
-fn probe_audio_stream_props(path: &Path) -> (Option<u32>, Option<u32>) {
-    if let Ok(tagged_file) = Probe::open(path).and_then(|p| p.read()) {
-        let props = tagged_file.properties();
-        return (props.sample_rate(), props.channels().map(|c| c as u32));
-    }
-    (None, None)
-}
-
-fn probe_duration_ms(path: &Path) -> u64 {
-    if let Ok(tagged_file) = Probe::open(path).and_then(|p| p.read()) {
-        return tagged_file.properties().duration().as_millis() as u64;
-    }
-    0
-}
-
 pub fn find_frame_offset(
     path: &Path,
     format_hint: Option<&str>,
@@ -588,11 +618,19 @@ pub fn find_frame_offset(
     let file_bytes = std::fs::read(path)?;
     let ext_str = format_hint
         .map(|s| s.to_ascii_lowercase())
-        .or_else(|| path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()))
+        .or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+        })
         .unwrap_or_else(|| "mp3".to_string());
     let ext = ext_str.as_str();
 
-    let (sample_rate, channels) = probe_audio_stream_props(path);
+    let tagged_file = Probe::open(path)?.read()?;
+    let props = tagged_file.properties();
+    let sample_rate = props.sample_rate();
+    let channels = props.channels().map(|c| c as u32);
+    let total_duration_ms = props.duration().as_millis() as u64;
 
     if target_ms_or_neg_byte_offset < 0 {
         let target_byte = target_ms_or_neg_byte_offset.unsigned_abs() as usize;
@@ -664,7 +702,6 @@ pub fn find_frame_offset(
             });
         }
 
-        let total_duration_ms = probe_duration_ms(path);
         let audio_size = file_bytes.len().saturating_sub(audio_offset);
         let est_byte = (target_ms * audio_size as u64)
             .checked_div(total_duration_ms)
@@ -739,7 +776,7 @@ mod tests {
         use lofty::config::WriteOptions;
         use lofty::id3::v2::Id3v2Tag;
         use lofty::picture::{MimeType, Picture, PictureType};
-        use lofty::prelude::*;
+        use lofty::tag::{Accessor, TagExt};
 
         let mut frame = vec![0u8; 417];
         frame[0] = 0xFF;
@@ -769,7 +806,10 @@ mod tests {
         write_id3v2_mp3_with_apic(&mp3_path, "Test Title", "Test Artist", &fake_jpeg);
 
         let res_no_art = scan_file(&mp3_path, true, true, true).unwrap();
-        assert_eq!(res_no_art.tags.get("TIT2").unwrap().as_str().unwrap(), "Test Title");
+        assert_eq!(
+            res_no_art.tags.get("TIT2").unwrap().as_str().unwrap(),
+            "Test Title"
+        );
         let apic = res_no_art.tags.get("APIC").unwrap().as_array().unwrap();
         assert_eq!(apic[3].as_u64().unwrap(), 10);
         assert!(apic[4].as_u64().unwrap() > 0);

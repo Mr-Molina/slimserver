@@ -25,9 +25,23 @@ fn percent_encode_path(bytes: &[u8]) -> String {
             || b.is_ascii_alphanumeric()
             || matches!(
                 b,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\''
-                    | b'(' | b')' | b':' | b'@' | b'&' | b'='
-                    | b'+' | b'$' | b',' | b'[' | b']'
+                b'-' | b'_'
+                    | b'.'
+                    | b'!'
+                    | b'~'
+                    | b'*'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b':'
+                    | b'@'
+                    | b'&'
+                    | b'='
+                    | b'+'
+                    | b'$'
+                    | b','
+                    | b'['
+                    | b']'
             )
         {
             out.push(b as char);
@@ -71,34 +85,47 @@ pub fn populate_scanned_files(db_path: &Path, basedir: &Path) -> Result<usize, A
 
     let mut count = 0usize;
     let mut conn = rusqlite::Connection::open(db_path)?;
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare_cached(
+    conn.execute_batch(
+        "PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -64000;",
+    )?;
+    let mut tx = conn.transaction()?;
+    let mut uncommitted = 0usize;
+
+    for entry_res in walkdir::WalkDir::new(basedir).follow_links(true) {
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let url = path_to_file_url(entry.path());
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let filesize = metadata.len() as i64;
+
+        tx.prepare_cached(
             "INSERT INTO scanned_files (url, timestamp, filesize) VALUES (?1, ?2, ?3)",
-        )?;
+        )?
+        .execute(rusqlite::params![url, mtime, filesize])?;
+        count += 1;
+        uncommitted += 1;
 
-        for entry_res in walkdir::WalkDir::new(basedir).follow_links(true) {
-            let entry = match entry_res {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let url = path_to_file_url(entry.path());
-            let mtime = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let filesize = if metadata.is_dir() { 0i64 } else { metadata.len() as i64 };
-
-            stmt.execute(rusqlite::params![url, mtime, filesize])?;
-            count += 1;
+        if uncommitted >= 5_000 {
+            tx.commit()?;
+            tx = conn.transaction()?;
+            uncommitted = 0;
         }
     }
     tx.commit()?;
@@ -118,7 +145,7 @@ pub fn precache_artwork_batch(
     }
     let store = lms_cache::DbArtworkStore::open(cache_root, false)?;
 
-    use rayon::prelude::*;
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     let success_count: usize = jobs
         .par_iter()
         .map(|(img_path, cachekey)| {
@@ -302,7 +329,7 @@ mod tests {
         drop(conn);
 
         let count = populate_scanned_files(&db_path, &music_dir).unwrap();
-        assert!(count >= 3);
+        assert_eq!(count, 2);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let mut stmt = conn
@@ -319,9 +346,12 @@ mod tests {
     fn test_precache_artwork_batch_populates_artwork_db() {
         let dir = tempfile::tempdir().unwrap();
         let img_path = dir.path().join("cover.jpg");
-        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(120, 120, |_, _| image::Rgb([40, 80, 160])));
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(120, 120, |_, _| {
+            image::Rgb([40, 80, 160])
+        }));
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImgFmt::Jpeg).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImgFmt::Jpeg)
+            .unwrap();
         std::fs::write(&img_path, buf).unwrap();
 
         let jobs = vec![(img_path, "music/cover01/cover_".to_string())];
@@ -330,7 +360,10 @@ mod tests {
         assert_eq!(count, 1);
 
         let store = lms_cache::DbArtworkStore::open(dir.path(), false).unwrap();
-        assert!(store.get("music/cover01/cover_100x100_o").unwrap().is_some());
+        assert!(store
+            .get("music/cover01/cover_100x100_o")
+            .unwrap()
+            .is_some());
         assert!(store.get("music/cover01/cover_50x50_m").unwrap().is_some());
     }
 }

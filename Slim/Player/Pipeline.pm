@@ -135,11 +135,15 @@ sub new {
 		$reader = IO::Handle->new();
 		$writer = IO::Handle->new();
 
-		open2($reader, $writer, $command);
+		my $pid = open2($reader, $writer, $command);
+		${*$self}{'pipeline_pid'} = $pid;
 
 		if (!defined(Slim::Utils::Network::blocking($reader, 0))) {
 
 			logError("Cannot set pipe line reader to nonblocking");
+
+			kill('TERM', $pid);
+			waitpid($pid, POSIX::WNOHANG());
 
 			$reader->close();
 			$writer->close();
@@ -150,6 +154,9 @@ sub new {
 		if (!defined(Slim::Utils::Network::blocking($writer, 0))) {
 
 			logError("Cannot set pipe line writer to nonblocking");
+
+			kill('TERM', $pid);
+			waitpid($pid, POSIX::WNOHANG());
 
 			$reader->close();
 			$writer->close();
@@ -388,12 +395,37 @@ sub close {
 			$listenWriter->close();
 		}
 	}
+	else {
+		my $pid = delete ${*$self}{'pipeline_pid'};
+		if (defined $pid) {
+			if (waitpid($pid, POSIX::WNOHANG()) == 0) {
+				kill('TERM', $pid);
+				my $running = 1;
+				for (1 .. 5) {
+					select(undef, undef, undef, 0.01);
+					if (waitpid($pid, POSIX::WNOHANG()) != 0) {
+						$running = 0;
+						last;
+					}
+				}
+				if ($running) {
+					kill('KILL', $pid);
+					waitpid($pid, 0);
+				}
+			}
+		}
+	}
 
 	my $source = ${*$self}{'pipeline_source'};
 
 	if (defined($source)) {
 		$source->close();
 	}
+}
+
+sub DESTROY {
+	my $self = shift;
+	$self->close();
 }
 
 1;

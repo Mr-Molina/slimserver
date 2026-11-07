@@ -2,6 +2,31 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
+## 2026-11-07 12:38 | Orchestrator | Session Handoff (/goodbye) — Post-37h Soak Hardware/Software Audit, IPC/SQLite/Nginx Tuning & Sandy Bridge AVX Deployment (`[slimserver]`)
+**Agent**: Orchestrator (`/goodbye`)
+**Host OS**: Dev: Debian 13 `x86_64` (`10.0.0.90`) | Prod: Debian 13 `x86_64` (`10.0.0.50` `workstation-1`, Lyrion `9.1.1`)
+**Branch**: `Rust-Experiment` (synced to `origin/Rust-Experiment` at `09e0410fd`)
+**Working Tree**: Clean (`0` uncommitted changes, `0` secrets, `0` scratch artifacts)
+
+### Completed This Session
+- **37.09-Hour Continuous Soak & Server Hardware/OS Tuning on `10.0.0.50` (`HW-01`..`HW-10`, `[EXECUTED & VERIFIED]`)** ✅:
+  - Removed stale `root:root` `/tmp/sbs_artwork` socket blocking `gdresized`; restored `gdresized` (`PID 48841`, `VmRSS = 2,716 kB`, `/tmp/sbs_artwork` `0666` `squeezeboxserver:nogroup`).
+  - Checkpointed and truncated `32.1 MB` of bloated SQLite WAL files (`spotty.db-wal`, `cache.db-wal`, `imgproxy.db-wal`) to `0 B` and configured `WAL` mode on `artwork.db`.
+  - Configured Nginx `lyrion_backend` (`keepalive 32`), `$connection_upgrade` map on port `9001`, and `gzip_types`; enabled `enp0s25` `TSO`/`GSO` + `4096` ring buffers (`ethtool-tuning.service`); set `net.ipv4.tcp_max_syn_backlog=4096`; installed `ffmpeg 7.1.5`; and deduplicated `castbridge.xml` (`48000` Hz, `17` connected players including restored `Home Group`).
+- **Rust Accelerator Crates & Perl Core Remediations (`SW-17`..`SW-24`, `[EXECUTED & VERIFIED]`)** ✅:
+  - Configured `rust/Cargo.toml` `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`) and `rust/.cargo/config.toml` (`-C target-cpu=sandybridge`, producing `9,199` AVX `vmov*` instructions in `lms-transcode`).
+  - Fixed `lms-gdresized` 32 MB frame cap & `0o666` socket mode, `lms-image` 16-byte header sniff & `CatmullRom`, `lms-transcode` `Cubic` resampler & 64 KB `BufWriter`, `lms-mp3cut` 64 KB `BufReader`, `lms-audioscan` single-read offset probe & header-bounded artwork search, `lms-scanner-accel` `prepare_cached` + SQLite PRAGMAs + directory skip, `Slim/Player/Pipeline.pm` zombie reaping + `DESTROY`, `Slim/Control/Queries.pm:4142` `defined $song->currentTrack()` guard, and `Slim/Utils/SQLiteHelper.pm` PRAGMAs (`synchronous=NORMAL`, `busy_timeout=5000`, `mmap_size=268435456`, `journal_size_limit=16777216`).
+  - Deployed all 5 binaries and 3 Perl modules to `10.0.0.50` with 100% SHA-256 parity.
+
+### Verification & Testing ✅
+- `goodbye_preflight.py --workspace /home/console-admin/Github/slimserver` -> `"status": "clean"`, `"secrets_found": []`, `"scratch_artifacts": []`
+- `cargo clippy --all-targets -- -D warnings` -> `0` warnings (exit `0`)
+- `cargo test` -> `39/39` tests pass across 7 crates (exit `0`)
+- `perl -I. -Ilib -c` -> `Syntax OK` across `Pipeline.pm`, `Queries.pm`, `SQLiteHelper.pm`, `slimserver.pl`
+
+### Carry-Forward (Priority Order)
+1. **Monitor `10.0.0.50` Production Instance**: Observe `gdresized` IPC socket throughput and SQLite WAL size caps (`<= 16 MB`) during library scans and artwork browsing.
+
 ## 2026-10-20 | Orchestrator | Session Handoff (/goodbye) — Rust-Experiment & Live Production Synced (`[slimserver]`)
 **Agent**: Orchestrator (`/goodbye`)
 **Host OS**: Dev: Debian 13 `x86_64` (`10.0.0.90`) | Prod: Debian 13 `aarch64` (`10.0.0.10`, Lyrion `9.1.1`)

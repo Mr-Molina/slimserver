@@ -71,13 +71,13 @@ pub fn resize_one_shot(
     Ok((format.as_str().to_string(), bytes))
 }
 
-fn process_client_request(
-    stream: &mut UnixStream,
-    faster: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_client(stream: &mut UnixStream, faster: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
     let mut reader = BufReader::new(stream);
     let mut raw_line = Vec::new();
-    reader.read_until(b'\n', &mut raw_line)?;
+    (&mut reader)
+        .take(32 * 1024 * 1024)
+        .read_until(b'\n', &mut raw_line)?;
 
     if raw_line.is_empty() {
         return Err("empty frame".into());
@@ -110,16 +110,16 @@ fn process_client_request(
     let cachekey_bytes = &raw[null_indices[2] + 1..null_indices[3]];
     let data_bytes = &raw[null_indices[3] + 1..null_indices[4]];
 
-    let file = std::str::from_utf8(file_bytes)
-        .map_err(|e| format!("invalid UTF-8 in file path: {e}"))?;
-    let mut spec = std::str::from_utf8(spec_bytes)
-        .map_err(|e| format!("invalid UTF-8 in spec: {e}"))?;
+    let file =
+        std::str::from_utf8(file_bytes).map_err(|e| format!("invalid UTF-8 in file path: {e}"))?;
+    let mut spec =
+        std::str::from_utf8(spec_bytes).map_err(|e| format!("invalid UTF-8 in spec: {e}"))?;
     let cacheroot = std::str::from_utf8(cacheroot_bytes)
         .map_err(|e| format!("invalid UTF-8 in cacheroot: {e}"))?;
     let cachekey = std::str::from_utf8(cachekey_bytes)
         .map_err(|e| format!("invalid UTF-8 in cachekey: {e}"))?;
-    let data_str = std::str::from_utf8(data_bytes)
-        .map_err(|e| format!("invalid UTF-8 in data: {e}"))?;
+    let data_str =
+        std::str::from_utf8(data_bytes).map_err(|e| format!("invalid UTF-8 in data: {e}"))?;
 
     if spec.is_empty() {
         spec = "XxX";
@@ -161,14 +161,42 @@ fn process_client_request(
     Ok(())
 }
 
+#[inline]
+pub fn process_client_request(
+    stream: &mut UnixStream,
+    faster: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    handle_client(stream, faster)
+}
+
 fn handle_client_connection(mut stream: UnixStream, faster: bool) {
-    let res = process_client_request(&mut stream, faster);
+    let timeout = Some(std::time::Duration::from_secs(15));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    let res = handle_client(&mut stream, faster);
     let response = match res {
         Ok(()) => "OK\r\n".to_string(),
         Err(e) => format!("Error: {e}\r\n"),
     };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+pub fn run_stdio(spec: &str, faster: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() > 64 * 1024 * 1024 {
+        return Err("stdin input exceeded 64MB limit".into());
+    }
+    let (fmt, bytes) = resize_one_shot(&buf, spec, faster)?;
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "{fmt}")?;
+    stdout.write_all(&bytes)?;
+    stdout.flush()?;
+    Ok(())
 }
 
 pub fn run_server(
@@ -181,12 +209,20 @@ pub fn run_server(
     }
 
     let listener = UnixListener::bind(sock_path)?;
+    std::fs::set_permissions(
+        sock_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o666),
+    )?;
     let mut handled = 0;
+    let initial_ppid = std::os::unix::process::parent_id();
 
     while match max_requests {
         Some(max) => handled < max,
         None => true,
     } {
+        if initial_ppid != 1 && std::os::unix::process::parent_id() == 1 {
+            break;
+        }
         let (stream, _) = match listener.accept() {
             Ok(s) => s,
             Err(e) => {
@@ -196,6 +232,12 @@ pub fn run_server(
                 break;
             }
         };
+        if initial_ppid != 1 && std::os::unix::process::parent_id() == 1 {
+            break;
+        }
+        let timeout = Some(std::time::Duration::from_secs(15));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
         handled += 1;
         handle_client_connection(stream, faster);
     }
@@ -249,13 +291,11 @@ fn main() {
                 }
             }
         } else if opts.stdin {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            if let Err(e) = run_stdio(spec, opts.faster) {
                 eprintln!("Error reading stdin: {e}");
                 std::process::exit(1);
             }
-            buf
+            return;
         } else {
             eprintln!("Error: --cli-resize requires either --file <path> or --stdin");
             std::process::exit(1);
@@ -301,9 +341,11 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     fn make_test_jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
-        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |_, _| image::Rgb([180, 90, 45])));
+        let img =
+            DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |_, _| image::Rgb([180, 90, 45])));
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImgFmt::Jpeg).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImgFmt::Jpeg)
+            .unwrap();
         buf
     }
 
@@ -327,7 +369,9 @@ mod tests {
 
         {
             let mut stream = UnixStream::connect(&sock_path).unwrap();
-            stream.write_all(b"data\x00100x100_o\0/tmp\0key1\0!!!NOT_BASE64!!!\0\r\n").unwrap();
+            stream
+                .write_all(b"data\x00100x100_o\0/tmp\0key1\0!!!NOT_BASE64!!!\0\r\n")
+                .unwrap();
             let mut resp = String::new();
             stream.read_to_string(&mut resp).unwrap();
             assert!(resp.starts_with("Error: "));
@@ -337,7 +381,10 @@ mod tests {
             let jpg = make_test_jpeg_bytes(80, 80);
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpg);
             let cacheroot = dir.path().to_str().unwrap();
-            let frame = format!("data\040x40_o\0{}\0music/1/cover_40x40_o\0{}\0\r\n", cacheroot, b64);
+            let frame = format!(
+                "data\040x40_o\0{}\0music/1/cover_40x40_o\0{}\0\r\n",
+                cacheroot, b64
+            );
             let mut stream = UnixStream::connect(&sock_path).unwrap();
             stream.write_all(frame.as_bytes()).unwrap();
             let mut resp = String::new();
@@ -411,7 +458,10 @@ mod tests {
 
         // Verify SQLite store contains the resized image
         let store = lms_cache::DbArtworkStore::open(dir.path(), false).unwrap();
-        let record = store.get("music/99/cover").unwrap().expect("record must exist");
+        let record = store
+            .get("music/99/cover")
+            .unwrap()
+            .expect("record must exist");
         assert_eq!(record.content_type, "jpg");
         assert!(!record.data.is_empty());
     }

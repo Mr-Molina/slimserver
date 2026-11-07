@@ -120,7 +120,11 @@ pub struct DbArtworkStore {
 impl DbArtworkStore {
     pub fn open(cache_root: &Path, is_imageproxy: bool) -> Result<Self, CacheError> {
         std::fs::create_dir_all(cache_root)?;
-        let db_filename = if is_imageproxy { "imgproxy.db" } else { "artwork.db" };
+        let db_filename = if is_imageproxy {
+            "imgproxy.db"
+        } else {
+            "artwork.db"
+        };
         let db_path = cache_root.join(db_filename);
         let conn = rusqlite::Connection::open(db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -151,7 +155,10 @@ impl DbArtworkStore {
     pub fn set(&self, key: &str, record: &ArtworkRecord) -> Result<(), CacheError> {
         let k = md5_key_i64(key);
         let blob = encode_artwork_blob(record);
-        let conn = self.conn.lock().map_err(|e| CacheError::Lock(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CacheError::Lock(e.to_string()))?;
 
         if self.is_imageproxy {
             let now = std::time::SystemTime::now()
@@ -174,7 +181,10 @@ impl DbArtworkStore {
 
     pub fn get(&self, key: &str) -> Result<Option<ArtworkRecord>, CacheError> {
         let k = md5_key_i64(key);
-        let conn = self.conn.lock().map_err(|e| CacheError::Lock(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CacheError::Lock(e.to_string()))?;
 
         if self.is_imageproxy {
             let now = std::time::SystemTime::now()
@@ -221,7 +231,10 @@ mod tests {
         // 2. Standard artwork cache key:
         // md5_hex("music/12345/cover_100x100_o") = "c78c3d3e2923430b16a433d8de85427c"
         // hex("c78c3d3e") = 3347856702, hex("2923430") = 43136048 -> "334785670243136048"
-        assert_eq!(md5_key_i64("music/12345/cover_100x100_o"), 334785670243136048_i64);
+        assert_eq!(
+            md5_key_i64("music/12345/cover_100x100_o"),
+            334785670243136048_i64
+        );
     }
 
     #[test]
@@ -234,7 +247,10 @@ mod tests {
         };
         let encoded = encode_artwork_blob(&rec);
         assert_eq!(&encoded[0..3], b"jpg");
-        assert_eq!(u32::from_le_bytes(encoded[3..7].try_into().unwrap()), 1700000000);
+        assert_eq!(
+            u32::from_le_bytes(encoded[3..7].try_into().unwrap()),
+            1700000000
+        );
         assert_eq!(u16::from_le_bytes(encoded[7..9].try_into().unwrap()), 15);
         let decoded = decode_artwork_blob(&encoded).unwrap();
         assert_eq!(decoded, rec);

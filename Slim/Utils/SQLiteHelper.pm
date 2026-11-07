@@ -97,10 +97,13 @@ sub on_connect_do {
 	my $class = shift;
 
 	my $sql = [
-		'PRAGMA synchronous = OFF',
+		'PRAGMA synchronous = NORMAL',
 		'PRAGMA journal_mode = WAL',
 		'PRAGMA foreign_keys = ON',
 		'PRAGMA wal_autocheckpoint = ' . (main::SCANNER ? 10000 : 200),
+		'PRAGMA busy_timeout = 5000',
+		'PRAGMA mmap_size = 268435456',
+		'PRAGMA journal_size_limit = 16777216',
 		# Default cache_size is 2000 pages, a page is normally 1K but may be different
 		# depending on the OS/filesystem.  So default is usually 2MB.
 		# Highmem we will try 20M (high) or 500M (max)

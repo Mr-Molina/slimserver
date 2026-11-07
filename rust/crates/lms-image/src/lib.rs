@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use lms_cache::DbArtworkStore;
+use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,8 @@ pub enum ImageError {
     UnsupportedFormat,
     #[error("Invalid resize spec: {0}")]
     InvalidSpec(String),
+    #[error("Invalid arguments")]
+    InvalidArguments,
 }
 
 pub fn sniff_format(bytes: &[u8]) -> Option<ImageFormat> {
@@ -122,18 +125,10 @@ pub fn parse_single_spec(spec: &str) -> ResizeSpec {
         if let Some(x_idx) = first.find(['x', 'X']) {
             let w_str = &first[..x_idx];
             let h_str = &first[x_idx + 1..];
-            if !w_str.is_empty()
-                && (w_str == "X" || w_str == "x" || w_str.chars().all(|c| c.is_ascii_digit()))
-                && w_str != "X"
-                && w_str != "x"
-            {
+            if !w_str.is_empty() && w_str.chars().all(|c| c.is_ascii_digit()) {
                 width = w_str.parse::<u32>().ok();
             }
-            if !h_str.is_empty()
-                && (h_str == "X" || h_str == "x" || h_str.chars().all(|c| c.is_ascii_digit()))
-                && h_str != "X"
-                && h_str != "x"
-            {
+            if !h_str.is_empty() && h_str.chars().all(|c| c.is_ascii_digit()) {
                 height = h_str.parse::<u32>().ok();
             }
         }
@@ -208,6 +203,17 @@ pub fn resize_image(
     spec: &ResizeSpec,
     faster: bool,
 ) -> Result<(Vec<u8>, ImageFormat), ImageError> {
+    if let Some(w) = spec.width {
+        if w > 8_192 {
+            return Err(ImageError::InvalidArguments);
+        }
+    }
+    if let Some(h) = spec.height {
+        if h > 8_192 {
+            return Err(ImageError::InvalidArguments);
+        }
+    }
+
     let in_format = sniff_format(input_bytes).ok_or(ImageError::UnsupportedFormat)?;
 
     // Short-circuit if no width/height specified, and formats match, return original image
@@ -218,13 +224,18 @@ pub fn resize_image(
         return Ok((input_bytes.to_vec(), in_format));
     }
 
-    let img = image::load_from_memory(input_bytes)
-        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
+    let img =
+        image::load_from_memory(input_bytes).map_err(|e| ImageError::ImageDecode(e.to_string()))?;
     let in_width = img.width();
     let in_height = img.height();
 
     if in_width == 0 || in_height == 0 {
-        return Err(ImageError::ImageDecode("image has 0 dimensions".to_string()));
+        return Err(ImageError::ImageDecode(
+            "image has 0 dimensions".to_string(),
+        ));
+    }
+    if in_width > 16_384 || in_height > 16_384 {
+        return Err(ImageError::InvalidArguments);
     }
 
     // Determine target format
@@ -245,7 +256,7 @@ pub fn resize_image(
     let filter = if faster {
         image::imageops::FilterType::Triangle
     } else {
-        image::imageops::FilterType::Lanczos3
+        image::imageops::FilterType::CatmullRom
     };
 
     let output_image: image::DynamicImage = match spec.mode {
@@ -311,7 +322,12 @@ pub fn resize_image(
                 let offset_x = (canvas_w - scaled_w) / 2;
                 let offset_y = (canvas_h - scaled_h) / 2;
                 let scaled_rgba = scaled.to_rgba8();
-                image::imageops::overlay(&mut canvas, &scaled_rgba, offset_x as i64, offset_y as i64);
+                image::imageops::overlay(
+                    &mut canvas,
+                    &scaled_rgba,
+                    offset_x as i64,
+                    offset_y as i64,
+                );
                 image::DynamicImage::ImageRgba8(canvas)
             }
         }
@@ -362,7 +378,12 @@ pub fn resize_image(
                 let offset_x = (canvas_w - scaled_w) / 2;
                 let offset_y = (canvas_h - scaled_h) / 2;
                 let scaled_rgba = scaled.to_rgba8();
-                image::imageops::overlay(&mut canvas, &scaled_rgba, offset_x as i64, offset_y as i64);
+                image::imageops::overlay(
+                    &mut canvas,
+                    &scaled_rgba,
+                    offset_x as i64,
+                    offset_y as i64,
+                );
                 image::DynamicImage::ImageRgba8(canvas)
             }
         }
@@ -456,15 +477,15 @@ pub fn gdresize_to_cache(
                 .unwrap_or(0);
             let path_str = p.to_string_lossy().to_string();
 
-            let raw = std::fs::read(p)?;
-            if sniff_format(&raw).is_some() {
-                (raw, path_str, mtime)
+            let mut header = Vec::with_capacity(16);
+            std::fs::File::open(p)?.take(16).read_to_end(&mut header)?;
+
+            let raw = if sniff_format(&header).is_some() {
+                std::fs::read(p)?
             } else {
-                match extract_embedded_artwork(p) {
-                    Ok(artwork) => (artwork, path_str, mtime),
-                    Err(_) => (raw, path_str, mtime),
-                }
-            }
+                extract_embedded_artwork(p)?
+            };
+            (raw, path_str, mtime)
         }
         InputSource::Bytes(b) => (b.to_vec(), String::new(), 0),
     };
@@ -724,12 +745,8 @@ mod tests {
             None,
             vec![6, 6, 6],
         );
-        let pic_icon = Picture::new_unchecked(
-            PictureType::Icon,
-            Some(MimeType::Jpeg),
-            None,
-            vec![1, 1, 1],
-        );
+        let pic_icon =
+            Picture::new_unchecked(PictureType::Icon, Some(MimeType::Jpeg), None, vec![1, 1, 1]);
         // Push in reverse order
         tag.push_picture(pic_media);
         tag.push_picture(pic_icon);
@@ -762,5 +779,21 @@ mod tests {
         assert_eq!(cached.data, out);
         assert_eq!(cached.content_type, "jpg");
         assert_eq!(cached.original_path, img_path.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_dimension_bounds_rejection() {
+        let src = make_jpeg(100, 100);
+        let spec_w = parse_single_spec("8193x100_m");
+        assert!(matches!(
+            resize_image(&src, &spec_w, false),
+            Err(ImageError::InvalidArguments)
+        ));
+
+        let spec_h = parse_single_spec("100x8193_m");
+        assert!(matches!(
+            resize_image(&src, &spec_h, false),
+            Err(ImageError::InvalidArguments)
+        ));
     }
 }

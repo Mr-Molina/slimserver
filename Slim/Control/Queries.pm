@@ -4125,7 +4125,7 @@ sub statusQuery {
 			$request->addResult('replay_gain', $trackGain);
 		}
 
-		my $transcoded = $song->transcoded();
+		my $transcoded = $song->can('transcoded') ? $song->transcoded() : ($song->can('_transcoded') ? $song->_transcoded() : undef);
 		if (defined $transcoded) {
 			$request->addResult('is_transcoded', $transcoded);
 		}
@@ -4139,7 +4139,7 @@ sub statusQuery {
 		}
 
 		if ($tags =~ /b/) {   # get the song's current bitrate
-			my $vbr = $transcoded ? 0 : $song->currentTrack()->vbr_scale;
+			my $track = $song->currentTrack(); my $vbr = ($transcoded || !$track) ? 0 : $track->vbr_scale;
 			my $bitrate = $song->streambitrate();
 			if ($bitrate) {
 				$streamFormat ||= $song->streamformat();

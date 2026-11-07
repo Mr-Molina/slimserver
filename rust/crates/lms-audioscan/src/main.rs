@@ -1,14 +1,20 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use lms_audioscan::{find_frame_offset, scan_file};
 use std::env;
 use std::path::Path;
-use lms_audioscan::{find_frame_offset, scan_file};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 || args[1..].iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+    if args.len() < 2
+        || args[1..]
+            .iter()
+            .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
         println!("Usage: lms-audioscan <subcommand> [args...]");
-        println!("Subcommands: scan <path>, scan-tags <path>, find-frame <format> <path> <offset_or_ms>");
+        println!(
+            "Subcommands: scan <path>, scan-tags <path>, find-frame <format> <path> <offset_or_ms>"
+        );
         println!("Options: -h, --help  Display this help message");
         if args.len() < 2 {
             std::process::exit(1);
