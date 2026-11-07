@@ -177,6 +177,7 @@ sub new {
 	${*$self}{'pipeline_source'} = $source;
 	${*$self}{'pipeline_pending_bytes'} = '';
 	${*$self}{'pipeline_pending_size'} = 0;
+	${*$self}{'pipeline_pending_offset'} = 0;
 	${*$self}{'pipeline_error'} = 0;
 
 	return $self;
@@ -279,10 +280,12 @@ sub sysread {
 	}
 
 	# First try to stuff the pipe
-	while (defined($source)) {
+	my $chunks = 0;
+	while (defined($source) && ++$chunks < 4) {
 
-		my $pendingBytes = ${*$self}{'pipeline_pending_bytes'};
-		my $pendingSize  = ${*$self}{'pipeline_pending_size'};
+		my $pendingBytes  = ${*$self}{'pipeline_pending_bytes'};
+		my $pendingSize   = ${*$self}{'pipeline_pending_size'};
+		my $pendingOffset = ${*$self}{'pipeline_pending_offset'} || 0;
 
 		if (!$pendingSize) {
 
@@ -308,29 +311,35 @@ sub sysread {
 			}
 
 			$pendingSize = $socketReadlen;
+			$pendingOffset = 0;
 		}
 
 		main::DEBUGLOG && $log->debug("Attempting to write to pipeline writer");
 
-		my $writelen = $writer->syswrite($pendingBytes, $pendingSize);
+		my $writelen = syswrite($writer, $pendingBytes, $pendingSize - $pendingOffset, $pendingOffset);
 
 		if ($writelen) {
 
 			main::DEBUGLOG && $log->debug("Wrote $writelen bytes to pipeline writer");
 
-			if ($writelen != $pendingSize) {
-				${*$self}{'pipeline_pending_bytes'} = substr($pendingBytes, $writelen);
-				${*$self}{'pipeline_pending_size'}  = $pendingSize - $writelen;
+			$pendingOffset += $writelen;
+
+			if ($pendingOffset < $pendingSize) {
+				${*$self}{'pipeline_pending_bytes'}  = $pendingBytes;
+				${*$self}{'pipeline_pending_size'}   = $pendingSize;
+				${*$self}{'pipeline_pending_offset'} = $pendingOffset;
 			}
 			else {
-				${*$self}{'pipeline_pending_bytes'} = '';
-				${*$self}{'pipeline_pending_size'}  = 0;
+				${*$self}{'pipeline_pending_bytes'}  = '';
+				${*$self}{'pipeline_pending_size'}   = 0;
+				${*$self}{'pipeline_pending_offset'} = 0;
 			}
 		}
 		else {
 
-			${*$self}{'pipeline_pending_bytes'} = $pendingBytes;
-			${*$self}{'pipeline_pending_size'}  = $pendingSize;
+			${*$self}{'pipeline_pending_bytes'}  = $pendingBytes;
+			${*$self}{'pipeline_pending_size'}   = $pendingSize;
+			${*$self}{'pipeline_pending_offset'} = $pendingOffset;
 
 			if ($! != EWOULDBLOCK) {
 				return undef;	# reflect error to caller
@@ -400,17 +409,13 @@ sub close {
 		if (defined $pid) {
 			if (waitpid($pid, POSIX::WNOHANG()) == 0) {
 				kill('TERM', $pid);
-				my $running = 1;
-				for (1 .. 5) {
-					select(undef, undef, undef, 0.01);
-					if (waitpid($pid, POSIX::WNOHANG()) != 0) {
-						$running = 0;
-						last;
-					}
-				}
-				if ($running) {
-					kill('KILL', $pid);
-					waitpid($pid, 0);
+				if (waitpid($pid, POSIX::WNOHANG()) == 0) {
+					Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + 0.05, sub {
+						if (waitpid($pid, POSIX::WNOHANG()) == 0) {
+							kill('KILL', $pid);
+							waitpid($pid, POSIX::WNOHANG());
+						}
+					});
 				}
 			}
 		}

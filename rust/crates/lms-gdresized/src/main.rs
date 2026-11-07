@@ -1,8 +1,16 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::collections::HashMap;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 #[derive(Debug, Default)]
 struct CliOptions {
@@ -69,6 +77,28 @@ pub fn resize_one_shot(
     let parsed_spec = lms_image::parse_single_spec(spec);
     let (bytes, format) = lms_image::resize_image(input, &parsed_spec, faster)?;
     Ok((format.as_str().to_string(), bytes))
+}
+
+type StoreCacheKey = (PathBuf, bool);
+type StoreCacheMap = HashMap<StoreCacheKey, Arc<lms_cache::DbArtworkStore>>;
+
+static STORE_CACHE: OnceLock<Mutex<StoreCacheMap>> = OnceLock::new();
+
+pub fn open_or_cached_store(
+    cacheroot: &Path,
+    is_imageproxy: bool,
+) -> Result<Arc<lms_cache::DbArtworkStore>, lms_cache::CacheError> {
+    let cache = STORE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (cacheroot.to_path_buf(), is_imageproxy);
+    let mut guard = cache
+        .lock()
+        .map_err(|_| lms_cache::CacheError::Io(std::io::Error::other("store cache mutex poisoned")))?;
+    if let Some(store) = guard.get(&key) {
+        return Ok(Arc::clone(store));
+    }
+    let store = Arc::new(lms_cache::DbArtworkStore::open(cacheroot, is_imageproxy)?);
+    guard.insert(key, Arc::clone(&store));
+    Ok(store)
 }
 
 fn handle_client(stream: &mut UnixStream, faster: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,7 +184,7 @@ fn handle_client(stream: &mut UnixStream, faster: bool) -> Result<(), Box<dyn st
     }
 
     let is_imageproxy = cachekey.starts_with("imageproxy");
-    let store = lms_cache::DbArtworkStore::open(Path::new(cacheroot), is_imageproxy)?;
+    let store = open_or_cached_store(Path::new(cacheroot), is_imageproxy)?;
 
     lms_image::gdresize_to_cache(input_source, &specs, &store, cachekey, faster)?;
 
@@ -170,9 +200,6 @@ pub fn process_client_request(
 }
 
 fn handle_client_connection(mut stream: UnixStream, faster: bool) {
-    let timeout = Some(std::time::Duration::from_secs(15));
-    let _ = stream.set_read_timeout(timeout);
-    let _ = stream.set_write_timeout(timeout);
     let res = handle_client(&mut stream, faster);
     let response = match res {
         Ok(()) => "OK\r\n".to_string(),
@@ -216,6 +243,31 @@ pub fn run_server(
     let mut handled = 0;
     let initial_ppid = std::os::unix::process::parent_id();
 
+    let tx = if max_requests.is_none() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<UnixStream>(64);
+        let rx = Arc::new(Mutex::new(receiver));
+        for _ in 0..4 {
+            let rx = Arc::clone(&rx);
+            std::thread::spawn(move || {
+                loop {
+                    let stream = {
+                        let Ok(guard) = rx.lock() else {
+                            break;
+                        };
+                        match guard.recv() {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        }
+                    };
+                    handle_client_connection(stream, faster);
+                }
+            });
+        }
+        Some(sender)
+    } else {
+        None
+    };
+
     while match max_requests {
         Some(max) => handled < max,
         None => true,
@@ -239,8 +291,16 @@ pub fn run_server(
         let _ = stream.set_read_timeout(timeout);
         let _ = stream.set_write_timeout(timeout);
         handled += 1;
-        handle_client_connection(stream, faster);
+        if let Some(ref sender) = tx {
+            if sender.send(stream).is_err() {
+                break;
+            }
+        } else {
+            handle_client_connection(stream, faster);
+        }
     }
+
+    drop(tx);
 
     if sock_path.exists() {
         let _ = std::fs::remove_file(sock_path);

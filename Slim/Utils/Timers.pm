@@ -254,7 +254,7 @@ sub _makeTimer {
 	# cost of proxying the method is silly
 	my $w;
 	$w = EV::timer( $when - $now, 0, sub {
-		if ( $_[0] && $_[0] == EV_KILL ) {
+		if ( defined $_[0] && !ref($_[0]) && $_[0] == EV_KILL ) {
 			# Nasty hack to destroy the EV::Timer object properly
 			defined $w && $w->stop;
 			undef $w;
@@ -297,14 +297,7 @@ sub cleanupTimers {
 		my @objs = keys %{ $TIMERS{$sub} };
 		for my $obj ( @objs ) {
 			my $timers = $TIMERS{$sub}->{$obj};
-			while ( @{$timers} ) {
-				if ( !defined $timers->[0] ) {
-					splice @{$timers}, 0, 1;
-				}
-				else {
-					last;
-				}
-			}
+			@{$timers} = grep { defined $_ } @{$timers};
 
 			if ( !scalar @{$timers} ) {
 				# No timers left for this obj, remove it

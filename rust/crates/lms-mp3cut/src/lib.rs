@@ -271,14 +271,17 @@ pub fn decode_mllt_cache(data: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
             .map_err(|_| Mp3CutError::CacheError("Read error".into()))?,
     ) as usize;
 
-    let expected_len = 32 + frame_count * 12;
+    let expected_len = frame_count
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| Mp3CutError::CacheError("Invalid frame count overflow".into()))?;
     if data.len() < expected_len {
         return Err(Mp3CutError::CacheError(
             "Incomplete .mllt frame table".into(),
         ));
     }
 
-    let mut frames = Vec::with_capacity(frame_count);
+    let mut frames = Vec::with_capacity(frame_count.min(data.len() / 12));
     let mut offset = 32;
     for _ in 0..frame_count {
         let f_offset = u64::from_le_bytes(
@@ -366,7 +369,7 @@ pub fn scan_mp3_frames(bytes: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
         scan_end = bytes.len() - 128;
     }
 
-    let mut frames = Vec::new();
+    let mut frames = Vec::with_capacity(bytes.len() / 417);
     let mut sample_rate = 0;
     let mut samples_per_frame = 0;
     let mut channels = 0;
@@ -624,8 +627,8 @@ impl GaplessCutStream {
             return Ok(0);
         }
 
-        let remaining = (self.end_offset - self.current_offset) as usize;
-        let to_read = buf.len().min(remaining);
+        let to_read = (buf.len() as u64)
+            .min(self.end_offset.saturating_sub(self.current_offset)) as usize;
         let n = self.file.read(&mut buf[..to_read])?;
         self.current_offset += n as u64;
         Ok(n)

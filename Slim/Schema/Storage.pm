@@ -62,6 +62,8 @@ sub throw_exception {
 		$dbfile = Slim::Utils::SQLiteHelper->dbFile($dbfile, $dbfile =~ /persist/);
 
 		unlink($dbfile);
+		unlink("$dbfile-wal");
+		unlink("$dbfile-shm");
 
 		if (!$rebuilt{$dbfile} && !-f $dbfile) {
 

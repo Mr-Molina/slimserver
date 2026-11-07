@@ -104,15 +104,12 @@ sub on_connect_do {
 		'PRAGMA busy_timeout = 5000',
 		'PRAGMA mmap_size = 268435456',
 		'PRAGMA journal_size_limit = 16777216',
+		'PRAGMA temp_store = MEMORY',
 		# Default cache_size is 2000 pages, a page is normally 1K but may be different
 		# depending on the OS/filesystem.  So default is usually 2MB.
 		# Highmem we will try 20M (high) or 500M (max)
 		'PRAGMA cache_size = ' . $class->_cacheSize,
 	];
-
-	# Default temp_store is to create disk files to save memory
-	# Highmem we'll let it use memory
-	push @{$sql}, 'PRAGMA temp_store = MEMORY' if $prefs->get('dbhighmem');
 
 	return $sql;
 }
@@ -130,13 +127,13 @@ sub setCacheSize {
 sub _cacheSize {
 	my $high = $prefs->get('dbhighmem');
 
-	return 2000 if !$high;
+	return -8192 if !$high;
 
 	# scanner doesn't take advantage of a huge buffer
-	return 20000 if main::SCANNER || $high == 1;
+	return -32768 if main::SCANNER || $high == 1;
 
 	# maximum memory usage for large collections and lots of memory
-	return 500_000;
+	return -262144;
 }
 
 sub _migrateDBFile {
@@ -319,7 +316,7 @@ sub optimizeDB {
 	return if !main::SCANNER && grep { $_->power() } Slim::Player::Client::clients();
 
 	$class->vacuum();
-	$class->vacuum('persist.db');
+	$class->vacuum('persist.db', undef, 1);
 }
 
 =head2 exitScan()
@@ -358,6 +355,8 @@ sub postConnect {
 
 	$dbh->do("ATTACH '$persistentdb' AS persistentdb");
 	$dbh->do('PRAGMA persistentdb.journal_mode = WAL');
+	$dbh->do('PRAGMA persistentdb.synchronous = NORMAL');
+	$dbh->do('PRAGMA persistentdb.mmap_size = 67108864');
 	$dbh->do('PRAGMA persistentdb.cache_size = ' . $class->_cacheSize);
 
 	# http://search.cpan.org/~adamk/DBD-SQLite-1.33/lib/DBD/SQLite.pm#Transaction_and_Database_Locking
@@ -518,9 +517,9 @@ If the $optional parameter is passed, the VACUUM will only happen if there's a c
 =cut
 
 sub vacuum {
-	my ( $class, $db, $optional ) = @_;
+	my ( $class, $db, $optional, $persistent ) = @_;
 
-	my $dbFile = $class->dbFile($db || 'library.db');
+	my $dbFile = $class->dbFile($db || 'library.db', $persistent);
 
 	# files other than the default library.db can be stored in a persistent folder
 	$dbFile = $class->dbFile($db, 'persistent') if $db && !-f $dbFile;
@@ -533,28 +532,36 @@ sub vacuum {
 	my $source = sprintf( $class->default_dbsource(), $dbFile );
 
 	# this can't be run from the schema_cleanup.sql, as VACUUM doesn't work inside a transaction
-	my $dbh = DBI->connect($source);
+	eval {
+		my $dbh = DBI->connect($source);
+		return unless $dbh;
 
-	if ($optional) {
-		my $pages = $dbh->selectrow_array('PRAGMA page_count;');
-		my $free  = $dbh->selectrow_array('PRAGMA freelist_count;');
-		my $frag  = ($pages && $free) ? $free / $pages : 0;
+		if ($optional) {
+			my $pages = $dbh->selectrow_array('PRAGMA page_count;');
+			my $free  = $dbh->selectrow_array('PRAGMA freelist_count;');
+			my $frag  = ($pages && $free) ? $free / $pages : 0;
 
-		main::DEBUGLOG && $log->is_debug && $log->debug("$dbFile: Pages: $pages; Free: $free; Fragmentation: $frag");
+			main::DEBUGLOG && $log->is_debug && $log->debug("$dbFile: Pages: $pages; Free: $free; Fragmentation: $frag");
 
-		# don't skip this vacuum if fragmentation is higher than 10%;
-		$optional = 0 if $frag > 0.1;
-	}
-
-	if ( !$optional ) {
-		# use memory as temporary storage for the vaccum if dbhighmem is enabled and db file is smaller than 1GB
-		if ( Slim::Utils::OSDetect::getOS->canVacuumInMemory($dbSize) ) {
-			main::INFOLOG && $log->is_info && $log->info("Using memory (RAM) to store temporary table in VACUUM command: $db");
-			$dbh->do('PRAGMA temp_store = MEMORY');
+			# don't skip this vacuum if fragmentation is higher than 10%;
+			$optional = 0 if $frag > 0.1;
 		}
-		$dbh->do('VACUUM');
+
+		if ( !$optional ) {
+			# use memory as temporary storage for the vaccum if dbhighmem is enabled and db file is smaller than 1GB
+			if ( Slim::Utils::OSDetect::getOS->canVacuumInMemory($dbSize) ) {
+				main::INFOLOG && $log->is_info && $log->info("Using memory (RAM) to store temporary table in VACUUM command: $db");
+				$dbh->do('PRAGMA temp_store = MEMORY');
+			}
+			$dbh->do('PRAGMA busy_timeout = 10000');
+			$dbh->do('PRAGMA synchronous = NORMAL');
+			$dbh->do('VACUUM');
+		}
+		$dbh->disconnect;
+	};
+	if ($@) {
+		$log->error("VACUUM failed for $db: $@");
 	}
-	$dbh->disconnect;
 
 	main::DEBUGLOG && $log->is_debug && $log->debug("VACUUM $db done!");
 }

@@ -468,11 +468,13 @@ sub _pauseStreaming {
 	}
 
 	_setStreamingState($self, IDLE);
-	$playingSong->setStatus(Slim::Player::Song::STATUS_READY);
+	if (defined $playingSong) {
+		$playingSong->setStatus(Slim::Player::Song::STATUS_READY);
 
-	# clear streamingSong if not same as playingSong
-	if ($playingSong != $self->{'songqueue'}->[0]) {
-		shift @{$self->{'songqueue'}};
+		# clear streamingSong if not same as playingSong
+		if (@{$self->{'songqueue'}} && $playingSong != $self->{'songqueue'}->[0]) {
+			shift @{$self->{'songqueue'}};
+		}
 	}
 
 }
@@ -502,7 +504,7 @@ sub _CheckSync {
 		my $playPoint = $player->playPoint();
 		if ( !defined $playPoint ) {
 			if ( main::DEBUGLOG && $synclog->is_debug ) {$synclog->debug( $player->id() . " bailing as no playPoint" );}
-			return;
+			next;
 		}
 		if ( $playPoint->[0] > $recentThreshold ) {
 			push(@playerPlayPoints,
@@ -517,10 +519,10 @@ sub _CheckSync {
 				$synclog->debug( $player->id() . " bailing as playPoint too old: "
 					  . ( $now - $playPoint->[0] ) . "s" );
 			}
-			return;
+			next;
 		}
 	}
-	return unless scalar(@playerPlayPoints);
+	return if scalar(@playerPlayPoints) < 2;
 
 	if ( main::DEBUGLOG && $synclog->is_debug ) {
 		my $first = $playerPlayPoints[0][1];
@@ -550,6 +552,7 @@ sub _CheckSync {
 	# my $referenceMinAdjust = $prefs->client($playerPlayPoints[$reference][0])->get('minSyncAdjust')/1000;
 
 	# tell each player that is out-of-sync with the reference to adjust
+	my $maxDelta = 0;
 	for ( my $i = 0 ; $i < @playerPlayPoints ; $i++ ) {
 		next if ( $i == $reference );
 		my $player = $playerPlayPoints[$i][0];
@@ -566,7 +569,7 @@ sub _CheckSync {
 				$synclog->info(sprintf("%s resync: skipAhead %dms",	$player->id(), $delta * 1000));
 			}
 			$player->skipAhead($delta);
-			$self->{'nextCheckSyncTime'} += 1;
+			$maxDelta = 1 if $maxDelta < 1;
 		}
 		else {
 
@@ -576,10 +579,11 @@ sub _CheckSync {
 					$synclog->info(sprintf("%s resync: pauseFor %dms", $player->id(), $delta * 1000));
 				}
 				$player->pauseForInterval($delta);
-				$self->{'nextCheckSyncTime'} += $delta;
+				$maxDelta = $delta if $delta > $maxDelta;
 			}
 		}
 	}
+	$self->{'nextCheckSyncTime'} += $maxDelta;
 }
 
 sub _Stop {					# stop -> Stopped, Idle
@@ -587,6 +591,9 @@ sub _Stop {					# stop -> Stopped, Idle
 
 	# bug 10458 - try to avoding unnecessary notifications
 	$suppressNotifications = 1 unless ( $self->isPlaying() || $self->isPaused() );
+
+	$self->{'nextTrackCallbackId'}++;
+	$self->{'nextTrack'} = undef;
 
 	if ( !$suppressNotifications && $self->playingSong() && ( $self->isPlaying(1) || $self->isPaused() ) ) {
 		my $song = $self->playingSong();
@@ -797,7 +804,7 @@ sub _playersMessage {
 		}
 	}
 
-	my $line1 = (uc($message) eq $message) ? $master->string($message) : $message;
+	my $line1 = ($master && uc($message) eq $message) ? $master->string($message) : $message;
 
 	main::INFOLOG && $log->info("$line1: $url");
 

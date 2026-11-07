@@ -831,7 +831,8 @@ sub albumsQuery {
 			}
 		}
 
-		my $vaObjId = Slim::Schema->variousArtistsObject->id;
+		my $vaObj = Slim::Schema->variousArtistsObject;
+		my $vaObjId = $vaObj ? $vaObj->id : 0;
 
 		while ( $sth->fetch ) {
 
@@ -880,7 +881,7 @@ sub albumsQuery {
 			if ( $tags =~ /2/ ) {
 				my $nonContiguous;
 				if ( $c->{'group_count'} > 1 ) {
-					my $previousGroup;
+					my $previousGroup = '';
 					my $groupSeen = {};
 					foreach ( sort split(',,', $c->{'group_structure'}) ) {
 						my $thisTrackGroup = substr($_, 10);
@@ -920,7 +921,7 @@ sub albumsQuery {
 			}
 
 			# want multiple artists?
-			if ( $contributorSql && $c->{'albums.contributor'} != $vaObjId && !$c->{'albums.compilation'} ) {
+			if ( $contributorSql && defined $c->{'albums.contributor'} && $c->{'albums.contributor'} != $vaObjId && !$c->{'albums.compilation'} ) {
 				$contributorSth ||= $dbh->prepare_cached($contributorSql);
 				$contributorSth->bind_param(":album", $c->{'albums.id'});
 				if ( $work ) {
@@ -4074,10 +4075,12 @@ sub statusQuery {
 	}
 
 	# add showBriefly info
-	if ($client->display->renderCache->{showBriefly}
-		&& $client->display->renderCache->{showBriefly}->{line}
-		&& $client->display->renderCache->{showBriefly}->{ttl} > time()) {
-		$request->addResult('showBriefly', $client->display->renderCache->{showBriefly}->{line});
+	if (my $display = $client->display) {
+		if ($display->renderCache->{showBriefly}
+			&& $display->renderCache->{showBriefly}->{line}
+			&& $display->renderCache->{showBriefly}->{ttl} > time()) {
+			$request->addResult('showBriefly', $display->renderCache->{showBriefly}->{line});
+		}
 	}
 
 	if ($client->isPlayer()) {
@@ -4170,14 +4173,11 @@ sub statusQuery {
 		$request->addResult('will_sleep_in', ($sleep < 0 ? 0 : $sleep));
 	}
 
-	if ($client->isSynced()) {
-
-		my $master = $client->master();
+	if ($client->isSynced() && (my $master = $client->master())) {
 
 		$request->addResult('sync_master', $master->id());
 
-		my @slaves = Slim::Player::Sync::slaves($master);
-		my @sync_slaves = map { $_->id } @slaves;
+		my @sync_slaves = map { $_ ? $_->id : () } Slim::Player::Sync::slaves($master);
 
 		$request->addResult('sync_slaves', join(",", @sync_slaves));
 	}
@@ -4503,7 +4503,7 @@ sub statusQuery {
 					else {
 						_addSong(	$request, $loop, $count,
 									$data, $tags,
-									'playlist index', $idx, $fast, @addedFromWork[$count]
+									'playlist index', $idx, $fast, $addedFromWork[$count]
 								);
 
 						if ( $tags =~ /2/ ) {
@@ -4540,7 +4540,7 @@ sub statusQuery {
 						$albumGroupData ||= [];
 
 						my $nonContiguous;
-						my $previousGroup;
+						my $previousGroup = '';
 						my $groupSeen = {};
 
 						# determine whether album group contains contiguous or non-contiguous groups of tracks

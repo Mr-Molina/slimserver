@@ -88,6 +88,7 @@ CREATE INDEX trackRemoteIndex ON tracks (remote);
 CREATE INDEX trackLosslessIndex ON tracks (lossless);
 CREATE INDEX urlIndex ON tracks (url);
 CREATE INDEX trackExtId ON tracks (extid);
+CREATE INDEX tracks_album_disc_tracknum ON tracks (album, disc, tracknum);
 
 --
 -- Table: playlist_track
@@ -104,6 +105,7 @@ CREATE TABLE playlist_track (
 CREATE INDEX trackIndex ON playlist_track (track);
 CREATE INDEX positionIndex ON playlist_track (position);
 CREATE INDEX playlistIndex ON playlist_track (playlist);
+CREATE INDEX playlist_track_pos ON playlist_track (playlist, position, track);
 
 --
 -- Table: albums
@@ -135,6 +137,7 @@ CREATE INDEX albumsYearIndex ON albums (year);
 CREATE INDEX albumsDiscIndex ON albums (disc);
 CREATE INDEX albumsDiscCountIndex ON albums (discc);
 CREATE INDEX albumsArtworkIndex ON albums (artwork);
+CREATE INDEX albumsContributorIndex ON albums (contributor);
 
 --
 -- Table: years
@@ -177,7 +180,7 @@ CREATE TABLE contributor_track (
 );
 CREATE INDEX contributor_trackContribIndex ON contributor_track (contributor);
 CREATE INDEX contributor_trackTrackIndex ON contributor_track (track);
-CREATE INDEX contributor_trackRoleIndex ON contributor_track (role);
+CREATE INDEX contributor_track_track_role_contrib ON contributor_track (track, role, contributor);
 
 --
 -- Table: contributor_album
@@ -193,7 +196,7 @@ CREATE TABLE contributor_album (
 );
 CREATE INDEX contributor_albumContribIndex ON contributor_album (contributor);
 CREATE INDEX contributor_albumAlbumIndex ON contributor_album (album);
-CREATE INDEX contributor_albumRoleIndex ON contributor_album (role);
+CREATE INDEX contributor_album_album_role ON contributor_album (album, role, contributor);
 
 --
 -- Table: genres
@@ -223,7 +226,7 @@ CREATE TABLE genre_track (
   FOREIGN KEY (`track`) REFERENCES `tracks` (`id`) ON DELETE CASCADE,
   FOREIGN KEY (`genre`) REFERENCES `genres` (`id`) ON DELETE CASCADE
 );
-CREATE INDEX genre_trackGenreIndex ON genre_track (genre);
+CREATE INDEX genre_track_track_genre ON genre_track (track, genre);
 CREATE INDEX genre_trackTrackIndex ON genre_track (track);
 
 --

@@ -212,7 +212,7 @@ sub artworkRequest {
 		elsif ( $id =~ /^[0-9a-f]{8}$/ ) {
 			# ID is a coverid
 			$sth = Slim::Schema->dbh->prepare_cached( qq{
-				SELECT url, cover FROM tracks WHERE coverid = ?
+				SELECT url, cover FROM tracks WHERE coverid = ? LIMIT 1
 			} );
 		}
 		elsif ( $id =~ /^-\d+$/ ) {

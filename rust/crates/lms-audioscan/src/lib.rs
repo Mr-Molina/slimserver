@@ -5,6 +5,7 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::TagType;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,17 +222,29 @@ fn compute_audio_offset(file_bytes: &[u8], _path: &Path) -> u64 {
             | (file_bytes[9] as u64 & 0x7F);
         let footer = (file_bytes[5] & 0x10) != 0;
         let tag_end = (10 + size + if footer { 10 } else { 0 }) as usize;
-        let mut pos = tag_end;
+        let mut pos = tag_end.min(file_bytes.len());
         while pos + 4 <= file_bytes.len() {
-            if file_bytes[pos] == 0xFF
-                && (file_bytes[pos + 1] & 0xE0) == 0xE0
-                && parse_mp3_header(&file_bytes[pos..pos + 4]).is_some()
-            {
-                return pos as u64;
+            if file_bytes[pos] == 0xFF && (file_bytes[pos + 1] & 0xE0) == 0xE0 {
+                if let Some(hdr) = parse_mp3_header(&file_bytes[pos..pos + 4]) {
+                    let pad = if hdr.padding { 1 } else { 0 };
+                    let frame_len = if hdr.sample_rate > 0 {
+                        ((144 * hdr.bitrate_kbps * 1000) / hdr.sample_rate + pad) as usize
+                    } else {
+                        hdr.frame_length
+                    };
+                    let frame_len = frame_len.max(4);
+                    let frame_end = (pos + frame_len).min(file_bytes.len());
+                    let payload = &file_bytes[pos..frame_end];
+                    if payload.windows(4).any(|w| w == b"Xing" || w == b"Info" || w == b"VBRI") {
+                        pos += frame_len;
+                        continue;
+                    }
+                    return pos as u64;
+                }
             }
             pos += 1;
         }
-        return tag_end as u64;
+        return pos.min(file_bytes.len()) as u64;
     }
 
     if file_bytes.len() >= 4 && &file_bytes[0..4] == b"fLaC" {
@@ -294,7 +307,7 @@ fn compute_audio_offset(file_bytes: &[u8], _path: &Path) -> u64 {
                 } else {
                     0
                 };
-                return (pos + 16 + ssnd_offset) as u64;
+                return (pos + 16 + ssnd_offset).min(file_bytes.len()) as u64;
             }
             pos += 8 + chunk_len;
             if chunk_len % 2 == 1 {
@@ -313,13 +326,35 @@ fn compute_audio_offset(file_bytes: &[u8], _path: &Path) -> u64 {
             file_bytes[pos + 3],
         ]) as usize;
         let box_type = &file_bytes[pos + 4..pos + 8];
+        let (actual_len, header_len) = if box_len == 1 {
+            if pos + 16 <= file_bytes.len() {
+                let largesize = u64::from_be_bytes([
+                    file_bytes[pos + 8],
+                    file_bytes[pos + 9],
+                    file_bytes[pos + 10],
+                    file_bytes[pos + 11],
+                    file_bytes[pos + 12],
+                    file_bytes[pos + 13],
+                    file_bytes[pos + 14],
+                    file_bytes[pos + 15],
+                ]) as usize;
+                (largesize, 16)
+            } else {
+                break;
+            }
+        } else {
+            (box_len, 8)
+        };
         if box_type == b"mdat" {
-            return (pos + 8) as u64;
+            return (pos + header_len).min(file_bytes.len()) as u64;
         }
-        if box_len == 0 || box_len == 1 {
+        if actual_len < 8 {
             break;
         }
-        pos += box_len;
+        pos = match pos.checked_add(actual_len) {
+            Some(p) => p,
+            None => break,
+        };
     }
 
     // MP3 without ID3 header
@@ -363,14 +398,18 @@ pub fn scan_file(
     include_tags: bool,
     no_artwork: bool,
 ) -> Result<ScanResult, AudioScanError> {
-    let file_bytes = std::fs::read(path)?;
-    let file_size = file_bytes.len() as u64;
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut header_bytes = Vec::new();
+    (&mut file)
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut header_bytes)?;
 
     let mut info_map = serde_json::Map::new();
     let mut tags_map = serde_json::Map::new();
 
     let tagged_file = Probe::open(path)?.read()?;
-    let audio_offset = compute_audio_offset(&file_bytes, path);
+    let audio_offset = compute_audio_offset(&header_bytes, path);
 
     if include_info {
         let props = tagged_file.properties();
@@ -403,15 +442,15 @@ pub fn scan_file(
             serde_json::json!(bits_per_sample),
         );
 
-        if file_bytes.len() >= 3 && &file_bytes[0..3] == b"ID3" {
-            let major = file_bytes.get(3).copied().unwrap_or(4);
-            let revision = file_bytes.get(4).copied().unwrap_or(0);
+        if header_bytes.len() >= 3 && &header_bytes[0..3] == b"ID3" {
+            let major = header_bytes.get(3).copied().unwrap_or(4);
+            let revision = header_bytes.get(4).copied().unwrap_or(0);
             info_map.insert(
                 "id3_version".to_string(),
                 serde_json::json!(format!("ID3v2.{major}.{revision}")),
             );
             info_map.insert("layer".to_string(), serde_json::json!(3));
-        } else if let Some((_, hdr)) = find_mp3_frame(&file_bytes, 0) {
+        } else if let Some((_, hdr)) = find_mp3_frame(&header_bytes, 0) {
             info_map.insert("layer".to_string(), serde_json::json!(hdr.layer));
         }
     }
@@ -464,10 +503,11 @@ pub fn scan_file(
                             let desc = pic.description().unwrap_or("");
                             let data = pic.data();
                             let offset = find_slice_offset(
-                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                &header_bytes
+                                    [..(audio_offset as usize).min(header_bytes.len())],
                                 data,
                             )
-                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .or_else(|| find_slice_offset(&header_bytes, data))
                             .unwrap_or(0);
                             let entry = if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 serde_json::json!([mime, type_u8, desc, data.len(), offset])
@@ -491,10 +531,11 @@ pub fn scan_file(
                             let desc = pic.description().unwrap_or("");
                             let data = pic.data();
                             let offset = find_slice_offset(
-                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                &header_bytes
+                                    [..(audio_offset as usize).min(header_bytes.len())],
                                 data,
                             )
-                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .or_else(|| find_slice_offset(&header_bytes, data))
                             .unwrap_or(0);
                             let img_data_val = if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 serde_json::json!(data.len())
@@ -526,10 +567,11 @@ pub fn scan_file(
                         if let Some(pic) = pics.first() {
                             let data = pic.data();
                             let offset = find_slice_offset(
-                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                &header_bytes
+                                    [..(audio_offset as usize).min(header_bytes.len())],
                                 data,
                             )
-                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .or_else(|| find_slice_offset(&header_bytes, data))
                             .unwrap_or(0);
                             if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 tags_map.insert("COVR".to_string(), serde_json::json!(data.len()));
@@ -548,10 +590,11 @@ pub fn scan_file(
                         if let Some(pic) = pics.first() {
                             let data = pic.data();
                             let offset = find_slice_offset(
-                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                &header_bytes
+                                    [..(audio_offset as usize).min(header_bytes.len())],
                                 data,
                             )
-                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .or_else(|| find_slice_offset(&header_bytes, data))
                             .unwrap_or(0);
                             if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 tags_map.insert(
@@ -580,10 +623,11 @@ pub fn scan_file(
                             let desc = pic.description().unwrap_or("");
                             let data = pic.data();
                             let offset = find_slice_offset(
-                                &file_bytes[..(audio_offset as usize).min(file_bytes.len())],
+                                &header_bytes
+                                    [..(audio_offset as usize).min(header_bytes.len())],
                                 data,
                             )
-                            .or_else(|| find_slice_offset(&file_bytes, data))
+                            .or_else(|| find_slice_offset(&header_bytes, data))
                             .unwrap_or(0);
                             let entry = if no_artwork || data.len() > 16 * 1024 * 1024 {
                                 serde_json::json!([mime, type_u8, desc, data.len(), offset])
@@ -615,7 +659,12 @@ pub fn find_frame_offset(
     format_hint: Option<&str>,
     target_ms_or_neg_byte_offset: i64,
 ) -> Result<FrameSeekResult, AudioScanError> {
-    let file_bytes = std::fs::read(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut header_bytes = Vec::new();
+    (&mut file)
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut header_bytes)?;
     let ext_str = format_hint
         .map(|s| s.to_ascii_lowercase())
         .or_else(|| {
@@ -636,7 +685,7 @@ pub fn find_frame_offset(
         let target_byte = target_ms_or_neg_byte_offset.unsigned_abs() as usize;
         match ext {
             "mp3" | "mp2" => {
-                if let Some((pos, hdr)) = find_mp3_frame(&file_bytes, target_byte) {
+                if let Some((pos, hdr)) = find_mp3_frame(&header_bytes, target_byte) {
                     return Ok(FrameSeekResult {
                         byte_offset: pos as i64,
                         seek_header: None,
@@ -652,7 +701,7 @@ pub fn find_frame_offset(
                 })
             }
             "flac" | "flc" | "fla" => {
-                if let Some(pos) = find_flac_frame(&file_bytes, target_byte) {
+                if let Some(pos) = find_flac_frame(&header_bytes, target_byte) {
                     return Ok(FrameSeekResult {
                         byte_offset: pos as i64,
                         seek_header: None,
@@ -668,7 +717,7 @@ pub fn find_frame_offset(
                 })
             }
             "ogg" | "oga" | "ogf" => {
-                if let Some(pos) = find_ogg_page(&file_bytes, target_byte) {
+                if let Some(pos) = find_ogg_page(&header_bytes, target_byte) {
                     return Ok(FrameSeekResult {
                         byte_offset: pos as i64,
                         seek_header: None,
@@ -692,7 +741,7 @@ pub fn find_frame_offset(
         }
     } else {
         let target_ms = target_ms_or_neg_byte_offset as u64;
-        let audio_offset = compute_audio_offset(&file_bytes, path) as usize;
+        let audio_offset = compute_audio_offset(&header_bytes, path) as usize;
         if target_ms == 0 {
             return Ok(FrameSeekResult {
                 byte_offset: audio_offset as i64,
@@ -702,16 +751,16 @@ pub fn find_frame_offset(
             });
         }
 
-        let audio_size = file_bytes.len().saturating_sub(audio_offset);
-        let est_byte = (target_ms * audio_size as u64)
+        let audio_size = file_size.saturating_sub(audio_offset as u64);
+        let est_byte = (target_ms * audio_size)
             .checked_div(total_duration_ms)
-            .map(|offset| audio_offset + offset as usize)
-            .unwrap_or(audio_offset);
-        let clamped_est = est_byte.min(file_bytes.len());
+            .map(|offset| audio_offset as u64 + offset)
+            .unwrap_or(audio_offset as u64);
+        let clamped_est = (est_byte as usize).min(header_bytes.len());
 
         match ext {
             "mp3" | "mp2" => {
-                if let Some((pos, hdr)) = find_mp3_frame(&file_bytes, clamped_est) {
+                if let Some((pos, hdr)) = find_mp3_frame(&header_bytes, clamped_est) {
                     return Ok(FrameSeekResult {
                         byte_offset: pos as i64,
                         seek_header: None,
@@ -727,7 +776,7 @@ pub fn find_frame_offset(
                 })
             }
             "flac" | "flc" | "fla" => {
-                if let Some(pos) = find_flac_frame(&file_bytes, clamped_est) {
+                if let Some(pos) = find_flac_frame(&header_bytes, clamped_est) {
                     return Ok(FrameSeekResult {
                         byte_offset: pos as i64,
                         seek_header: None,
@@ -743,7 +792,7 @@ pub fn find_frame_offset(
                 })
             }
             "ogg" | "oga" | "ogf" => {
-                if let Some(pos) = find_ogg_page(&file_bytes, clamped_est) {
+                if let Some(pos) = find_ogg_page(&header_bytes, clamped_est) {
                     return Ok(FrameSeekResult {
                         byte_offset: pos as i64,
                         seek_header: None,
@@ -759,7 +808,7 @@ pub fn find_frame_offset(
                 })
             }
             _ => Ok(FrameSeekResult {
-                byte_offset: clamped_est as i64,
+                byte_offset: est_byte.min(file_size) as i64,
                 seek_header: None,
                 samplerate: sample_rate,
                 channels,

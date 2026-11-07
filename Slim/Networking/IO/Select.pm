@@ -129,6 +129,7 @@ sub _add {
 				my $error = "$@";
 				my $func = main::DEBUGLOG ? Slim::Utils::PerlRunTime::realNameForCodeRef($cb) : 'unk';
 				logError("Select task failed calling $func: $error; fh=$fh");
+				_remove($mode, $fh);
 			}
 		},
 	);

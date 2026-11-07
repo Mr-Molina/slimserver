@@ -54,6 +54,8 @@ sub resize {
 
 	my $isDebug = main::DEBUGLOG && $log->is_debug;
 
+	utf8::encode($file) if !ref($file) && utf8::is_utf8($file);
+
 	# Check for callback, and that the gdresized daemon running and read/writable
 	# unfortunately AnyEvent seems to struggle with wide characters...
 	if (!main::ISWINDOWS && hasDaemon() && $callback && !utf8::is_utf8($file)) {

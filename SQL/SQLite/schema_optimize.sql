@@ -13,3 +13,4 @@
 -- Analyze is slow but very necessary for SQLite to choose correct indices for queries, especially
 -- on the tracks table which has a ton of them.
 ANALYZE;
+PRAGMA optimize;

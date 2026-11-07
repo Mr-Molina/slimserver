@@ -86,12 +86,19 @@ pub fn populate_scanned_files(db_path: &Path, basedir: &Path) -> Result<usize, A
     let mut count = 0usize;
     let mut conn = rusqlite::Connection::open(db_path)?;
     conn.execute_batch(
-        "PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -64000;",
+        "PRAGMA journal_mode = WAL; \
+         PRAGMA synchronous = NORMAL; \
+         PRAGMA busy_timeout = 5000; \
+         PRAGMA cache_size = -64000; \
+         PRAGMA temp_store = MEMORY;",
     )?;
     let mut tx = conn.transaction()?;
     let mut uncommitted = 0usize;
 
-    for entry_res in walkdir::WalkDir::new(basedir).follow_links(true) {
+    let walk_root = basedir
+        .canonicalize()
+        .unwrap_or_else(|_| basedir.to_path_buf());
+    for entry_res in walkdir::WalkDir::new(&walk_root).follow_links(true) {
         let entry = match entry_res {
             Ok(e) => e,
             Err(_) => continue,
@@ -116,7 +123,8 @@ pub fn populate_scanned_files(db_path: &Path, basedir: &Path) -> Result<usize, A
         let filesize = metadata.len() as i64;
 
         tx.prepare_cached(
-            "INSERT INTO scanned_files (url, timestamp, filesize) VALUES (?1, ?2, ?3)",
+            "INSERT OR REPLACE INTO scanned_files (url, timestamp, filesize) \
+             VALUES (?1, ?2, ?3)",
         )?
         .execute(rusqlite::params![url, mtime, filesize])?;
         count += 1;

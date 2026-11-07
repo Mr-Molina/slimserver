@@ -637,32 +637,58 @@ fn parse_sox(args: &[String]) -> Result<TranscodeJob, TranscodeError> {
     })
 }
 
-fn flac_crc8(data: &[u8]) -> u8 {
-    let mut crc = 0u8;
-    for &b in data {
-        crc ^= b;
-        for _ in 0..8 {
+const CRC8_TABLE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u8;
+        let mut j = 0;
+        while j < 8 {
             if (crc & 0x80) != 0 {
                 crc = (crc << 1) ^ 0x07;
             } else {
                 crc <<= 1;
             }
+            j += 1;
         }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+fn flac_crc8(data: &[u8]) -> u8 {
+    let mut crc = 0u8;
+    for &b in data {
+        crc = CRC8_TABLE[(crc ^ b) as usize];
     }
     crc
 }
 
-fn flac_crc16(data: &[u8]) -> u16 {
-    let mut crc = 0u16;
-    for &b in data {
-        crc ^= (b as u16) << 8;
-        for _ in 0..8 {
+const CRC16_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut j = 0;
+        while j < 8 {
             if (crc & 0x8000) != 0 {
                 crc = (crc << 1) ^ 0x8005;
             } else {
                 crc <<= 1;
             }
+            j += 1;
         }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+fn flac_crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc = (crc << 8) ^ CRC16_TABLE[((crc >> 8) as u8 ^ b) as usize];
     }
     crc
 }
@@ -684,7 +710,7 @@ fn write_flac_header<W: Write>(
     block.extend_from_slice(&4096u16.to_be_bytes());
     block.extend_from_slice(&[0, 0, 0]);
     block.extend_from_slice(&[0, 0, 0]);
-    let sr = sample_rate as u64;
+    let sr = (sample_rate as u64) & 0x0F_FFFF;
     let ch = ((channels - 1) & 0x07) as u64;
     let b = ((bps - 1) & 0x1F) as u64;
     let tot = total_samples & 0x0000_000F_FFFF_FFFF;
@@ -731,7 +757,9 @@ fn write_flac_frame<W: Write>(
     let crc8 = flac_crc8(&header);
     header.push(crc8);
 
-    let mut frame_bytes = header;
+    let mut frame_bytes =
+        Vec::with_capacity(32 + block_len * channels as usize * (bps as usize / 8));
+    frame_bytes.extend_from_slice(&header);
     for samples in channel_samples.iter().take(channels as usize) {
         frame_bytes.push(0x02);
         for &s in &samples[..block_len] {
@@ -791,9 +819,9 @@ fn write_wav_header<W: Write>(
     header[20..22].copy_from_slice(&1u16.to_le_bytes());
     header[22..24].copy_from_slice(&channels.to_le_bytes());
     header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * channels as u32 * (bps as u32 / 8);
+    let byte_rate = sample_rate * channels as u32 * (bps as u32).div_ceil(8);
     header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
-    let block_align = channels * (bps / 8);
+    let block_align = channels * bps.div_ceil(8);
     header[32..34].copy_from_slice(&block_align.to_le_bytes());
     header[34..36].copy_from_slice(&bps.to_le_bytes());
     header[36..40].copy_from_slice(b"data");
@@ -1027,6 +1055,7 @@ pub fn execute_transcode<R: Read + Seek + Send + Sync + 'static, W: Write>(
 
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
     let mut sample_buf_i16: Option<SampleBuffer<i16>> = None;
+    let mut out_bytes = Vec::<u8>::new();
 
     let direct_i16 = !needs_resample
         && src_channels == out_channels
@@ -1104,7 +1133,8 @@ pub fn execute_transcode<R: Read + Seek + Send + Sync + 'static, W: Write>(
             buf.copy_interleaved_ref(decoded);
             let samples = buf.samples();
             let c = src_channels as usize;
-            let mut out_bytes = Vec::with_capacity(sliced_frames * c * 2);
+            out_bytes.clear();
+            out_bytes.reserve(sliced_frames * c * 2);
             for f in slice_start..slice_end {
                 for ch in 0..c {
                     let s = samples[f * c + ch];
@@ -1117,12 +1147,12 @@ pub fn execute_transcode<R: Read + Seek + Send + Sync + 'static, W: Write>(
             }
             output.write_all(&out_bytes)?;
         } else {
+            let sc = decoded.spec().channels.count().max(1);
             let buf = sample_buf.get_or_insert_with(|| {
                 SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec())
             });
             buf.copy_interleaved_ref(decoded);
             let samples = buf.samples();
-            let sc = src_channels as usize;
             let tc = out_channels as usize;
 
             let mut mapped_planar = vec![Vec::with_capacity(sliced_frames); tc];
@@ -1232,19 +1262,46 @@ fn convert_f32_to_int(planar: &[Vec<f32>], bps: u16) -> Vec<Vec<i32>> {
     let tc = planar.len();
     let num_frames = planar[0].len();
     let mut out = vec![Vec::with_capacity(num_frames); tc];
-    for ch in 0..tc {
-        for &sample in &planar[ch] {
-            let clamped = sample.clamp(-1.0, 1.0);
-            let int_val = match bps {
-                16 => (clamped * 32767.0).round().clamp(-32768.0, 32767.0) as i32,
-                24 => (clamped * 8388607.0).round().clamp(-8388608.0, 8388607.0) as i32,
-                32 => (clamped * 2147483647.0)
-                    .round()
-                    .clamp(-2147483648.0, 2147483647.0) as i32,
-                8 => (clamped * 127.0).round().clamp(-128.0, 127.0) as i32,
-                _ => (clamped * 32767.0).round().clamp(-32768.0, 32767.0) as i32,
-            };
-            out[ch].push(int_val);
+    match bps {
+        24 => {
+            for ch in 0..tc {
+                for &sample in &planar[ch] {
+                    let v = (sample.clamp(-1.0, 1.0) * 8388607.0)
+                        .round()
+                        .clamp(-8388608.0, 8388607.0) as i32;
+                    out[ch].push(v);
+                }
+            }
+        }
+        32 => {
+            for ch in 0..tc {
+                for &sample in &planar[ch] {
+                    let v = (sample.clamp(-1.0, 1.0) * 2147483647.0)
+                        .round()
+                        .clamp(-2147483648.0, 2147483647.0) as i32;
+                    out[ch].push(v);
+                }
+            }
+        }
+        8 => {
+            for ch in 0..tc {
+                for &sample in &planar[ch] {
+                    let v = (sample.clamp(-1.0, 1.0) * 127.0)
+                        .round()
+                        .clamp(-128.0, 127.0) as i32;
+                    out[ch].push(v);
+                }
+            }
+        }
+        _ => {
+            for ch in 0..tc {
+                for &sample in &planar[ch] {
+                    let v = (sample.clamp(-1.0, 1.0) * 32767.0)
+                        .round()
+                        .clamp(-32768.0, 32767.0) as i32;
+                    out[ch].push(v);
+                }
+            }
         }
     }
     out
@@ -1279,6 +1336,12 @@ fn run(argv0: &str, args: &[String]) -> Result<(), TranscodeError> {
     if let Some(ref path) = job.input_path {
         let file = std::fs::File::open(path)?;
         execute_transcode(&job, file, &mut out_handle)?;
+    } else if job.start_sec.is_none() {
+        let stdin = std::io::stdin();
+        let ro_stdin = symphonia::core::io::ReadOnlySource::new(
+            stdin.take(2 * 1024 * 1024 * 1024),
+        );
+        execute_transcode(&job, ro_stdin, &mut out_handle)?;
     } else {
         let stdin = std::io::stdin();
         let mut temp = tempfile::tempfile()?;

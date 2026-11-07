@@ -9,6 +9,7 @@ package Slim::Networking::Select;
 
 use strict;
 
+use POSIX qw(EWOULDBLOCK EAGAIN EINTR);
 use Slim::Networking::IO::Select;
 use Slim::Utils::Errno;
 use Slim::Utils::Log;
@@ -63,51 +64,66 @@ sub writeNoBlock {
 sub _writeNoBlock {
 	my $socket = shift;
 
-	my $segment = shift(@{$writeQueue{$socket}});
-
-	if (!defined $segment) {
+	if ( !$writeQueue{$socket} || !@{$writeQueue{$socket}} ) {
 		removeWrite($socket);
+		delete $writeQueue{$socket};
 		return;
 	}
 
-	if ( main::INFOLOG && $log->is_info ) {
-		$log->info(sprintf("fileno: [%d] Wrote $segment->{'length'} bytes", fileno($socket)));
-	}
+	my $count = 0;
 
-	my $sentbytes = syswrite($socket, ${$segment->{'data'}}, $segment->{'length'}, $segment->{'offset'});
-
-	if ($! == EWOULDBLOCK) {
+	while (my $segment = shift(@{$writeQueue{$socket}})) {
 
 		if ( main::INFOLOG && $log->is_info ) {
-			$log->info(sprintf("fileno: [%d] Would block while sending.", fileno($socket)));
+			$log->info(sprintf("fileno: [%d] Wrote $segment->{'length'} bytes", fileno($socket)));
 		}
 
-		$sentbytes = 0 unless defined $sentbytes;
+		my $sentbytes = syswrite($socket, ${$segment->{'data'}}, $segment->{'length'}, $segment->{'offset'});
+
+		if (!defined $sentbytes) {
+			if ($! == EWOULDBLOCK || $! == EAGAIN || $! == EINTR) {
+				if ( main::INFOLOG && $log->is_info ) {
+					$log->info(sprintf("fileno: [%d] Would block while sending.", fileno($socket)));
+				}
+				$sentbytes = 0;
+			}
+		}
+
+		if (!defined($sentbytes)) {
+
+			if ( main::INFOLOG && $log->is_info ) {
+				$log->info(sprintf("fileno: [%d] Send to socket had error, aborting.", fileno($socket)));
+			}
+
+			removeWrite($socket);
+			removeWriteNoBlockQ($socket);
+			return;
+		}
+
+		# sent incomplete message
+		if ($sentbytes < $segment->{'length'}) {
+
+			if ( main::INFOLOG && $log->is_info ) {
+				$log->info(sprintf("fileno: [%d] Incomplete message, sent only: $sentbytes", fileno($socket)));
+			}
+
+			$segment->{'length'} -= $sentbytes;
+			$segment->{'offset'} += $sentbytes;
+
+			unshift @{$writeQueue{$socket}}, $segment;
+
+			addWrite($socket, \&_writeNoBlock, 1);
+			return;
+		}
+
+		last if ++$count >= 16;
 	}
 
-	if (!defined($sentbytes)) {
-
-		if ( main::INFOLOG && $log->is_info ) {
-			$log->info(sprintf("fileno: [%d] Send to socket had error, aborting.", fileno($socket)));
-		}
-
+	if ( !@{$writeQueue{$socket}} ) {
 		removeWrite($socket);
-		removeWriteNoBlockQ($socket);
-		return;
+		delete $writeQueue{$socket};
 	}
-
-	# sent incomplete message
-	if ($sentbytes < $segment->{'length'}) {
-
-		if ( main::INFOLOG && $log->is_info ) {
-			$log->info(sprintf("fileno: [%d] Incomplete message, sent only: $sentbytes", fileno($socket)));
-		}
-
-		$segment->{'length'} -= $sentbytes;
-		$segment->{'offset'} += $sentbytes;
-
-		unshift @{$writeQueue{$socket}}, $segment;
-
+	else {
 		addWrite($socket, \&_writeNoBlock, 1);
 	}
 }

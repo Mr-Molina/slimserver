@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use lms_cache::DbArtworkStore;
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
 
@@ -198,6 +199,52 @@ pub fn extract_embedded_artwork(path: &Path) -> Result<Vec<u8>, ImageError> {
     }
 }
 
+fn resolve_bg_rgba(bgcolor: Option<u32>, format: ImageFormat) -> image::Rgba<u8> {
+    match bgcolor {
+        Some(bg) => {
+            let r = ((bg >> 16) & 0xFF) as u8;
+            let g = ((bg >> 8) & 0xFF) as u8;
+            let b = (bg & 0xFF) as u8;
+            let a = if bg > 0xFFFFFF {
+                ((bg >> 24) & 0xFF) as u8
+            } else {
+                255
+            };
+            image::Rgba([r, g, b, a])
+        }
+        None => {
+            if format == ImageFormat::Png {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([0, 0, 0, 255])
+            }
+        }
+    }
+}
+
+fn resize_with_downsample(
+    img: &image::DynamicImage,
+    scaled_w: u32,
+    scaled_h: u32,
+    filter: image::imageops::FilterType,
+) -> image::DynamicImage {
+    let in_width = img.width();
+    let in_height = img.height();
+    if filter == image::imageops::FilterType::CatmullRom
+        && in_width >= scaled_w.saturating_mul(4)
+        && in_height >= scaled_h.saturating_mul(4)
+    {
+        let intermediate = img.resize_exact(
+            scaled_w.saturating_mul(2),
+            scaled_h.saturating_mul(2),
+            image::imageops::FilterType::Triangle,
+        );
+        intermediate.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::CatmullRom)
+    } else {
+        img.resize_exact(scaled_w, scaled_h, filter)
+    }
+}
+
 pub fn resize_image(
     input_bytes: &[u8],
     spec: &ResizeSpec,
@@ -224,19 +271,20 @@ pub fn resize_image(
         return Ok((input_bytes.to_vec(), in_format));
     }
 
+    let reader = image::ImageReader::new(std::io::Cursor::new(input_bytes))
+        .with_guessed_format()
+        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
+    let (dim_w, dim_h) = reader
+        .into_dimensions()
+        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
+    if dim_w == 0 || dim_h == 0 || dim_w > 16_384 || dim_h > 16_384 {
+        return Err(ImageError::InvalidArguments);
+    }
+
     let img =
         image::load_from_memory(input_bytes).map_err(|e| ImageError::ImageDecode(e.to_string()))?;
     let in_width = img.width();
     let in_height = img.height();
-
-    if in_width == 0 || in_height == 0 {
-        return Err(ImageError::ImageDecode(
-            "image has 0 dimensions".to_string(),
-        ));
-    }
-    if in_width > 16_384 || in_height > 16_384 {
-        return Err(ImageError::InvalidArguments);
-    }
 
     // Determine target format
     let mut format = match spec.explicit_format {
@@ -292,32 +340,12 @@ pub fn resize_image(
             let scaled_w = ((in_width as f64 * scale).round() as u32).clamp(1, canvas_w);
             let scaled_h = ((in_height as f64 * scale).round() as u32).clamp(1, canvas_h);
 
-            let scaled = img.resize_exact(scaled_w, scaled_h, filter);
+            let scaled = resize_with_downsample(&img, scaled_w, scaled_h, filter);
 
             if scaled_w == canvas_w && scaled_h == canvas_h {
                 scaled
             } else {
-                let bg_rgba = match spec.bgcolor {
-                    Some(bg) => {
-                        let r = ((bg >> 16) & 0xFF) as u8;
-                        let g = ((bg >> 8) & 0xFF) as u8;
-                        let b = (bg & 0xFF) as u8;
-                        let a = if bg > 0xFFFFFF {
-                            ((bg >> 24) & 0xFF) as u8
-                        } else {
-                            255
-                        };
-                        image::Rgba([r, g, b, a])
-                    }
-                    None => {
-                        if format == ImageFormat::Png {
-                            image::Rgba([0, 0, 0, 0])
-                        } else {
-                            image::Rgba([0, 0, 0, 255])
-                        }
-                    }
-                };
-
+                let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
                 let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
                 let offset_x = (canvas_w - scaled_w) / 2;
                 let offset_y = (canvas_h - scaled_h) / 2;
@@ -349,31 +377,11 @@ pub fn resize_image(
             let scaled_w = ((in_width as f64 * scale).round() as u32).clamp(1, canvas_w);
             let scaled_h = ((in_height as f64 * scale).round() as u32).clamp(1, canvas_h);
 
-            let scaled = img.resize_exact(scaled_w, scaled_h, filter);
+            let scaled = resize_with_downsample(&img, scaled_w, scaled_h, filter);
             if scaled_w == canvas_w && scaled_h == canvas_h {
                 scaled
             } else {
-                let bg_rgba = match spec.bgcolor {
-                    Some(bg) => {
-                        let r = ((bg >> 16) & 0xFF) as u8;
-                        let g = ((bg >> 8) & 0xFF) as u8;
-                        let b = (bg & 0xFF) as u8;
-                        let a = if bg > 0xFFFFFF {
-                            ((bg >> 24) & 0xFF) as u8
-                        } else {
-                            255
-                        };
-                        image::Rgba([r, g, b, a])
-                    }
-                    None => {
-                        if format == ImageFormat::Png {
-                            image::Rgba([0, 0, 0, 0])
-                        } else {
-                            image::Rgba([0, 0, 0, 255])
-                        }
-                    }
-                };
-
+                let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
                 let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
                 let offset_x = (canvas_w - scaled_w) / 2;
                 let offset_y = (canvas_h - scaled_h) / 2;
@@ -401,7 +409,16 @@ pub fn resize_image(
             let scale = target_w as f64 / in_width as f64;
             let target_h = ((in_height as f64 * scale).round() as u32).max(1);
 
-            img.resize_exact(target_w, target_h, filter)
+            let scaled = resize_with_downsample(&img, target_w, target_h, filter);
+            if format == ImageFormat::Jpg && scaled.color().has_alpha() {
+                let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
+                let mut canvas = image::RgbaImage::from_pixel(target_w, target_h, bg_rgba);
+                let scaled_rgba = scaled.to_rgba8();
+                image::imageops::overlay(&mut canvas, &scaled_rgba, 0, 0);
+                image::DynamicImage::ImageRgba8(canvas)
+            } else {
+                scaled
+            }
         }
     };
 
@@ -477,22 +494,25 @@ pub fn gdresize_to_cache(
                 .unwrap_or(0);
             let path_str = p.to_string_lossy().to_string();
 
+            let mut file = std::fs::File::open(p)?;
             let mut header = Vec::with_capacity(16);
-            std::fs::File::open(p)?.take(16).read_to_end(&mut header)?;
+            (&mut file).take(16).read_to_end(&mut header)?;
 
             let raw = if sniff_format(&header).is_some() {
-                std::fs::read(p)?
+                let mut full = header;
+                file.read_to_end(&mut full)?;
+                full
             } else {
                 extract_embedded_artwork(p)?
             };
-            (raw, path_str, mtime)
+            (Cow::Owned(raw), path_str, mtime)
         }
-        InputSource::Bytes(b) => (b.to_vec(), String::new(), 0),
+        InputSource::Bytes(b) => (Cow::Borrowed(b), String::new(), 0),
     };
 
     if specs.len() == 1 {
         let spec_parsed = parse_single_spec(&specs[0]);
-        let (out_bytes, out_format) = resize_image(&src_bytes, &spec_parsed, faster)?;
+        let (out_bytes, out_format) = resize_image(src_bytes.as_ref(), &spec_parsed, faster)?;
 
         if !cachekey.is_empty() {
             let record = lms_cache::ArtworkRecord {
@@ -540,25 +560,31 @@ pub fn gdresize_to_cache(
                 spec_to_run.height = Some(item.height);
             }
 
-            let (resized_bytes, format) = resize_image(&current_bytes, &spec_to_run, faster)?;
+            let (resized_bytes, format) =
+                resize_image(current_bytes.as_ref(), &spec_to_run, faster)?;
 
             let spec_str = format!("{}x{}_{}", item.width, item.height, item.mode_char);
             let key = format_series_cachekey(cachekey, &spec_str);
+
+            let need_for_current = item.width >= 100 && item.height >= 100;
+            let is_first = first_result.is_none();
+
+            let record_data = resized_bytes.clone();
 
             let record = lms_cache::ArtworkRecord {
                 content_type: format.as_str().to_string(),
                 mtime,
                 original_path: original_path.clone(),
-                data: resized_bytes.clone(),
+                data: record_data,
             };
             store.set(&key, &record)?;
 
-            if item.width >= 100 && item.height >= 100 {
-                current_bytes = resized_bytes.clone();
+            if is_first {
+                first_result = Some((resized_bytes.clone(), format));
             }
 
-            if first_result.is_none() {
-                first_result = Some((resized_bytes, format));
+            if need_for_current {
+                current_bytes = Cow::Owned(resized_bytes);
             }
         }
 
