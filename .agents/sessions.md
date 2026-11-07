@@ -2,11 +2,12 @@
 
 > **CRITICAL RULE:** All new entries MUST be prepended directly below this block. When an agent wakes up, it reads the top entry. When it sleeps, it writes the top entry.
 
-## 2026-11-07 12:38 | Orchestrator | Session Handoff (/goodbye) — Post-37h Soak Hardware/Software Audit, IPC/SQLite/Nginx Tuning & Sandy Bridge AVX Deployment (`[slimserver]`)
+## 2026-11-07 12:41 | Orchestrator | Session Handoff (/goodbye) — Workspace Scoped Exclusively to `slimserver` (`Rust-Experiment`) & `10.0.0.50` Server (`[slimserver]`)
 **Agent**: Orchestrator (`/goodbye`)
 **Host OS**: Dev: Debian 13 `x86_64` (`10.0.0.90`) | Prod: Debian 13 `x86_64` (`10.0.0.50` `workstation-1`, Lyrion `9.1.1`)
-**Branch**: `Rust-Experiment` (synced to `origin/Rust-Experiment` at `09e0410fd`)
+**Branch**: `Rust-Experiment` (synced to `origin/Rust-Experiment`)
 **Working Tree**: Clean (`0` uncommitted changes, `0` secrets, `0` scratch artifacts)
+**Workspace Boundary**: `DJMix-LMS` and `Louder-ESP32` (`BASEMENT` `172.22.1.15`) are managed in separate dedicated projects; this workspace is scoped strictly to `slimserver` (`Rust-Experiment`) and `10.0.0.50` server operations.
 
 ### Completed This Session
 - **37.09-Hour Continuous Soak & Server Hardware/OS Tuning on `10.0.0.50` (`HW-01`..`HW-10`, `[EXECUTED & VERIFIED]`)** ✅:
