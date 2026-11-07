@@ -794,6 +794,7 @@ sub albumsQuery {
 		};
 
 		my ($contributorSql, $contributorSth, $contributorNameSth, $contributorRoleSth, @linkRoleIds);
+		my %albumContribCache;
 		if ( $tags =~ /(?:aa|SS)/ ) {
 			# Override $contributorSql if we're dealing with a Work: output Artist, Orchestra, Conductor in that order.
 			if ($work) {
@@ -922,13 +923,18 @@ sub albumsQuery {
 
 			# want multiple artists?
 			if ( $contributorSql && defined $c->{'albums.contributor'} && $c->{'albums.contributor'} != $vaObjId && !$c->{'albums.compilation'} ) {
-				$contributorSth ||= $dbh->prepare_cached($contributorSql);
-				$contributorSth->bind_param(":album", $c->{'albums.id'});
-				if ( $work ) {
-					$contributorSth->bind_param(":work", $work);
-					$contributorSth->bind_param(":performance", $c->{'tracks.performance'}||undef);
+				my $contributorArray = $albumContribCache{ $c->{'albums.id'} };
+				if (!$contributorArray) {
+					$contributorSth ||= $dbh->prepare_cached($contributorSql);
+					$contributorSth->bind_param(":album", $c->{'albums.id'});
+					if ( $work ) {
+						$contributorSth->bind_param(":work", $work);
+						$contributorSth->bind_param(":performance", $c->{'tracks.performance'}||undef);
+					}
+					$contributorArray = $dbh->selectall_arrayref($contributorSth,{ Slice => {} }) || [];
+					$contributorSth->finish();
+					$albumContribCache{ $c->{'albums.id'} } = $contributorArray;
 				}
-				my $contributorArray = $dbh->selectall_arrayref($contributorSth,{ Slice => {} });
 
 				my $contributorHash = {};
 				foreach (@$contributorArray) {
@@ -990,6 +996,7 @@ sub albumsQuery {
 			main::idleStreams() if !($chunkCount % 5);
 		}
 
+		$contributorSth->finish() if $contributorSth;
 	}
 
 	$request->addResult('count', $count);
@@ -4277,21 +4284,35 @@ sub statusQuery {
 
 		# The alarm_state and alarm_next are only good for an alarm in the next 24 hours
 		#  but we need the next alarm (which could be further away than 24 hours)
-		my $alarmNextAlarm = Slim::Utils::Alarm->getNextAlarm($client);
-
-		if($alarmNextAlarm and $alarmNextAlarm->enabled()) {
-			# Get epoch seconds
-			my $alarmNext2 = $alarmNextAlarm->nextDue();
-			$request->addResult('alarm_next2', $alarmNext2);
-			# Get repeat status
-			my $alarmRepeat = $alarmNextAlarm->repeat();
-			$request->addResult('alarm_repeat', $alarmRepeat);
-			# Get days alarm is active
-			my $alarmDays = "";
-			for my $i (0..6) {
-				$alarmDays .= $alarmNextAlarm->day($i) ? "1" : "0";
+		my $alarmCache = $client->pluginData('statusAlarmCache');
+		my $now = time();
+		if (!$alarmCache || ($now - ($alarmCache->{time} || 0)) > 5) {
+			my $alarmNextAlarm = Slim::Utils::Alarm->getNextAlarm($client);
+			my ($alarmNext2, $alarmRepeat, $alarmDays);
+			if ($alarmNextAlarm && $alarmNextAlarm->enabled()) {
+				# Get epoch seconds
+				$alarmNext2 = $alarmNextAlarm->nextDue();
+				# Get repeat status
+				$alarmRepeat = $alarmNextAlarm->repeat();
+				# Get days alarm is active
+				$alarmDays = "";
+				for my $i (0..6) {
+					$alarmDays .= $alarmNextAlarm->day($i) ? "1" : "0";
+				}
 			}
-			$request->addResult('alarm_days', $alarmDays);
+			$alarmCache = {
+				time => $now,
+				next2 => $alarmNext2,
+				repeat => $alarmRepeat,
+				days => $alarmDays,
+			};
+			$client->pluginData('statusAlarmCache', $alarmCache);
+		}
+
+		if (defined $alarmCache->{next2}) {
+			$request->addResult('alarm_next2', $alarmCache->{next2});
+			$request->addResult('alarm_repeat', $alarmCache->{repeat});
+			$request->addResult('alarm_days', $alarmCache->{days});
 		}
 
 		# send client pref for alarm snooze
@@ -5938,9 +5959,8 @@ sub _songData {
 
 		if ( $handler && $handler->can('getMetadataFor') ) {
 			# Don't modify source data
-			$remoteMeta = Storable::dclone(
-				$handler->getMetadataFor( $client, $url )
-			);
+			my $meta = $handler->getMetadataFor( $client, $url );
+			$remoteMeta = ref($meta) eq 'HASH' ? { %$meta } : ( $meta ? Storable::dclone($meta) : {} );
 
 			$remoteMeta->{a} = $remoteMeta->{artist};
 			$remoteMeta->{A} = $remoteMeta->{artist};

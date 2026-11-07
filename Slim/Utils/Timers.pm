@@ -45,6 +45,7 @@ use constant CLEANUP_INTERVAL => 30;
 use constant EV_KILL          => 0xDEADBEEF;
 
 my %TIMERS = ();
+my %TIMER_LOCATIONS = ();
 my $CLEANUP;
 
 my $log = logger('server.timers');
@@ -111,10 +112,17 @@ sub killTimers {
 
 	if ( exists $TIMERS{$subptr}->{$objRef} ) {
 		for my $timer ( @{ $TIMERS{$subptr}->{$objRef} } ) {
-			$timer->cb->(EV_KILL) if $timer;
+			if ( $timer ) {
+				delete $TIMER_LOCATIONS{"$timer"};
+				$timer->cb->(EV_KILL);
+			}
 		}
 
 		delete $TIMERS{$subptr}->{$objRef};
+
+		if ( !keys %{ $TIMERS{$subptr} } ) {
+			delete $TIMERS{$subptr};
+		}
 
 		return 1;
 	}
@@ -156,10 +164,17 @@ sub forgetTimer {
 	for my $sub ( @subs ) {
 		if ( exists $TIMERS{$sub}->{$objRef} ) {
 			for my $timer ( @{ $TIMERS{$sub}->{$objRef} } ) {
-				$timer->cb->(EV_KILL) if $timer;
+				if ( $timer ) {
+					delete $TIMER_LOCATIONS{"$timer"};
+					$timer->cb->(EV_KILL);
+				}
 			}
 
 			delete $TIMERS{$sub}->{$objRef};
+
+			if ( !keys %{ $TIMERS{$sub} } ) {
+				delete $TIMERS{$sub};
+			}
 		}
 	}
 
@@ -177,6 +192,30 @@ removed, 0 if the timer could not be found.
 sub killSpecific {
 	my $w = shift;
 
+	return unless defined $w;
+
+	if ( my $loc = delete $TIMER_LOCATIONS{"$w"} ) {
+		my ( $sub, $objRef ) = @$loc;
+		if ( my $timers = $TIMERS{$sub}->{$objRef} ) {
+			my $i = 0;
+			for my $timer ( @{$timers} ) {
+				if ( defined $timer && $timer == $w ) {
+					$timer->cb->(EV_KILL);
+					splice @{$timers}, $i, 1;
+					last;
+				}
+				$i++;
+			}
+			if ( !@{$timers} ) {
+				delete $TIMERS{$sub}->{$objRef};
+				if ( !keys %{ $TIMERS{$sub} } ) {
+					delete $TIMERS{$sub};
+				}
+			}
+		}
+		return;
+	}
+
 	my @subs = keys %TIMERS;
 
 	for my $sub ( @subs ) {
@@ -184,9 +223,17 @@ sub killSpecific {
 			my $i = 0;
 			for my $timer ( @{ $TIMERS{$sub}->{$objRef} } ) {
 				if ( defined $timer && $timer == $w ) {
+					delete $TIMER_LOCATIONS{"$w"};
 					$timer->cb->(EV_KILL);
 
 					splice @{ $TIMERS{$sub}->{$objRef} }, $i, 1;
+
+					if ( !@{ $TIMERS{$sub}->{$objRef} } ) {
+						delete $TIMERS{$sub}->{$objRef};
+						if ( !keys %{ $TIMERS{$sub} } ) {
+							delete $TIMERS{$sub};
+						}
+					}
 
 					return;
 				}
@@ -257,6 +304,7 @@ sub _makeTimer {
 		if ( defined $_[0] && !ref($_[0]) && $_[0] == EV_KILL ) {
 			# Nasty hack to destroy the EV::Timer object properly
 			defined $w && $w->stop;
+			delete $TIMER_LOCATIONS{"$w"} if defined $w;
 			undef $w;
 			return;
 		}
@@ -274,10 +322,13 @@ sub _makeTimer {
 		}
 
 		# Destroy the timer after it's been run
+		delete $TIMER_LOCATIONS{"$w"} if defined $w;
 		undef $w;
 	} );
 
 	_storeTimer( $subptr, $objRef, $w );
+
+	$TIMER_LOCATIONS{"$w"} = [ $subptr, $objRef ];
 
 	if ( !$CLEANUP ) {
 		# start periodic cleanup timer

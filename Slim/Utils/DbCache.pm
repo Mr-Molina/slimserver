@@ -159,9 +159,9 @@ sub _key {
 	utf8::encode($key) if utf8::is_utf8($key);
 
 	# Get a 60-bit unsigned int from MD5 (SQLite uses 64-bit signed ints for the key)
-	# Have to concat 2 values here so it works on a 32-bit machine
+	# Bitwise pack 32-bit hi and 28-bit lo into a 60-bit integer
 	my $md5 = Digest::MD5::md5_hex($key);
-	return hex( substr($md5, 0, 8) ) . hex( substr($md5, 8, 7) );
+	return (hex( substr($md5, 0, 8) ) << 28) | hex( substr($md5, 8, 7) );
 }
 
 sub pragma {

@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use image::DynamicImage;
 use lms_cache::DbArtworkStore;
 use std::borrow::Cow;
 use std::io::Read;
@@ -245,11 +246,30 @@ fn resize_with_downsample(
     }
 }
 
-pub fn resize_image(
-    input_bytes: &[u8],
+pub fn decode_checked(bytes: &[u8]) -> Result<(DynamicImage, ImageFormat), ImageError> {
+    let in_format = sniff_format(bytes).ok_or(ImageError::UnsupportedFormat)?;
+
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
+    let (dim_w, dim_h) = reader
+        .into_dimensions()
+        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
+    if dim_w == 0 || dim_h == 0 || dim_w > 16_384 || dim_h > 16_384 {
+        return Err(ImageError::InvalidArguments);
+    }
+
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
+    Ok((img, in_format))
+}
+
+fn resize_decoded_image(
+    img: &DynamicImage,
+    in_format: ImageFormat,
     spec: &ResizeSpec,
     faster: bool,
-) -> Result<(Vec<u8>, ImageFormat), ImageError> {
+) -> Result<(DynamicImage, Vec<u8>, ImageFormat), ImageError> {
     if let Some(w) = spec.width {
         if w > 8_192 {
             return Err(ImageError::InvalidArguments);
@@ -261,28 +281,6 @@ pub fn resize_image(
         }
     }
 
-    let in_format = sniff_format(input_bytes).ok_or(ImageError::UnsupportedFormat)?;
-
-    // Short-circuit if no width/height specified, and formats match, return original image
-    if spec.width.is_none()
-        && spec.height.is_none()
-        && (spec.explicit_format.is_none() || spec.explicit_format == Some(in_format))
-    {
-        return Ok((input_bytes.to_vec(), in_format));
-    }
-
-    let reader = image::ImageReader::new(std::io::Cursor::new(input_bytes))
-        .with_guessed_format()
-        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
-    let (dim_w, dim_h) = reader
-        .into_dimensions()
-        .map_err(|e| ImageError::ImageDecode(e.to_string()))?;
-    if dim_w == 0 || dim_h == 0 || dim_w > 16_384 || dim_h > 16_384 {
-        return Err(ImageError::InvalidArguments);
-    }
-
-    let img =
-        image::load_from_memory(input_bytes).map_err(|e| ImageError::ImageDecode(e.to_string()))?;
     let in_width = img.width();
     let in_height = img.height();
 
@@ -307,7 +305,7 @@ pub fn resize_image(
         image::imageops::FilterType::CatmullRom
     };
 
-    let output_image: image::DynamicImage = match spec.mode {
+    let output_image: DynamicImage = match spec.mode {
         ResizeMode::Max | ResizeMode::Pad => {
             // Bug 17140: switch to png if image will contain any padded space,
             // unless a format was explicitly requested.
@@ -340,23 +338,38 @@ pub fn resize_image(
             let scaled_w = ((in_width as f64 * scale).round() as u32).clamp(1, canvas_w);
             let scaled_h = ((in_height as f64 * scale).round() as u32).clamp(1, canvas_h);
 
-            let scaled = resize_with_downsample(&img, scaled_w, scaled_h, filter);
+            let scaled = resize_with_downsample(img, scaled_w, scaled_h, filter);
 
             if scaled_w == canvas_w && scaled_h == canvas_h {
                 scaled
             } else {
                 let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
-                let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
                 let offset_x = (canvas_w - scaled_w) / 2;
                 let offset_y = (canvas_h - scaled_h) / 2;
-                let scaled_rgba = scaled.to_rgba8();
-                image::imageops::overlay(
-                    &mut canvas,
-                    &scaled_rgba,
-                    offset_x as i64,
-                    offset_y as i64,
-                );
-                image::DynamicImage::ImageRgba8(canvas)
+                if format == ImageFormat::Jpg && !scaled.color().has_alpha() {
+                    let mut canvas = image::RgbImage::from_pixel(
+                        canvas_w,
+                        canvas_h,
+                        image::Rgb([bg_rgba.0[0], bg_rgba.0[1], bg_rgba.0[2]]),
+                    );
+                    image::imageops::overlay(
+                        &mut canvas,
+                        &scaled.to_rgb8(),
+                        offset_x as i64,
+                        offset_y as i64,
+                    );
+                    DynamicImage::ImageRgb8(canvas)
+                } else {
+                    let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
+                    let scaled_rgba = scaled.to_rgba8();
+                    image::imageops::overlay(
+                        &mut canvas,
+                        &scaled_rgba,
+                        offset_x as i64,
+                        offset_y as i64,
+                    );
+                    DynamicImage::ImageRgba8(canvas)
+                }
             }
         }
         ResizeMode::FitOrKeep => {
@@ -377,22 +390,37 @@ pub fn resize_image(
             let scaled_w = ((in_width as f64 * scale).round() as u32).clamp(1, canvas_w);
             let scaled_h = ((in_height as f64 * scale).round() as u32).clamp(1, canvas_h);
 
-            let scaled = resize_with_downsample(&img, scaled_w, scaled_h, filter);
+            let scaled = resize_with_downsample(img, scaled_w, scaled_h, filter);
             if scaled_w == canvas_w && scaled_h == canvas_h {
                 scaled
             } else {
                 let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
-                let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
                 let offset_x = (canvas_w - scaled_w) / 2;
                 let offset_y = (canvas_h - scaled_h) / 2;
-                let scaled_rgba = scaled.to_rgba8();
-                image::imageops::overlay(
-                    &mut canvas,
-                    &scaled_rgba,
-                    offset_x as i64,
-                    offset_y as i64,
-                );
-                image::DynamicImage::ImageRgba8(canvas)
+                if format == ImageFormat::Jpg && !scaled.color().has_alpha() {
+                    let mut canvas = image::RgbImage::from_pixel(
+                        canvas_w,
+                        canvas_h,
+                        image::Rgb([bg_rgba.0[0], bg_rgba.0[1], bg_rgba.0[2]]),
+                    );
+                    image::imageops::overlay(
+                        &mut canvas,
+                        &scaled.to_rgb8(),
+                        offset_x as i64,
+                        offset_y as i64,
+                    );
+                    DynamicImage::ImageRgb8(canvas)
+                } else {
+                    let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
+                    let scaled_rgba = scaled.to_rgba8();
+                    image::imageops::overlay(
+                        &mut canvas,
+                        &scaled_rgba,
+                        offset_x as i64,
+                        offset_y as i64,
+                    );
+                    DynamicImage::ImageRgba8(canvas)
+                }
             }
         }
         ResizeMode::Original => {
@@ -409,13 +437,13 @@ pub fn resize_image(
             let scale = target_w as f64 / in_width as f64;
             let target_h = ((in_height as f64 * scale).round() as u32).max(1);
 
-            let scaled = resize_with_downsample(&img, target_w, target_h, filter);
+            let scaled = resize_with_downsample(img, target_w, target_h, filter);
             if format == ImageFormat::Jpg && scaled.color().has_alpha() {
                 let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
                 let mut canvas = image::RgbaImage::from_pixel(target_w, target_h, bg_rgba);
                 let scaled_rgba = scaled.to_rgba8();
                 image::imageops::overlay(&mut canvas, &scaled_rgba, 0, 0);
-                image::DynamicImage::ImageRgba8(canvas)
+                DynamicImage::ImageRgba8(canvas)
             } else {
                 scaled
             }
@@ -458,7 +486,39 @@ pub fn resize_image(
         }
     }
 
-    Ok((out_bytes, format))
+    Ok((output_image, out_bytes, format))
+}
+
+pub fn resize_image(
+    input_bytes: &[u8],
+    spec: &ResizeSpec,
+    faster: bool,
+) -> Result<(Vec<u8>, ImageFormat), ImageError> {
+    if let Some(w) = spec.width {
+        if w > 8_192 {
+            return Err(ImageError::InvalidArguments);
+        }
+    }
+    if let Some(h) = spec.height {
+        if h > 8_192 {
+            return Err(ImageError::InvalidArguments);
+        }
+    }
+
+    let in_format = sniff_format(input_bytes).ok_or(ImageError::UnsupportedFormat)?;
+
+    // Short-circuit if no width/height specified, and formats match, return original image
+    if spec.width.is_none()
+        && spec.height.is_none()
+        && (spec.explicit_format.is_none() || spec.explicit_format == Some(in_format))
+    {
+        return Ok((input_bytes.to_vec(), in_format));
+    }
+
+    let (img, in_fmt) = decode_checked(input_bytes)?;
+    let (_out_img, out_bytes, out_format) =
+        resize_decoded_image(&img, in_fmt, spec, faster)?;
+    Ok((out_bytes, out_format))
 }
 
 fn format_series_cachekey(cachekey: &str, spec: &str) -> String {
@@ -548,7 +608,7 @@ pub fn gdresize_to_cache(
 
         series.sort_by_key(|a| std::cmp::Reverse((a.width, a.height)));
 
-        let mut current_bytes = src_bytes;
+        let (mut current_img, mut current_fmt) = decode_checked(&src_bytes)?;
         let mut first_result: Option<(Vec<u8>, ImageFormat)> = None;
 
         for item in &series {
@@ -560,15 +620,13 @@ pub fn gdresize_to_cache(
                 spec_to_run.height = Some(item.height);
             }
 
-            let (resized_bytes, format) =
-                resize_image(current_bytes.as_ref(), &spec_to_run, faster)?;
+            let (next_img, resized_bytes, format) =
+                resize_decoded_image(&current_img, current_fmt, &spec_to_run, faster)?;
 
             let spec_str = format!("{}x{}_{}", item.width, item.height, item.mode_char);
             let key = format_series_cachekey(cachekey, &spec_str);
 
-            let need_for_current = item.width >= 100 && item.height >= 100;
             let is_first = first_result.is_none();
-
             let record_data = resized_bytes.clone();
 
             let record = lms_cache::ArtworkRecord {
@@ -580,11 +638,12 @@ pub fn gdresize_to_cache(
             store.set(&key, &record)?;
 
             if is_first {
-                first_result = Some((resized_bytes.clone(), format));
+                first_result = Some((resized_bytes, format));
             }
 
-            if need_for_current {
-                current_bytes = Cow::Owned(resized_bytes);
+            if item.width >= 100 && item.height >= 100 && !next_img.color().has_alpha() {
+                current_img = next_img;
+                current_fmt = format;
             }
         }
 

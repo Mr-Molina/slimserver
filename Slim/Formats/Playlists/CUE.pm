@@ -779,17 +779,29 @@ sub processAnchor {
 				}
 
 				eval {
-					# Pre-scan the file with MP3::Cut::Gapless to create frame data cache file
+					# Pre-scan the file with MP3::Cut::Gapless or lms-mp3cut to create frame data cache file
 					# that will be used during playback
-					require MP3::Cut::Gapless;
 					require File::Spec::Functions;
+					my $cachedir = File::Spec::Functions::catdir( $prefs->get('librarycachedir'), 'mp3cut' );
+					my $filepath = $path;
+					my $indexed  = 0;
 
-					main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data for $path");
+					if ( ($ENV{LMS_USE_RUST} // 1) && (my $mp3cutBin = Slim::Utils::Misc::findbin('lms-mp3cut')) ) {
+						main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data via lms-mp3cut for $filepath");
+						if ( system($mp3cutBin, '--file', $filepath, '--cache-dir', $cachedir, '--index-only') == 0 ) {
+							$indexed = 1;
+						}
+					}
 
-					MP3::Cut::Gapless->new(
-						file      => $path,
-						cache_dir => File::Spec::Functions::catdir( $prefs->get('librarycachedir'), 'mp3cut' ),
-					);
+					if ( !$indexed ) {
+						require MP3::Cut::Gapless;
+						main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data for $path");
+
+						MP3::Cut::Gapless->new(
+							file      => $path,
+							cache_dir => $cachedir,
+						);
+					}
 				};
 				if ($@) {
 					$log->warn("Unable to scan $path for gapless split data: $@");

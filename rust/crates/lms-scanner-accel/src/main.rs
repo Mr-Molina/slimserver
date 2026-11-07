@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 #[derive(thiserror::Error, Debug)]
@@ -16,6 +17,15 @@ pub enum AccelError {
     Walk(#[from] walkdir::Error),
     #[error("Argument error: {0}")]
     Arg(String),
+}
+
+impl From<Box<dyn std::error::Error>> for AccelError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        match err.downcast::<rusqlite::Error>() {
+            Ok(db) => AccelError::Db(*db),
+            Err(e) => AccelError::Arg(e.to_string()),
+        }
+    }
 }
 
 fn percent_encode_path(bytes: &[u8]) -> String {
@@ -75,6 +85,26 @@ fn path_to_file_url(path: &Path) -> String {
     }
 }
 
+fn flush_batch(
+    conn: &mut Connection,
+    batch: &mut Vec<(String, i64, i64)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    let mut stmt = tx.prepare_cached(
+        "INSERT OR REPLACE INTO scanned_files (url, timestamp, filesize) VALUES (?1, ?2, ?3)",
+    )?;
+    for (url, mtime, filesize) in batch.iter() {
+        stmt.execute(rusqlite::params![url, mtime, filesize])?;
+    }
+    drop(stmt);
+    batch.clear();
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn populate_scanned_files(db_path: &Path, basedir: &Path) -> Result<usize, AccelError> {
     if !basedir.exists() {
         return Err(AccelError::Io(std::io::Error::new(
@@ -84,16 +114,17 @@ pub fn populate_scanned_files(db_path: &Path, basedir: &Path) -> Result<usize, A
     }
 
     let mut count = 0usize;
-    let mut conn = rusqlite::Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL; \
          PRAGMA synchronous = NORMAL; \
          PRAGMA busy_timeout = 5000; \
          PRAGMA cache_size = -64000; \
-         PRAGMA temp_store = MEMORY;",
+         PRAGMA temp_store = MEMORY; \
+         CREATE INDEX IF NOT EXISTS scanned_files_url_idx ON scanned_files (url);",
     )?;
-    let mut tx = conn.transaction()?;
-    let mut uncommitted = 0usize;
+
+    let mut batch: Vec<(String, i64, i64)> = Vec::with_capacity(5_000);
 
     let walk_root = basedir
         .canonicalize()
@@ -122,21 +153,14 @@ pub fn populate_scanned_files(db_path: &Path, basedir: &Path) -> Result<usize, A
             .unwrap_or(0);
         let filesize = metadata.len() as i64;
 
-        tx.prepare_cached(
-            "INSERT OR REPLACE INTO scanned_files (url, timestamp, filesize) \
-             VALUES (?1, ?2, ?3)",
-        )?
-        .execute(rusqlite::params![url, mtime, filesize])?;
+        batch.push((url, mtime, filesize));
         count += 1;
-        uncommitted += 1;
 
-        if uncommitted >= 5_000 {
-            tx.commit()?;
-            tx = conn.transaction()?;
-            uncommitted = 0;
+        if batch.len() >= 5_000 {
+            flush_batch(&mut conn, &mut batch)?;
         }
     }
-    tx.commit()?;
+    flush_batch(&mut conn, &mut batch)?;
     Ok(count)
 }
 

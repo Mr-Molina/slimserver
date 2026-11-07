@@ -28,17 +28,15 @@ pub struct ArtworkRecord {
 /// In Perl:
 /// ```perl
 /// my $md5 = Digest::MD5::md5_hex($key);
-/// return hex( substr($md5, 0, 8) ) . hex( substr($md5, 8, 7) );
+/// return (hex( substr($md5, 0, 8) ) << 28) | hex( substr($md5, 8, 7) );
 /// ```
-/// Leading zero nibbles in `substr($md5, 8, 7)` evaluate as numbers without leading zeroes,
-/// and the two decimal representations are concatenated as strings before being parsed as a 64-bit signed int.
+/// 32-bit high bits and 28-bit low bits are bitwise packed into a 60-bit integer.
 pub fn md5_key_i64(key: &str) -> i64 {
     let digest = Md5::digest(key.as_bytes());
     let hex = format!("{:032x}", digest);
     let hi = u32::from_str_radix(&hex[0..8], 16).unwrap_or(0);
     let lo = u32::from_str_radix(&hex[8..15], 16).unwrap_or(0);
-    let decimal_concat = format!("{}{}", hi, lo);
-    decimal_concat.parse::<i64>().unwrap_or(0)
+    ((hi as i64) << 28) | (lo as i64)
 }
 
 /// Encodes an `ArtworkRecord` into a binary blob matching Perl `Slim::Utils::ArtworkCache` `pack('A3LS', ...)`.
@@ -221,19 +219,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dbcache_key_matches_perl_leading_zero_nibbles() {
+    fn test_dbcache_key_matches_perl_60bit_packing() {
         // 1. Key with leading zero in nibbles 8..15:
-        // perl -MDigest::MD5=md5_hex -e '$m=md5_hex("test/21"); print "$m -> ".hex(substr($m,0,8)).hex(substr($m,8,7))."\n"'
         // md5_hex("test/21") = "72e64b0f018e085acec8285c35c36e44"
-        // hex("72e64b0f") = 1927695119, hex("018e085") = 1630341 -> "19276951191630341"
-        assert_eq!(md5_key_i64("test/21"), 19276951191630341_i64);
+        // (0x72e64b0f << 28) | 0x018e085 = 0x072e_64b0_f018_e085
+        assert_eq!(md5_key_i64("test/21"), 0x072e_64b0_f018_e085_i64);
 
         // 2. Standard artwork cache key:
         // md5_hex("music/12345/cover_100x100_o") = "c78c3d3e2923430b16a433d8de85427c"
-        // hex("c78c3d3e") = 3347856702, hex("2923430") = 43136048 -> "334785670243136048"
+        // (0xc78c3d3e << 28) | 0x2923430 = 0x0c78_c3d3_e292_3430
         assert_eq!(
             md5_key_i64("music/12345/cover_100x100_o"),
-            334785670243136048_i64
+            0x0c78_c3d3_e292_3430_i64
         );
     }
 

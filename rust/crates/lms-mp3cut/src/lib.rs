@@ -319,9 +319,14 @@ pub fn decode_mllt_cache(data: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
 /// only contains a single frame.
 pub fn find_next_frame_header(bytes: &[u8]) -> Option<(usize, FrameHeader)> {
     let mut first_candidate: Option<(usize, FrameHeader)> = None;
+    let limit = bytes.len().saturating_sub(3);
     let mut i = 0;
-    while i + 4 <= bytes.len() {
-        if bytes[i] == 0xFF && (bytes[i + 1] & 0xE0) == 0xE0 {
+    while i < limit {
+        let Some(rel) = bytes[i..limit].iter().position(|&b| b == 0xFF) else {
+            return first_candidate;
+        };
+        i += rel;
+        if (bytes[i + 1] & 0xE0) == 0xE0 {
             if let Some(header) = parse_frame_header(&bytes[i..]) {
                 if i + header.frame_size <= bytes.len() {
                     let next_i = i + header.frame_size;
@@ -562,46 +567,33 @@ impl GaplessCutStream {
         let (byte_start, byte_end) = if total_frames <= audio_start_frame {
             (0, 0)
         } else {
-            let sample_rate = metadata.sample_rate.max(1) as f64;
-            let samples_per_frame = metadata.samples_per_frame.max(1) as f64;
+            let meta = &metadata;
+            let spf = meta.samples_per_frame as f64;
+            let audio_frames = &metadata.frames[audio_start_frame..];
 
-            let start_frame_idx = match start_ms {
-                None => audio_start_frame,
-                Some(s_ms) => {
-                    let mut found = None;
-                    for i in audio_start_frame..total_frames {
-                        let audio_idx = i - audio_start_frame;
-                        let frame_end_ms =
-                            ((audio_idx + 1) as f64 * samples_per_frame * 1000.0) / sample_rate;
-                        if frame_end_ms > s_ms as f64 {
-                            found = Some(i);
-                            break;
-                        }
-                    }
-                    found.unwrap_or(total_frames)
-                }
+            let (start_idx, end_idx) = if meta.sample_rate > 0 && spf > 0.0 {
+                let start_idx = match start_ms {
+                    None => 0,
+                    Some(start_ms) => (((start_ms as f64 * meta.sample_rate as f64)
+                        / (spf * 1000.0))
+                        .floor() as usize)
+                        .min(audio_frames.len()),
+                };
+                let end_idx = match end_ms {
+                    None => audio_frames.len(),
+                    Some(end_ms) => (((end_ms as f64 * meta.sample_rate as f64)
+                        / (spf * 1000.0))
+                        .ceil() as usize)
+                        .min(audio_frames.len()),
+                };
+                (start_idx, end_idx)
+            } else {
+                (0, audio_frames.len())
             };
 
-            let end_frame_idx = match end_ms {
-                None => total_frames.saturating_sub(1),
-                Some(e_ms) => {
-                    let mut found = None;
-                    for i in (audio_start_frame..total_frames).rev() {
-                        let audio_idx = i - audio_start_frame;
-                        let frame_start_ms =
-                            (audio_idx as f64 * samples_per_frame * 1000.0) / sample_rate;
-                        if frame_start_ms < e_ms as f64 {
-                            found = Some(i);
-                            break;
-                        }
-                    }
-                    found.unwrap_or(audio_start_frame.saturating_sub(1))
-                }
-            };
-
-            if start_frame_idx <= end_frame_idx && end_frame_idx < total_frames {
-                let start_off = metadata.frames[start_frame_idx].offset;
-                let last_frame = &metadata.frames[end_frame_idx];
+            if start_idx < end_idx {
+                let start_off = audio_frames[start_idx].offset;
+                let last_frame = &audio_frames[end_idx - 1];
                 let end_off = last_frame.offset + last_frame.length as u64;
                 (start_off, end_off)
             } else {
