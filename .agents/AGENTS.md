@@ -50,4 +50,4 @@ This document defines the multi-agent roles, responsibilities, and delegation st
 - **Cross-Platform Build & Test Split**:
   - **Windows**: Builds and tests the 5 portable crates (`lms-cache`, `lms-image`, `lms-transcode`, `lms-mp3cut`, `lms-audioscan`).
   - **WSL Ubuntu** (`CARGO_TARGET_DIR=$HOME/.cache/slimserver-target`): Builds and tests all 7 crates, including Linux-only `lms-gdresized` and `lms-scanner-accel`, as well as Perl syntax checks (`perl -c`) and `sqlite3` validation.
-- **Scope Boundary**: Strictly scoped to `slimserver` (`Rust-Experiment`), `workstation-1` (`10.0.0.50`, Lyrion `9.1.1`), and the `10.0.0.90` dev host. `DJMix-LMS` and `Louder-ESP32` are explicitly out of scope.
+- **Scope Boundary**: Strictly scoped to `slimserver` (`Rust-Experiment`), `workstation-1` (`10.0.0.50`, home-office Lyrion `9.1.1`), `xoa-1.myrccs.com` (`172.25.8.40`, work-office Debian 13 `x86_64`, Lyrion `9.1.1`), and the `10.0.0.90` dev host. `DJMix-LMS` and `Louder-ESP32` are explicitly out of scope.
