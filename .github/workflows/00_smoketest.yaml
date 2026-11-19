@@ -42,3 +42,78 @@ jobs:
 
       - name: Run Startup Test
         run: bash t/00_smoketest.sh
+
+  rust:
+    name: Rust workspace checks & Perl-Rust integration tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Make sure we're running as non-root
+        run: |
+          if [ "$RUNNER_USER" == "root" ]; then
+            echo Specify non-root image when testing with act:
+            echo act -P ubuntu-24.04=ghcr.io/catthehacker/ubuntu:runner-24.04
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust cross-compiler and Perl test dependencies
+        if: ${{ !env.ACT }}
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        with:
+          packages: gcc-aarch64-linux-gnu libdbi-perl libdbd-sqlite3-perl
+          version: 1
+
+      - name: Install Rust cross-compiler and Perl test dependencies (ACT fallback)
+        if: ${{ env.ACT }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libdbi-perl libdbd-sqlite3-perl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-audit
+        run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+
+      - name: Check Rust formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy lints
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust workspace unit tests
+        working-directory: rust
+        run: cargo test --workspace --locked
+
+      - name: Cross-check aarch64-unknown-linux-gnu target
+        working-directory: rust
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo check --target aarch64-unknown-linux-gnu --locked
+
+      - name: Run cargo-audit security check
+        working-directory: rust
+        run: cargo audit
+
+      - name: Run Perl-Rust integration test suite
+        run: prove -I. -Ilib -ICPAN t/rust_integration.t

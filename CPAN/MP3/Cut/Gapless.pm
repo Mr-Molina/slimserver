@@ -82,8 +82,8 @@ sub write {
     $self->{end_ms}   = $track->{end_ms} if $track->{end_ms};
 
     if ( !exists $self->{_mp3c} ) {
-        if ( $self->{_rust_fh} ) {
-            close delete $self->{_rust_fh};
+        if ( my $rfh = delete $self->{_rust_fh} ) {
+            close $rfh;
         }
         $self->_init;
     }
@@ -99,21 +99,20 @@ sub write {
 
 sub _rust_bin {
     return undef unless ($ENV{LMS_USE_RUST} // 1);
+    return undef unless $^O eq 'linux';
     require Config;
-    my $arch = ($Config::Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+    require FindBin;
+    my $archname = $Config::Config{archname} || '';
+    my $arch = $archname =~ /^(?:aarch64|arm64)(?:-|$)/i ? 'aarch64-linux'
+             : $archname =~ /^(?:x86_64|amd64)(?:-|$)/i  ? 'x86_64-linux'
+             : return undef;
+    my $bin_dir = (defined $FindBin::Bin && $FindBin::Bin ne '') ? "$FindBin::Bin/Bin/$arch" : undef;
     for my $dir (
-        $FindBin::Bin ? "$FindBin::Bin/Bin/$arch" : (),
+        $bin_dir ? ($bin_dir) : (),
         "/usr/share/squeezeboxserver/Bin/$arch",
-        "/home/console-admin/Github/slimserver/Bin/$arch",
-        $FindBin::Bin ? "$FindBin::Bin/Bin/x86_64-linux" : (),
-        "/usr/share/squeezeboxserver/Bin/x86_64-linux",
-        "/home/console-admin/Github/slimserver/Bin/x86_64-linux",
-        $FindBin::Bin ? "$FindBin::Bin/Bin/aarch64-linux" : (),
-        "/usr/share/squeezeboxserver/Bin/aarch64-linux",
-        "/home/console-admin/Github/slimserver/Bin/aarch64-linux",
     ) {
         my $bin = "$dir/lms-mp3cut";
-        return $bin if -x $bin;
+        return $bin if -f $bin && -x _;
     }
     return undef;
 }
@@ -121,14 +120,53 @@ sub _rust_bin {
 sub _perl_read {
     my $self = shift;
     if ( $self->{_rust_fh} ) {
-        my $n = CORE::read( $self->{_rust_fh}, $_[0], $_[1] || 32768 );
-        return $n || 0;
+        my $len = $_[1] || 32768;
+        my $n = CORE::read( $self->{_rust_fh}, $_[0], $len );
+        if ( defined $n && $n > 0 ) {
+            $self->{_rust_bytes_read} += $n;
+            return $n;
+        }
+
+        my $rfh       = delete $self->{_rust_fh};
+        my $close_ok  = close($rfh);
+        my $child_err = $?;
+
+        if ( !$self->{_rust_bytes_read} ) {
+            if ( !$close_ok || $child_err != 0 || !defined $n ) {
+                warn "lms-mp3cut failed (exit=" . ( $child_err >> 8 ) . ", sig=" . ( $child_err & 127 ) . "); falling back to XS\n";
+            }
+            else {
+                warn "lms-mp3cut returned unexpected empty stream; falling back to XS\n";
+            }
+            eval { $self->_init_xs; 1 } or do {
+                warn "MP3::Cut::Gapless XS fallback failed: $@";
+                return undef;
+            };
+            return $self->__xs_read(@_);
+        }
+
+        if ( !$close_ok || $child_err != 0 || !defined $n ) {
+            warn "lms-mp3cut failed mid-stream (exit=" . ( $child_err >> 8 ) . ", sig=" . ( $child_err & 127 ) . ")\n";
+            return undef;
+        }
+
+        return 0;
     }
     return $self->__xs_read(@_);
 }
 
+sub _init_xs {
+    my $self = shift;
+
+    open $self->{_fh}, '<', $self->{file} or die "Unable to open $self->{file} for reading: $!";
+    binmode $self->{_fh};
+    $self->{_mp3c} = $self->__init(@_);
+}
+
 sub _init {
     my $self = shift;
+
+    delete $self->{_rust_bytes_read};
 
     if ( my $bin = _rust_bin() ) {
         my @cmd = ( $bin, '--file', $self->{file} );
@@ -136,20 +174,22 @@ sub _init {
         push @cmd, ( '--start-ms',  $self->{start_ms} )  if defined $self->{start_ms};
         push @cmd, ( '--end-ms',    $self->{end_ms} )    if defined $self->{end_ms};
         if ( !defined $self->{start_ms} && !defined $self->{end_ms} ) {
-            push @cmd, '--index-only';
-            system(@cmd);
-            return;
+            if ( $self->{cache_dir} ) {
+                push @cmd, '--index-only';
+                if ( system(@cmd) == 0 ) {
+                    return;
+                }
+            }
         }
-        if ( open my $rfh, '-|', @cmd ) {
+        elsif ( open my $rfh, '-|', @cmd ) {
             binmode $rfh;
-            $self->{_rust_fh} = $rfh;
+            $self->{_rust_fh}         = $rfh;
+            $self->{_rust_bytes_read} = 0;
             return;
         }
     }
 
-    open $self->{_fh}, '<', $self->{file} || die "Unable to open $self->{file} for reading";
-    binmode $self->{_fh};
-    $self->{_mp3c} = $self->__init(@_);
+    $self->_init_xs(@_);
 }
 
 sub _parse_cue {
@@ -186,10 +226,14 @@ sub _parse_cue {
 sub DESTROY {
     my $self = shift;
 
-    close $self->{_rust_fh} if $self->{_rust_fh};
-    close $self->{_fh} if $self->{_fh};
+    if ( my $rfh = delete $self->{_rust_fh} ) {
+        close $rfh;
+    }
+    if ( my $fh = delete $self->{_fh} ) {
+        close $fh;
+    }
 
-    $self->__cleanup( $self->{_mp3c} ) if exists $self->{_mp3c};
+    $self->__cleanup( delete $self->{_mp3c} ) if exists $self->{_mp3c};
 }
 
 1;

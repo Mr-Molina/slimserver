@@ -1,7 +1,6 @@
 -- schema_16 recreated tracks but forgot to recreate all the indicies
 
 CREATE INDEX trackTitleIndex ON tracks (title);
-CREATE INDEX trackAlbumIndex ON tracks (album);
 CREATE INDEX ctSortIndex ON tracks (content_type);
 CREATE INDEX trackSortIndex ON tracks (titlesort);
 CREATE INDEX trackSearchIndex ON tracks (titlesearch);
@@ -19,3 +18,4 @@ CREATE INDEX urlIndex ON tracks (url);
 CREATE INDEX trackExtId ON tracks (extid);
 CREATE INDEX urlmd5Index ON tracks (urlmd5);
 CREATE INDEX coveridIndex ON tracks (coverid);
+CREATE INDEX IF NOT EXISTS tracks_album_disc_tracknum ON tracks (album, disc, tracknum);

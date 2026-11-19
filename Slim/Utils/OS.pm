@@ -234,17 +234,21 @@ sub scanner {
 	return "$Bin/scanner.pl";
 }
 
+sub _rustLinuxBinArch {
+	return undef unless $^O eq 'linux';
+	my $archname = $Config::Config{archname} || '';
+	return 'aarch64-linux' if $archname =~ /^(?:aarch64|arm64)(?:-|$)/i;
+	return 'x86_64-linux'  if $archname =~ /^(?:x86_64|amd64)(?:-|$)/i;
+	return undef;
+}
+
 sub gdresized {
-	if ( $ENV{LMS_USE_RUST} // 1 ) {
-		require Config;
-		my $arch = ($Config::Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+	if ( ($ENV{LMS_USE_RUST} // 1) && (my $arch = _rustLinuxBinArch()) ) {
 		for my $p (
 			"$Bin/Bin/$arch/gdresized",
 			"/usr/share/squeezeboxserver/Bin/$arch/gdresized",
-			"$Bin/Bin/x86_64-linux/gdresized",
-			"$Bin/Bin/aarch64-linux/gdresized",
 		) {
-			return $p if -x $p;
+			return $p if -f $p && -x _;
 		}
 	}
 	return "$Bin/gdresized.pl";

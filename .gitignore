@@ -6,3 +6,6 @@ Cache/*
 Logs/*
 prefs/*
 Plugins/*
+
+# Local Antigravity runtime audit cache (contains workstation-specific paths)
+.agents/security_audit_state.json

@@ -192,16 +192,18 @@ removed, 0 if the timer could not be found.
 sub killSpecific {
 	my $w = shift;
 
-	return unless defined $w;
+	return 0 unless defined $w;
 
 	if ( my $loc = delete $TIMER_LOCATIONS{"$w"} ) {
 		my ( $sub, $objRef ) = @$loc;
-		if ( my $timers = $TIMERS{$sub}->{$objRef} ) {
+		my $removed = 0;
+		if ( exists $TIMERS{$sub} && (my $timers = $TIMERS{$sub}->{$objRef}) ) {
 			my $i = 0;
 			for my $timer ( @{$timers} ) {
 				if ( defined $timer && $timer == $w ) {
 					$timer->cb->(EV_KILL);
 					splice @{$timers}, $i, 1;
+					$removed = 1;
 					last;
 				}
 				$i++;
@@ -213,7 +215,7 @@ sub killSpecific {
 				}
 			}
 		}
-		return;
+		return $removed;
 	}
 
 	my @subs = keys %TIMERS;
@@ -235,7 +237,7 @@ sub killSpecific {
 						}
 					}
 
-					return;
+					return 1;
 				}
 
 				$i++;
@@ -243,7 +245,7 @@ sub killSpecific {
 		}
 	}
 
-	return;
+	return 0;
 }
 
 =head2 firePendingTimer( $obj, $coderef )
@@ -348,7 +350,9 @@ sub cleanupTimers {
 		my @objs = keys %{ $TIMERS{$sub} };
 		for my $obj ( @objs ) {
 			my $timers = $TIMERS{$sub}->{$obj};
-			@{$timers} = grep { defined $_ } @{$timers};
+			for ( my $i = $#$timers; $i >= 0; $i-- ) {
+				splice( @{$timers}, $i, 1 ) unless defined $timers->[$i];
+			}
 
 			if ( !scalar @{$timers} ) {
 				# No timers left for this obj, remove it

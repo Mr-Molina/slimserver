@@ -7,13 +7,17 @@ package Slim::Utils::DbCache;
 
 use strict;
 
+use Config;
 use DBD::SQLite;
 use Digest::MD5 ();
 use File::Spec::Functions qw(catfile);
 use Storable qw(freeze thaw);
 
+use constant HAS_64BIT_INT        => $Config{ivsize} >= 8;
 use constant DEFAULT_EXPIRES_TIME => 60 * 60;
 use constant IDLE_THRESHOLD       => 600;       # player inactivity before we consider it unused
+
+BEGIN { require Math::BigInt unless HAS_64BIT_INT; }
 
 sub new {
 	my ( $self, $args ) = @_;
@@ -161,7 +165,14 @@ sub _key {
 	# Get a 60-bit unsigned int from MD5 (SQLite uses 64-bit signed ints for the key)
 	# Bitwise pack 32-bit hi and 28-bit lo into a 60-bit integer
 	my $md5 = Digest::MD5::md5_hex($key);
-	return (hex( substr($md5, 0, 8) ) << 28) | hex( substr($md5, 8, 7) );
+	if ( HAS_64BIT_INT ) {
+		return (hex( substr($md5, 0, 8) ) << 28) | hex( substr($md5, 8, 7) );
+	}
+
+	return Math::BigInt->new('0x' . substr($md5, 0, 8))
+		->blsft(28)
+		->bior(hex( substr($md5, 8, 7) ))
+		->bstr();
 }
 
 sub pragma {
@@ -241,8 +252,24 @@ sub _get_dbfile {
 	return catfile( $self->{root}, $namespace . '.db' );
 }
 
-# only try to re-build once
-my $rebuilt;
+# only try to re-build once per dbfile
+my %rebuilt;
+
+sub _unlink_db {
+	my $dbfile = shift;
+
+	my $ok = 1;
+	for my $file ( $dbfile, "$dbfile-wal", "$dbfile-shm" ) {
+		if ( (lstat($file) || -e $file) && !unlink($file) ) {
+			warn "Unable to unlink $file: $!\n";
+		}
+		if ( lstat($file) || -e $file ) {
+			$ok = 0;
+		}
+	}
+
+	return $ok;
+}
 
 sub _init_db {
 	my $self  = shift;
@@ -253,6 +280,7 @@ sub _init_db {
 	my $dbfile = $self->_get_dbfile;
 
 	my $dbh;
+	my ($set_sth, $get_sth, $delete_sth);
 
 	eval {
 		$dbh = DBI->connect( "dbi:SQLite:dbname=$dbfile", '', '', {
@@ -262,6 +290,8 @@ sub _init_db {
 			sqlite_use_immediate_transaction => 1,
 		} );
 
+		$dbh->do('PRAGMA busy_timeout = 5000');
+
 		# caches do see a lot of updates/writes/deletes - enable auto_vacuum
 		if ( !$dbh->selectrow_array('PRAGMA auto_vacuum') ) {
 			$dbh->do('PRAGMA auto_vacuum = FULL');
@@ -270,7 +300,7 @@ sub _init_db {
 			#$dbh->do('VACUUM');
 		}
 
-		$dbh->do('PRAGMA synchronous = OFF');
+		$dbh->do('PRAGMA synchronous = NORMAL');
 		$dbh->do('PRAGMA journal_mode = WAL');
 		# scanner is heavy on writes, server on reads - tweak accordingly
 		$dbh->do('PRAGMA wal_autocheckpoint = ' . (main::SCANNER ? 10000 : 200));
@@ -290,13 +320,13 @@ sub _init_db {
 
 		$dbh->do('PRAGMA journal_size_limit = ' . ($dbjournalsize * 1024 * 1024)) if defined $dbjournalsize;
 
-		# Increase cache size when using dbhighmem, and reduce it to 300K otherwise
+		# Use negative KiB cache_size semantics: 20 MiB for dbhighmem, 8000 KiB otherwise
 		if ( $dbhighmem ) {
-			$dbh->do('PRAGMA cache_size = 20000');
+			$dbh->do('PRAGMA cache_size = -20000');
 			$dbh->do('PRAGMA temp_store = MEMORY');
 		}
 		else {
-			$dbh->do('PRAGMA cache_size = 300');
+			$dbh->do('PRAGMA cache_size = -8000');
 		}
 
 		# Create the table, note that using an integer primary key
@@ -304,29 +334,55 @@ sub _init_db {
 		# because it doesn't have to create an index
 		if ($self->{noexpiry}) {
 			$dbh->do('CREATE TABLE IF NOT EXISTS cache (k INTEGER PRIMARY KEY, v BLOB)');
+			$set_sth = $dbh->prepare('INSERT OR REPLACE INTO cache (k, v) VALUES (?, ?)');
+			$get_sth = $dbh->prepare('SELECT v FROM cache WHERE k = ?');
 		}
 		else {
 			$dbh->do('CREATE TABLE IF NOT EXISTS cache (k INTEGER PRIMARY KEY, v BLOB, t INTEGER)');
 			$dbh->do('CREATE INDEX IF NOT EXISTS expiry ON cache (t)');
+			$set_sth = $dbh->prepare('INSERT OR REPLACE INTO cache (k, v, t) VALUES (?, ?, ?)');
+			$get_sth = $dbh->prepare('SELECT v, t FROM cache WHERE k = ?');
 		}
+		$delete_sth = $dbh->prepare('DELETE FROM cache WHERE k = ?');
 	};
 
 	if ( $@ ) {
+		my $err = $@;
+
+		for my $sth ($set_sth, $get_sth, $delete_sth) {
+			eval { $sth->finish } if $sth;
+		}
+		undef $set_sth;
+		undef $get_sth;
+		undef $delete_sth;
+
+		if ( $dbh ) {
+			eval { $dbh->{HandleError} = undef };
+			eval { $dbh->disconnect };
+			undef $dbh;
+		}
+		$self->_close_db;
+
 		if ( $retry ) {
 			# Give up after 2 tries
 			die "Unable to read/create $dbfile\n";
 		}
 
-		warn "$@Delete the file $dbfile and start from scratch.\n";
+		warn "${err}Delete the file $dbfile and start from scratch.\n";
 
 		# Make sure cachedir exists
 		Slim::Utils::Prefs::makeCacheDir() unless main::RESIZER;
 
 		# Something was wrong with the database, delete it and try again
-		unlink $dbfile;
+		_unlink_db($dbfile) or die "Unable to remove $dbfile\n";
 
 		return $self->_init_db(1);
 	}
+
+	$self->{set_sth}    = $set_sth;
+	$self->{get_sth}    = $get_sth;
+	$self->{delete_sth} = $delete_sth;
+	$self->{dbh}        = $dbh;
 
 	# set up error handler to log the db file causing problems
 	$dbh->{HandleError} = sub {
@@ -340,30 +396,24 @@ sub _init_db {
 
 		if ( $msg =~ /SQLite.*(?:database disk image is malformed|is not a database)/i ) {
 			# we've already tried to recover - give up
-			if ($rebuilt++) {
+			if ($rebuilt{$dbfile}++) {
 				Slim::Utils::Log::logError("Please stop the server, delete $dbfile and restart.");
 			}
 			else {
 				Slim::Utils::Log::logError("Trying to re-build $dbfile from scratch.");
+				my $err_dbh = $handle ? eval { $handle->isa('DBI::st') ? $handle->{Database} : $handle } : undef;
+				eval { $handle->finish } if $handle && eval { $handle->isa('DBI::st') };
 				$self->close();
-				unlink $dbfile;
+				if ( $err_dbh ) {
+					eval { $err_dbh->{HandleError} = undef };
+					eval { $err_dbh->disconnect } if eval { $err_dbh->{Active} };
+				}
+				undef $handle;
+				_unlink_db($dbfile) or die "Unable to remove $dbfile\n";
 				$self->_init_db(1);
 			}
 		}
 	};
-
-	# Prepare statements we need
-	if ($self->{noexpiry}) {
-		$self->{set_sth} = $dbh->prepare('INSERT OR REPLACE INTO cache (k, v) VALUES (?, ?)');
-		$self->{get_sth} = $dbh->prepare('SELECT v FROM cache WHERE k = ?');
-	}
-	else {
-		$self->{set_sth} = $dbh->prepare('INSERT OR REPLACE INTO cache (k, v, t) VALUES (?, ?, ?)');
-		$self->{get_sth} = $dbh->prepare('SELECT v, t FROM cache WHERE k = ?');
-	}
-	$self->{delete_sth} = $dbh->prepare('DELETE FROM cache WHERE k = ?');
-
-	$self->{dbh} = $dbh;
 
 	return $dbh;
 }
@@ -371,14 +421,14 @@ sub _init_db {
 sub _close_db {
 	my $self = shift;
 
-	if ( $self->{dbh} ) {
-		$self->{set_sth}->finish;
-		$self->{get_sth}->finish;
-		$self->{delete_sth}->finish;
+	if ( my $dbh = $self->{dbh} ) {
+		for my $sth_key (qw(set_sth get_sth delete_sth)) {
+			eval { $self->{$sth_key}->finish } if $self->{$sth_key};
+		}
+		eval { $dbh->{HandleError} = undef };
+		eval { $dbh->disconnect };
 
-		$self->{dbh}->disconnect;
-
-		delete $self->{$_} for qw(set_sth get_sth dbh);
+		delete $self->{$_} for qw(set_sth get_sth delete_sth dbh);
 	}
 }
 

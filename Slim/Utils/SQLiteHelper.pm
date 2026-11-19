@@ -97,11 +97,11 @@ sub on_connect_do {
 	my $class = shift;
 
 	my $sql = [
+		'PRAGMA busy_timeout = 5000',
 		'PRAGMA synchronous = NORMAL',
 		'PRAGMA journal_mode = WAL',
 		'PRAGMA foreign_keys = ON',
 		'PRAGMA wal_autocheckpoint = ' . (main::SCANNER ? 10000 : 200),
-		'PRAGMA busy_timeout = 5000',
 		'PRAGMA mmap_size = 268435456',
 		'PRAGMA journal_size_limit = 16777216',
 		'PRAGMA temp_store = MEMORY',
@@ -337,6 +337,7 @@ Called immediately after connect.  Sets up MD5() function.
 
 =cut
 my %postConnectHandlers;
+my %recoveredPersistDB;
 
 sub postConnect {
 	my ( $class, $dbh ) = @_;
@@ -353,11 +354,97 @@ sub postConnect {
 	# we need to migrate long 7.6.0 file names to shorter 7.6.1 filenames: Windows can't handle the long version
 	_migrateDBFile($class->dbFile('squeezebox-persistent.db'), $persistentdb);
 
-	$dbh->do("ATTACH '$persistentdb' AS persistentdb");
-	$dbh->do('PRAGMA persistentdb.journal_mode = WAL');
-	$dbh->do('PRAGMA persistentdb.synchronous = NORMAL');
-	$dbh->do('PRAGMA persistentdb.mmap_size = 67108864');
-	$dbh->do('PRAGMA persistentdb.cache_size = ' . $class->_cacheSize);
+	my $attachPersistentDB = sub {
+		local $dbh->{HandleError} = undef;
+		local $dbh->{RaiseError}  = 1;
+		local $dbh->{PrintError}  = 0;
+
+		my $dbs = $dbh->selectall_arrayref('PRAGMA database_list');
+		if ( !$dbs || !grep { defined $_->[1] && $_->[1] eq 'persistentdb' } @$dbs ) {
+			$dbh->do('ATTACH ' . $dbh->quote($persistentdb) . ' AS persistentdb');
+		}
+		$dbh->do('PRAGMA persistentdb.journal_mode = WAL');
+		$dbh->do('PRAGMA persistentdb.synchronous = NORMAL');
+		$dbh->do('PRAGMA persistentdb.journal_size_limit = 16777216');
+		$dbh->do('PRAGMA persistentdb.mmap_size = 67108864');
+		$dbh->do('PRAGMA persistentdb.cache_size = ' . $class->_cacheSize);
+
+		my ($qc) = $dbh->selectrow_array('PRAGMA persistentdb.quick_check(1)');
+		die 'SQLite persistentdb database disk image is malformed (' . (defined $qc ? $qc : 'undef') . ')'
+			if !defined $qc || lc($qc) ne 'ok';
+
+		my ($hasTable) = $dbh->selectrow_array(
+			"SELECT name FROM persistentdb.sqlite_master WHERE type='table' AND name='tracks_persistent'"
+		);
+
+		if ( !$hasTable ) {
+			$dbh->do(q{
+				CREATE TABLE IF NOT EXISTS persistentdb.tracks_persistent (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					url text NOT NULL,
+					musicbrainz_id varchar(40),
+					added int(10),
+					rating tinyint(1),
+					playCount int(10),
+					lastPlayed int(10),
+					urlmd5 char(32) NOT NULL default '0'
+				)
+			});
+
+			for my $ddl (
+				'CREATE INDEX IF NOT EXISTS persistentdb.trackMusicBrainzIndex ON tracks_persistent (musicbrainz_id)',
+				'CREATE INDEX IF NOT EXISTS persistentdb.trackUrlIndex ON tracks_persistent (url)',
+				'CREATE INDEX IF NOT EXISTS persistentdb.trackAddedIndex ON tracks_persistent (added)',
+				'CREATE INDEX IF NOT EXISTS persistentdb.trackRatingIndex ON tracks_persistent (rating)',
+				'CREATE INDEX IF NOT EXISTS persistentdb.trackPlayCountIndex ON tracks_persistent (playCount)',
+				'CREATE INDEX IF NOT EXISTS persistentdb.trackLastPlayedIndex ON tracks_persistent (lastPlayed)',
+				'CREATE INDEX IF NOT EXISTS persistentdb.urlmd5Index ON tracks_persistent (urlmd5)',
+			) {
+				$dbh->do($ddl);
+			}
+		}
+	};
+
+	eval { $attachPersistentDB->() };
+
+	if ( my $err = $@ ) {
+		if ( $err =~ /SQLite.*(?:database disk image is malformed|is not a database)/i && !$recoveredPersistDB{$persistentdb}++ ) {
+			$log->error("Corrupt persistent database detected ($persistentdb): $err\nRebuilding $persistentdb from scratch.");
+
+			my $dbs = eval {
+				local $dbh->{HandleError} = undef;
+				local $dbh->{RaiseError}  = 1;
+				local $dbh->{PrintError}  = 0;
+				$dbh->selectall_arrayref('PRAGMA database_list');
+			};
+			if ( $dbs && grep { defined $_->[1] && $_->[1] eq 'persistentdb' } @$dbs ) {
+				eval {
+					local $dbh->{HandleError} = undef;
+					local $dbh->{RaiseError}  = 1;
+					local $dbh->{PrintError}  = 0;
+					$dbh->do('DETACH DATABASE persistentdb');
+				};
+			}
+
+			my $unlinkFailed = 0;
+			for my $file ( $persistentdb, "$persistentdb-wal", "$persistentdb-shm" ) {
+				if ( lstat($file) || -e $file ) {
+					if ( !unlink($file) && (lstat($file) || -e $file) ) {
+						$log->error("Unable to unlink corrupt SQLite file $file: $!");
+						$unlinkFailed = 1;
+					}
+				}
+			}
+
+			die "Unable to remove corrupt persistent database $persistentdb: $err" if $unlinkFailed;
+
+			$attachPersistentDB->();
+			delete $recoveredPersistDB{$persistentdb};
+		}
+		else {
+			die $err;
+		}
+	}
 
 	# http://search.cpan.org/~adamk/DBD-SQLite-1.33/lib/DBD/SQLite.pm#Transaction_and_Database_Locking
 	$dbh->{sqlite_use_immediate_transaction} = 1;
@@ -519,7 +606,8 @@ If the $optional parameter is passed, the VACUUM will only happen if there's a c
 sub vacuum {
 	my ( $class, $db, $optional, $persistent ) = @_;
 
-	my $dbFile = $class->dbFile($db || 'library.db', $persistent);
+	my $dbName = $db || 'library.db';
+	my $dbFile = $class->dbFile($dbName, $persistent);
 
 	# files other than the default library.db can be stored in a persistent folder
 	$dbFile = $class->dbFile($db, 'persistent') if $db && !-f $dbFile;
@@ -527,14 +615,19 @@ sub vacuum {
 	return unless -f $dbFile;
 	my $dbSize = -s _;
 
-	main::DEBUGLOG && $log->is_debug && $log->debug("Start VACUUM $db");
+	main::DEBUGLOG && $log->is_debug && $log->debug("Start VACUUM $dbName");
 
 	my $source = sprintf( $class->default_dbsource(), $dbFile );
 
 	# this can't be run from the schema_cleanup.sql, as VACUUM doesn't work inside a transaction
+	my $dbh;
 	eval {
-		my $dbh = DBI->connect($source);
-		return unless $dbh;
+		$dbh = DBI->connect($source, '', '', {
+			RaiseError => 1,
+			PrintError => 0,
+		}) or die $DBI::errstr || "Failed to connect to $dbFile";
+
+		$dbh->do('PRAGMA busy_timeout = 10000');
 
 		if ($optional) {
 			my $pages = $dbh->selectrow_array('PRAGMA page_count;');
@@ -550,20 +643,22 @@ sub vacuum {
 		if ( !$optional ) {
 			# use memory as temporary storage for the vaccum if dbhighmem is enabled and db file is smaller than 1GB
 			if ( Slim::Utils::OSDetect::getOS->canVacuumInMemory($dbSize) ) {
-				main::INFOLOG && $log->is_info && $log->info("Using memory (RAM) to store temporary table in VACUUM command: $db");
+				main::INFOLOG && $log->is_info && $log->info("Using memory (RAM) to store temporary table in VACUUM command: $dbName");
 				$dbh->do('PRAGMA temp_store = MEMORY');
 			}
-			$dbh->do('PRAGMA busy_timeout = 10000');
 			$dbh->do('PRAGMA synchronous = NORMAL');
 			$dbh->do('VACUUM');
 		}
-		$dbh->disconnect;
 	};
-	if ($@) {
-		$log->error("VACUUM failed for $db: $@");
+	my $err = $@;
+	eval { $dbh->disconnect } if $dbh;
+
+	if ($err) {
+		$log->error("VACUUM failed for $dbName: $err");
+		return;
 	}
 
-	main::DEBUGLOG && $log->is_debug && $log->debug("VACUUM $db done!");
+	main::DEBUGLOG && $log->is_debug && $log->debug("VACUUM $dbName done!");
 }
 
 sub dbFile {

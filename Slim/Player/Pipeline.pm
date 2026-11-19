@@ -21,6 +21,8 @@ use Slim::Utils::Log;
 use Slim::Utils::Misc;
 use Slim::Utils::Network;
 use Slim::Utils::OSDetect;
+use Slim::Utils::Timers ();
+use Time::HiRes ();
 
 my $log = logger('player.source');
 
@@ -66,7 +68,8 @@ sub new {
 			$writerPort = $listenWriter->sockport;
 		}
 
-		$command =~ s/"/\\"/g;
+		$command =~ s/(\\*)"/$1$1\\"/g;
+		$command =~ s/(\\+)$/$1$1/;
 
 		my $newcommand = '"' . Slim::Utils::Misc::findbin('socketwrapper') .  '" ';
 
@@ -135,15 +138,17 @@ sub new {
 		$reader = IO::Handle->new();
 		$writer = IO::Handle->new();
 
-		my $pid = open2($reader, $writer, $command);
+		my @cmd = _splitSimpleCommand($command);
+		my $pid = (@cmd > 1 || (@cmd == 1 && $cmd[0] !~ /[\s"'\\\$`|&;<>(){}*?\[\]~#]/))
+			? open2($reader, $writer, @cmd)
+			: open2($reader, $writer, $command);
 		${*$self}{'pipeline_pid'} = $pid;
 
 		if (!defined(Slim::Utils::Network::blocking($reader, 0))) {
 
 			logError("Cannot set pipe line reader to nonblocking");
 
-			kill('TERM', $pid);
-			waitpid($pid, POSIX::WNOHANG());
+			_reapChild(delete ${*$self}{'pipeline_pid'});
 
 			$reader->close();
 			$writer->close();
@@ -155,8 +160,7 @@ sub new {
 
 			logError("Cannot set pipe line writer to nonblocking");
 
-			kill('TERM', $pid);
-			waitpid($pid, POSIX::WNOHANG());
+			_reapChild(delete ${*$self}{'pipeline_pid'});
 
 			$reader->close();
 			$writer->close();
@@ -359,22 +363,134 @@ sub sysseek {
 	return 0;
 }
 
+sub _splitSimpleCommand {
+	my $command = shift;
+	return () unless defined $command;
+
+	my @args;
+	my $len = length($command);
+	my $i = 0;
+
+	while ($i < $len) {
+		my $ch = substr($command, $i, 1);
+		if ($ch eq ' ' || $ch eq "\t") {
+			$i++;
+			next;
+		}
+
+		my $arg = '';
+		my $in_double = 0;
+
+		while ($i < $len) {
+			$ch = substr($command, $i, 1);
+
+			if ($in_double) {
+				if ($ch eq '"') {
+					$in_double = 0;
+					$i++;
+				}
+				elsif ($ch eq '\\') {
+					return () if $i + 1 >= $len;
+					my $next = substr($command, $i + 1, 1);
+					if ($next eq '"' || $next eq '\\' || $next eq '$' || $next eq '`') {
+						$arg .= $next;
+					}
+					elsif ($next eq "\n") {
+						return ();
+					}
+					else {
+						$arg .= '\\' . $next;
+					}
+					$i += 2;
+				}
+				elsif ($ch eq '$' || $ch eq '`' || $ch eq "\n") {
+					return ();
+				}
+				else {
+					$arg .= $ch;
+					$i++;
+				}
+			}
+			else {
+				if ($ch eq ' ' || $ch eq "\t") {
+					last;
+				}
+				elsif ($ch eq '"') {
+					$in_double = 1;
+					$i++;
+				}
+				elsif ($ch =~ /[\|\&\;\<\>\(\)\{\}\*\?\[\]\~\$\`\'\\\#\r\n]/) {
+					return ();
+				}
+				else {
+					$arg .= $ch;
+					$i++;
+				}
+			}
+		}
+
+		return () if $in_double;
+		push @args, $arg;
+	}
+
+	return @args;
+}
+
+sub _reapKilledChild {
+	my ($pid, $retries) = @_;
+	return if waitpid($pid, POSIX::WNOHANG()) != 0;
+	return if (${^GLOBAL_PHASE} // '') eq 'DESTRUCT';
+	return if $retries >= 10;
+
+	Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + 0.05, sub {
+		_reapKilledChild($pid, $retries + 1);
+	});
+}
+
+sub _reapChild {
+	my $pid = shift;
+	return unless defined $pid;
+	return if waitpid($pid, POSIX::WNOHANG()) != 0;
+
+	kill('TERM', $pid);
+	return if waitpid($pid, POSIX::WNOHANG()) != 0;
+
+	if ((${^GLOBAL_PHASE} // '') eq 'DESTRUCT') {
+		kill('KILL', $pid);
+		waitpid($pid, 0);
+		return;
+	}
+
+	Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + 0.05, sub {
+		return if waitpid($pid, POSIX::WNOHANG()) != 0;
+
+		kill('KILL', $pid);
+		return if waitpid($pid, POSIX::WNOHANG()) != 0;
+
+		_reapKilledChild($pid, 0);
+	});
+}
+
 sub close {
 	my $self = shift;
-
+	my $inDestruct = (${^GLOBAL_PHASE} // '') eq 'DESTRUCT';
 
 	my $reader = ${*$self}{'pipeline_reader'};
 
 	if (defined($reader)) {
-		Slim::Networking::Select::removeRead($reader);
-		Slim::Networking::Select::removeError($reader);
+		if (!$inDestruct) {
+			Slim::Networking::Select::removeRead($reader);
+			Slim::Networking::Select::removeError($reader);
+		}
 		$reader->close();
 	}
 
 	my $writer = ${*$self}{'pipeline_writer'};
 
 	if (defined($writer)) {
-		Slim::Networking::Select::removeWrite($writer);
+		if (!$inDestruct) {
+			Slim::Networking::Select::removeWrite($writer);
+		}
 		$writer->close();
 	}
 
@@ -384,8 +500,10 @@ sub close {
 
 		if (defined($listenReader)) {
 
-			Slim::Networking::Select::removeRead($listenReader);
-			Slim::Networking::Select::removeError($listenReader);
+			if (!$inDestruct) {
+				Slim::Networking::Select::removeRead($listenReader);
+				Slim::Networking::Select::removeError($listenReader);
+			}
 
 			${*$listenReader}{'pipeline'} = undef;
 
@@ -396,8 +514,10 @@ sub close {
 
 		if (defined($listenWriter)) {
 
-			Slim::Networking::Select::removeRead($listenWriter);
-			Slim::Networking::Select::removeError($listenWriter);
+			if (!$inDestruct) {
+				Slim::Networking::Select::removeRead($listenWriter);
+				Slim::Networking::Select::removeError($listenWriter);
+			}
 
 			${*$listenWriter}{'pipeline'} = undef;
 
@@ -406,30 +526,25 @@ sub close {
 	}
 	else {
 		my $pid = delete ${*$self}{'pipeline_pid'};
-		if (defined $pid) {
-			if (waitpid($pid, POSIX::WNOHANG()) == 0) {
-				kill('TERM', $pid);
-				if (waitpid($pid, POSIX::WNOHANG()) == 0) {
-					Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + 0.05, sub {
-						if (waitpid($pid, POSIX::WNOHANG()) == 0) {
-							kill('KILL', $pid);
-							waitpid($pid, POSIX::WNOHANG());
-						}
-					});
-				}
-			}
-		}
+		_reapChild($pid) if defined $pid;
 	}
 
 	my $source = ${*$self}{'pipeline_source'};
 
-	if (defined($source)) {
+	if (defined($source) && !$inDestruct) {
 		$source->close();
 	}
 }
 
 sub DESTROY {
 	my $self = shift;
+
+	if ((${^GLOBAL_PHASE} // '') eq 'DESTRUCT') {
+		my $pid = delete ${*$self}{'pipeline_pid'};
+		_reapChild($pid) if defined $pid;
+		return;
+	}
+
 	$self->close();
 }
 

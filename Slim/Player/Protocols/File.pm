@@ -207,13 +207,6 @@ sub open {
 	# there's a bug in MP3::Cut::Gapless which fails the cache file check on Windows
 	if ( !main::ISWINDOWS && $format eq 'mp3' && $track->virtual ) {
 		eval {
-			my $cachedir = catdir( $prefs->get('librarycachedir'), 'mp3cut' );
-			if ( ($ENV{LMS_USE_RUST} // 1) && (my $mp3cutBin = Slim::Utils::Misc::findbin('lms-mp3cut')) ) {
-				eval {
-					system($mp3cutBin, '--file', $filepath, '--cache-dir', $cachedir, '--index-only');
-				};
-			}
-
 			# Return a gapless MP3 stream for cue sheet tracks
 			# XXX avoid calling the above stuff for these tracks, it's just wasted
 			require MP3::Cut::Gapless;
@@ -234,7 +227,7 @@ sub open {
 
 			${*$sock}{mp3cut} = MP3::Cut::Gapless->new(
 				file      => $filepath,
-				cache_dir => $cachedir,
+				cache_dir => catdir( $prefs->get('librarycachedir'), 'mp3cut' ),
 				start_ms  => $start_ms,
 				end_ms    => $end_ms,
 			);

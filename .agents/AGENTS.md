@@ -42,3 +42,12 @@ This document defines the multi-agent roles, responsibilities, and delegation st
 ### 9. Extension Certifier
 - **Primary Function**: Multi-layer verification and certification of network endpoints, directory mappings, and physical hardware status.
 - **Tools / Capabilities**: Physical layer probing, directory cross-referencing, read-back verification gates.
+
+## Workspace Scope & Rust-Experiment Conventions
+
+- **Active Branch Focus**: `Rust-Experiment` — `rust/` workspace containing 7 crates: `lms-cache`, `lms-image`, `lms-gdresized`, `lms-transcode`, `lms-mp3cut`, `lms-audioscan`, and `lms-scanner-accel`.
+- **Mandatory `rust-pro` Gate**: All Rust changes must pass `cargo fmt --all -- --check`, strict `google_rust_audit` (`python <plugin_root>/skills/rust-pro/scripts/google_rust_audit.py <crate_root>/src --strict`), `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `cargo audit` before completion.
+- **Cross-Platform Build & Test Split**:
+  - **Windows**: Builds and tests the 5 portable crates (`lms-cache`, `lms-image`, `lms-transcode`, `lms-mp3cut`, `lms-audioscan`).
+  - **WSL Ubuntu** (`CARGO_TARGET_DIR=$HOME/.cache/slimserver-target`): Builds and tests all 7 crates, including Linux-only `lms-gdresized` and `lms-scanner-accel`, as well as Perl syntax checks (`perl -c`) and `sqlite3` validation.
+- **Scope Boundary**: Strictly scoped to `slimserver` (`Rust-Experiment`), `workstation-1` (`10.0.0.50`, Lyrion `9.1.1`), and the `10.0.0.90` dev host. `DJMix-LMS` and `Louder-ESP32` are explicitly out of scope.

@@ -28,6 +28,7 @@ BEGIN {
 use Carp::Clan qw/DBIx::Class/;
 use File::Slurp;
 use File::Spec;
+use Scalar::Util qw(refaddr);
 
 use Slim::Utils::Log;
 use Slim::Utils::Misc;
@@ -53,38 +54,117 @@ sub dbh {
 sub throw_exception {
 	my ($self, $msg) = @_;
 
-	if ($msg =~ /SQLite.*(?:database disk image is malformed|is not a database)/i) {
+	if (
+		$msg =~ /(?:database disk image is malformed|is not a database)/i
+		&& $msg =~ m{(?:SQLite|(?:^|[\\/=])(?:library|persist)\.db\b|\b(?:persistentdb|tracks_persistent)\b)}i
+	) {
 
-		$msg =~ m{/((?:library|persist)\.db)}i;
+		my $dbh = eval { $self->_dbh };
+		my $dbbase;
 
-		my $dbfile = $1 || 'library.db';
+		if ( $msg =~ m{(?:^|[\\/=])((?:library|persist)\.db)\b}i ) {
+			$dbbase = lc($1);
+		}
+		elsif ( $msg =~ /\b(?:persistentdb|tracks_persistent)\b/i ) {
+			$dbbase = 'persist.db';
+		}
+		elsif ( $dbh ) {
+			local $dbh->{HandleError} = undef;
+			local $dbh->{PrintError}  = 0;
+			local $dbh->{RaiseError}  = 1;
 
-		$dbfile = Slim::Utils::SQLiteHelper->dbFile($dbfile, $dbfile =~ /persist/);
-
-		unlink($dbfile);
-		unlink("$dbfile-wal");
-		unlink("$dbfile-shm");
-
-		if (!$rebuilt{$dbfile} && !-f $dbfile) {
-
-			# make sure we don't come here again
-			$rebuilt{$dbfile}++;
-
-			logError("$msg\nTrying to rebuild $dbfile from scratch.");
-
-			$msg = '';
-
-			Slim::Schema->_connect();
-
-			eval { $self->ensure_connected };
-
-			if ($@) {
-				logError("Unable to open the database image - even tried creating it from scratch!");
-				logError("Fatal. Exiting. [$@]");
-				exit;
+			my $dbs = eval { $dbh->selectall_arrayref('PRAGMA database_list') };
+			if ( $dbs && grep { defined $_->[1] && $_->[1] eq 'persistentdb' } @$dbs ) {
+				my ($check) = eval { $dbh->selectrow_array('PRAGMA persistentdb.quick_check(1)') };
+				if ( $@ || !$check || lc($check) ne 'ok' ) {
+					$dbbase = 'persist.db';
+				}
 			}
 
-			return $self->_dbh;
+			if ( !$dbbase ) {
+				my ($check) = eval { $dbh->selectrow_array('PRAGMA main.quick_check(1)') };
+				if ( $@ || !$check || lc($check) ne 'ok' ) {
+					$dbbase = 'library.db';
+				}
+			}
+		}
+
+		if ( $dbbase ) {
+			my $dbfile = Slim::Utils::SQLiteHelper->dbFile($dbbase, $dbbase =~ /persist/);
+
+			if ( $dbh ) {
+				if ( my $kids = eval { $dbh->{CachedKids} } ) {
+					for my $sth ( values %$kids ) {
+						eval { $sth->finish } if $sth;
+					}
+					%$kids = ();
+				}
+				eval { $self->disconnect };
+				eval { $dbh->disconnect } if eval { $dbh->{Active} };
+				eval { $self->_dbh(undef) };
+			}
+			eval { Slim::Schema->clearCachedDbh() };
+
+			my $unlinkFailed = 0;
+			for my $file ( $dbfile, "$dbfile-wal", "$dbfile-shm" ) {
+				if ( lstat($file) || -e $file ) {
+					if ( !unlink($file) && (lstat($file) || -e $file) ) {
+						logError("Unable to unlink corrupt SQLite file $file: $!");
+						$unlinkFailed = 1;
+					}
+				}
+			}
+
+			if (!$rebuilt{$dbfile} && !$unlinkFailed && !-f $dbfile) {
+
+				# make sure we don't come here again
+				$rebuilt{$dbfile}++;
+
+				logError("$msg\nTrying to rebuild $dbfile from scratch.");
+
+				$msg = '';
+
+				Slim::Schema->_connect();
+
+				my $new_storage = eval { Slim::Schema->storage };
+				my $err         = $@;
+				my $rebuilt_dbh = $new_storage ? eval { $new_storage->dbh } : undef;
+				$err ||= $@;
+
+				if ( !$rebuilt_dbh ) {
+					$rebuilt_dbh = eval { Slim::Schema->dbh };
+					$err ||= $@;
+				}
+
+				if ( $new_storage && ref($new_storage) && refaddr($new_storage) != refaddr($self) ) {
+					eval { $self->_dbh(undef) };
+
+					if ( !$rebuilt_dbh ) {
+						logError("Unable to open the database image - even tried creating it from scratch!");
+						logError("Fatal. Exiting. [$err]");
+						exit;
+					}
+
+					return $rebuilt_dbh;
+				}
+
+				if ( !$rebuilt_dbh ) {
+					eval { $self->ensure_connected };
+
+					if ($@) {
+						logError("Unable to open the database image - even tried creating it from scratch!");
+						logError("Fatal. Exiting. [$@]");
+						exit;
+					}
+
+					$rebuilt_dbh = $self->_dbh;
+				}
+
+				return $rebuilt_dbh;
+			}
+		}
+		else {
+			logError("Unable to determine corrupt SQLite database file from error; skipping automatic wipe: $msg");
 		}
 
 	} elsif ($msg =~ /SQLite.*no such table: sqlite_stat1/i) {

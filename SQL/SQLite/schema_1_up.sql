@@ -72,7 +72,6 @@ CREATE TABLE tracks (
   FOREIGN KEY (`album`) REFERENCES `albums` (`id`) ON DELETE CASCADE
 );
 CREATE INDEX trackTitleIndex ON tracks (title);
-CREATE INDEX trackAlbumIndex ON tracks (album);
 CREATE INDEX ctSortIndex ON tracks (content_type);
 CREATE INDEX trackSortIndex ON tracks (titlesort);
 CREATE INDEX trackSearchIndex ON tracks (titlesearch);
@@ -104,7 +103,6 @@ CREATE TABLE playlist_track (
 );
 CREATE INDEX trackIndex ON playlist_track (track);
 CREATE INDEX positionIndex ON playlist_track (position);
-CREATE INDEX playlistIndex ON playlist_track (playlist);
 CREATE INDEX playlist_track_pos ON playlist_track (playlist, position, track);
 
 --
@@ -179,7 +177,6 @@ CREATE TABLE contributor_track (
   FOREIGN KEY (`contributor`) REFERENCES `contributors` (`id`) ON DELETE CASCADE 
 );
 CREATE INDEX contributor_trackContribIndex ON contributor_track (contributor);
-CREATE INDEX contributor_trackTrackIndex ON contributor_track (track);
 CREATE INDEX contributor_track_track_role_contrib ON contributor_track (track, role, contributor);
 
 --
@@ -195,7 +192,6 @@ CREATE TABLE contributor_album (
   FOREIGN KEY (`contributor`) REFERENCES `contributors` (`id`) ON DELETE CASCADE
 );
 CREATE INDEX contributor_albumContribIndex ON contributor_album (contributor);
-CREATE INDEX contributor_albumAlbumIndex ON contributor_album (album);
 CREATE INDEX contributor_album_album_role ON contributor_album (album, role, contributor);
 
 --
@@ -227,7 +223,6 @@ CREATE TABLE genre_track (
   FOREIGN KEY (`genre`) REFERENCES `genres` (`id`) ON DELETE CASCADE
 );
 CREATE INDEX genre_track_track_genre ON genre_track (track, genre);
-CREATE INDEX genre_trackTrackIndex ON genre_track (track);
 
 --
 -- Table: comments

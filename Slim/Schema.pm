@@ -107,6 +107,10 @@ sub dbh {
 	return $_dbh || shift->storage->dbh;
 }
 
+sub clearCachedDbh {
+	$_dbh = undef;
+}
+
 =head1 METHODS
 
 All methods below are class methods on L<Slim::Schema>. Please see
@@ -282,6 +286,8 @@ sub _connect {
 
 	$sqlHelperClass->postConnect( $class->storage->dbh );
 
+	$_dbh = $class->storage->dbh if $sqlHelperClass && $sqlHelperClass->canCacheDBHandle;
+
 	return $class->storage->dbh;
 }
 
@@ -326,6 +332,7 @@ sub disconnect {
 	my $class = shift;
 
 	eval { $class->storage->dbh->disconnect };
+	$class->clearCachedDbh();
 
 	$initialized = 0;
 }
@@ -1503,7 +1510,7 @@ sub _createComments {
 }
 
 sub _createWork {
-	my ($self, $work, $workSort, $composerOrList, $create) = @_;
+	my ($self, $work, $workSort, $composerOrList, $create, $albumId) = @_;
 
 	my @composerIDs = ref $composerOrList eq 'ARRAY' ? @$composerOrList : ($composerOrList ? ($composerOrList) : ());
 
@@ -1529,9 +1536,9 @@ sub _createWork {
 			last if $workID;
 		}
 
-		if ( !$workID && $lastAlbum && $lastAlbum->{id} ) {
+		if ( !$workID && $albumId ) {
 			my $sth_album = $dbh->prepare_cached('SELECT works.id FROM works JOIN tracks ON tracks.work = works.id WHERE works.titlesearch = ? AND tracks.album = ? LIMIT 1');
-			$sth_album->execute($titlesearch, $lastAlbum->{id});
+			$sth_album->execute($titlesearch, $albumId);
 			($workID) = $sth_album->fetchrow_array;
 			$sth_album->finish;
 		}
@@ -1813,12 +1820,6 @@ sub _newTrack {
 		$columnValueHash{primary_artist} = $artist->[0];
 	}
 
-	### Create Work rows
-	my $workID;
-	if ( _workRequired($deferredAttributes->{'GENRE'}) ) {
-		$workID = $self->_createWork($deferredAttributes->{'WORK'}, $deferredAttributes->{'WORKSORT'}, $contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'}, 1);
-	}
-
 	### Find artwork column values for the Track
 	if ( !$columnValueHash{cover} && $columnValueHash{audio} ) {
 		# Track does not have embedded artwork, look for standalone cover
@@ -1849,6 +1850,18 @@ sub _newTrack {
 		undef,																	# Track
 		$dirname,
 	);
+
+	### Create Work rows
+	my $workID;
+	if ( _workRequired($deferredAttributes->{'GENRE'}) ) {
+		$workID = $self->_createWork(
+			$deferredAttributes->{'WORK'},
+			$deferredAttributes->{'WORKSORT'},
+			$contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'},
+			1,
+			$playlist ? undef : $albumId,
+		);
+	}
 
 	### Create Track row
 	$columnValueHash{'work'} = $workID if $workID;
@@ -3081,21 +3094,6 @@ sub _postCheckAttributes {
 		$cols{primary_artist} = $artist->[0];
 	}
 
-	#Work
-	if (defined $attributes->{'WORK'}) {
-		if ( _workRequired($attributes->{'GENRE'}) ) {
-			my $workID = $self->_createWork($attributes->{'WORK'}, $attributes->{'WORKSORT'}, $contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'}, 1);
-			if ($workID) {
-				$track->work($workID);
-			}
-		} else {
-			$track->work(undef);
-		}
-	}
-	else {
-		$track->work(undef);
-	}
-
 	### Update Album row
 	my $albumId = $self->_createOrUpdateAlbum($attributes,
 		\%cols,																	# trackColumns
@@ -3107,8 +3105,30 @@ sub _postCheckAttributes {
 	);
 
 	# Don't add an album to container tracks - See bug 2337
-	if (!Slim::Music::Info::isContainer($track, $trackType)) {
+	my $isContainer = Slim::Music::Info::isContainer($track, $trackType);
+	if (!$isContainer) {
 		$track->album($albumId);
+	}
+
+	#Work
+	if (defined $attributes->{'WORK'}) {
+		if ( _workRequired($attributes->{'GENRE'}) ) {
+			my $workID = $self->_createWork(
+				$attributes->{'WORK'},
+				$attributes->{'WORKSORT'},
+				$contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'},
+				1,
+				$isContainer ? undef : $albumId,
+			);
+			if ($workID) {
+				$track->work($workID);
+			}
+		} else {
+			$track->work(undef);
+		}
+	}
+	else {
+		$track->work(undef);
 	}
 
 	$self->_createContributorRoleRelationships($contributors, $trackId, $albumId);

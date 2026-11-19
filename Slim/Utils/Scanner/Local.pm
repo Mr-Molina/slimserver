@@ -106,8 +106,12 @@ sub find {
 				my $dbname_str = eval { Slim::Schema->dbh->{Name} } || '';
 				if ( $dbname_str =~ /dbname=([^;]+)/ ) {
 					my $dbfile = $1;
-					if ( -f $dbfile ) {
-						if ( open my $afh, '-|', $accel, 'scan-dir', '--db', $dbfile, '--dir', $path ) {
+					my @exts = grep { /^[a-z0-9+]+$/i }
+					           map  { s/^\.//r }
+					           Slim::Music::Info::validTypeExtensions( $args->{types} || 'audio' );
+					if ( -f $dbfile && @exts ) {
+						Slim::Schema->forceCommit;
+						if ( open my $afh, '-|', $accel, 'scan-dir', '--db', $dbfile, '--dir', $path, '--extensions', join(',', @exts) ) {
 							my $out = do { local $/; <$afh> };
 							my ($count) = $out =~ /(\d+)/;
 							if ( close($afh) && defined $count && $count =~ /^\d+$/ ) {
@@ -136,21 +140,20 @@ sub find {
 
 sub rustScannerAccelBin {
 	return undef unless ($ENV{LMS_USE_RUST} // 1);
+	return undef unless $^O eq 'linux';
 	require Config;
-	my $arch = ($Config::Config{archname} || '') =~ /aarch64/ ? 'aarch64-linux' : 'x86_64-linux';
+	require FindBin;
+	my $archname = $Config::Config{archname} || '';
+	my $arch = $archname =~ /^(?:aarch64|arm64)(?:-|$)/i ? 'aarch64-linux'
+	         : $archname =~ /^(?:x86_64|amd64)(?:-|$)/i  ? 'x86_64-linux'
+	         : return undef;
+	my $bin_dir = (defined $FindBin::Bin && $FindBin::Bin ne '') ? "$FindBin::Bin/Bin/$arch" : undef;
 	for my $dir (
-		$FindBin::Bin ? "$FindBin::Bin/Bin/$arch" : (),
+		$bin_dir ? ($bin_dir) : (),
 		"/usr/share/squeezeboxserver/Bin/$arch",
-		"/home/console-admin/Github/slimserver/Bin/$arch",
-		$FindBin::Bin ? "$FindBin::Bin/Bin/x86_64-linux" : (),
-		"/usr/share/squeezeboxserver/Bin/x86_64-linux",
-		"/home/console-admin/Github/slimserver/Bin/x86_64-linux",
-		$FindBin::Bin ? "$FindBin::Bin/Bin/aarch64-linux" : (),
-		"/usr/share/squeezeboxserver/Bin/aarch64-linux",
-		"/home/console-admin/Github/slimserver/Bin/aarch64-linux",
 	) {
 		my $bin = "$dir/lms-scanner-accel";
-		return $bin if -x $bin;
+		return $bin if -f $bin && -x _;
 	}
 	return undef;
 }

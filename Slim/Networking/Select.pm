@@ -9,7 +9,7 @@ package Slim::Networking::Select;
 
 use strict;
 
-use POSIX qw(EWOULDBLOCK EAGAIN EINTR);
+use Errno qw(EAGAIN);
 use Slim::Networking::IO::Select;
 use Slim::Utils::Errno;
 use Slim::Utils::Log;

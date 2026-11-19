@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "lms-audioscan"
@@ -15,7 +15,6 @@ base64 = { workspace = true }
 lofty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-symphonia = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

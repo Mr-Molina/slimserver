@@ -283,23 +283,32 @@ sub checkBin {
 	# if we don't have one or more of the requisite binaries, then move on.
 	while ($command && $command =~ /\[([^]]+)\]/g) {
 
+		my $binName = $1;
+
+		if ($binName eq 'lms-transcode' && !($ENV{LMS_USE_RUST} // 1)) {
+			$command = undef;
+			$@ = $binName;
+			main::DEBUGLOG && $log->debug("   skipping $binName (LMS_USE_RUST disabled)");
+			last;
+		}
+
 		my $binary;
 
-		if (!exists $binaries{$1}) {
-			$binary = Slim::Utils::Misc::findbin($1);
+		if (!exists $binaries{$binName}) {
+			$binary = Slim::Utils::Misc::findbin($binName);
 		}
 
 		if ($binary) {
 
-			$binaries{$1} = $binary;
+			$binaries{$binName} = $binary;
 
-		} elsif (!exists $binaries{$1}) {
+		} elsif (!exists $binaries{$binName}) {
 
 			$command = undef;
 
-			$@ = $1;
+			$@ = $binName;
 
-			$log->warn("   couldn't find binary for: $1");
+			$log->warn("   couldn't find binary for: $binName");
 		}
 	}
 
@@ -394,7 +403,7 @@ sub getConvertCommand2 {
 		next PROFILE unless exists $commandTable{$profile};
 
 		my $command = checkBin($profile);
-		next PROFILE if !$command;
+		goto INSTANCE if !$command;
 
 		my $streamMode = undef;
 		my $caps = $capabilities{$profile};
@@ -539,7 +548,7 @@ sub tokenizeConvertCommand2 {
 
 	# Special case for cuesheets. We pass the start and end
 	# of the track within the file.
-	if ($fullpath =~ /#([^-]+)-([^-]+)$/) {
+	if ($fullpath =~ /#(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/) {
 		 ($start, $end) = ($1, $2);
 	}
 
@@ -573,12 +582,19 @@ sub tokenizeConvertCommand2 {
 		}
 	}
 
-	# escape $ and * in file names and URLs.
-	# Except on Windows where $ and ` shouldn't be escaped and "
-	# isn't allowed in filenames.
+	# escape \, $, ", and ` in file names and URLs on Unix.
+	# On Windows, escape quotes and any backslashes preceding quotes/end of string.
 	if (!main::ISWINDOWS) {
+		$filepath =~ s/\\/\\\\/g;
 		$filepath =~ s/([\$\"\`])/\\$1/g;
+		$fullpath =~ s/\\/\\\\/g;
 		$fullpath =~ s/([\$\"\`])/\\$1/g;
+	}
+	else {
+		$filepath =~ s/(\\*)"/$1$1\\"/g;
+		$filepath =~ s/(\\+)$/$1$1/;
+		$fullpath =~ s/(\\*)"/$1$1\\"/g;
+		$fullpath =~ s/(\\+)$/$1$1/;
 	}
 
 	# Check to see if we need to flip the endianess on output

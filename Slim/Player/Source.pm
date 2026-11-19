@@ -343,12 +343,15 @@ sub _readNextChunk {
 						my $weakClient = $client;
 						Scalar::Util::weaken($weakClient);
 
-						Slim::Networking::Select::addRead(${*$fd}{'pipeline_reader'} || $fd, sub { _wakeupOnReadable(shift, $weakClient) if $weakClient; }, 1);
+						my $readFh  = ${*$fd}{'pipeline_reader'} || $fd;
+						my $writeFh = ${*$fd}{'pipeline_writer'};
+
+						Slim::Networking::Select::addRead($readFh, sub { _wakeupOnReadable(shift, $weakClient, $writeFh); }, 1);
 
 						# If this pipeline's input is full, also wake up when it drains. Until the pipeline
 						# produces its first output, the reader above cannot become readable.
-						if (${*$fd}{'pipeline_pending_size'} && defined ${*$fd}{'pipeline_writer'}) {
-							Slim::Networking::Select::addWrite(${*$fd}{'pipeline_writer'}, sub { _wakeupOnWritable(shift, $weakClient) if $weakClient; }, 1);
+						if (${*$fd}{'pipeline_pending_size'} && defined $writeFh) {
+							Slim::Networking::Select::addWrite($writeFh, sub { _wakeupOnWritable(shift, $weakClient, $readFh); }, 1);
 						}
 					}
 					return undef;
@@ -380,6 +383,11 @@ sub _readNextChunk {
 	# so open the next filehandle.
 bail:
 	if ($endofsong) {
+
+		if (defined $fd) {
+			Slim::Networking::Select::removeRead(${*$fd}{'pipeline_reader'} || $fd);
+			Slim::Networking::Select::removeWrite(${*$fd}{'pipeline_writer'}) if defined ${*$fd}{'pipeline_writer'};
+		}
 
 		if ( main::INFOLOG && $log->is_info ) {
 			my $msg = "end of file or error on socket, song pos: " . $client->songBytes;
@@ -420,21 +428,27 @@ bail:
 }
 
 sub _wakeupOnReadable {
-	my ($fd, $master) = @_;
-
-	main::DEBUGLOG && $log->debug($master->id);
+	my ($fd, $master, $writeFh) = @_;
 
 	Slim::Networking::Select::removeRead($fd) if defined $fd;
+	Slim::Networking::Select::removeWrite($writeFh) if defined $writeFh;
+
+	return unless $master;
+
+	main::DEBUGLOG && $log->debug($master->id);
 
 	_wakeupStream($master);
 }
 
 sub _wakeupOnWritable {
-	my ($fd, $master) = @_;
-
-	main::DEBUGLOG && $log->debug($master->id);
+	my ($fd, $master, $readFh) = @_;
 
 	Slim::Networking::Select::removeWrite($fd) if defined $fd;
+	Slim::Networking::Select::removeRead($readFh) if defined $readFh;
+
+	return unless $master;
+
+	main::DEBUGLOG && $log->debug($master->id);
 
 	_wakeupStream($master);
 }

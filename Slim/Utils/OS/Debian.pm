@@ -102,14 +102,12 @@ sub scanner {
 }
 
 sub gdresized {
-	if ( $ENV{LMS_USE_RUST} // 1 ) {
+	if ( ($ENV{LMS_USE_RUST} // 1) && (my $arch = Slim::Utils::OS::_rustLinuxBinArch()) ) {
 		for my $p (
-			'/usr/share/squeezeboxserver/Bin/aarch64-linux/gdresized',
-			'/usr/share/squeezeboxserver/Bin/x86_64-linux/gdresized',
-			"$Bin/Bin/aarch64-linux/gdresized",
-			"$Bin/Bin/x86_64-linux/gdresized",
+			"/usr/share/squeezeboxserver/Bin/$arch/gdresized",
+			"$Bin/Bin/$arch/gdresized",
 		) {
-			return $p if -x $p;
+			return $p if -f $p && -x _;
 		}
 	}
 	return "/usr/sbin/squeezeboxserver-resized";

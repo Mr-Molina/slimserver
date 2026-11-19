@@ -343,12 +343,8 @@ sub albumsQuery {
 				$sql = 'SELECT %s FROM albumsSearch, albums ';
 				unshift @{$w}, "albums.id = albumsSearch.id";
 
-				if ($tags ne 'CC') {
-					if (defined $sort && $sort ne 'album') {
-						$order_by = "albumsSearch.fulltextweight DESC, $sort";
-					} else {
-						$order_by = $sort = "albumsSearch.fulltextweight DESC, albums.titlesort";
-					}
+				if ($tags ne 'CC' && $sort eq 'album') {
+					$order_by = "albumsSearch.fulltextweight DESC, $order_by";
 				}
 			}
 			else {
@@ -923,17 +919,22 @@ sub albumsQuery {
 
 			# want multiple artists?
 			if ( $contributorSql && defined $c->{'albums.contributor'} && $c->{'albums.contributor'} != $vaObjId && !$c->{'albums.compilation'} ) {
-				my $contributorArray = $albumContribCache{ $c->{'albums.id'} };
+				my $contribKey = join(':',
+					$c->{'albums.id'},
+					$work ? ($c->{'tracks.work'} // $work) : '',
+					$work ? ($c->{'tracks.performance'} // '') : '',
+				);
+				my $contributorArray = $albumContribCache{$contribKey};
 				if (!$contributorArray) {
 					$contributorSth ||= $dbh->prepare_cached($contributorSql);
 					$contributorSth->bind_param(":album", $c->{'albums.id'});
 					if ( $work ) {
-						$contributorSth->bind_param(":work", $work);
+						$contributorSth->bind_param(":work", $c->{'tracks.work'} // $work);
 						$contributorSth->bind_param(":performance", $c->{'tracks.performance'}||undef);
 					}
 					$contributorArray = $dbh->selectall_arrayref($contributorSth,{ Slice => {} }) || [];
 					$contributorSth->finish();
-					$albumContribCache{ $c->{'albums.id'} } = $contributorArray;
+					$albumContribCache{$contribKey} = $contributorArray;
 				}
 
 				my $contributorHash = {};
@@ -997,6 +998,7 @@ sub albumsQuery {
 		}
 
 		$contributorSth->finish() if $contributorSth;
+		%albumContribCache = ();
 	}
 
 	$request->addResult('count', $count);
