@@ -1,7 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use rusqlite::Connection;
+use rusqlite::OpenFlags;
+use rusqlite::TransactionBehavior;
 use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -185,28 +189,85 @@ fn parse_extensions_csv(csv: &str) -> Result<Vec<String>, AccelError> {
     Ok(exts)
 }
 
-fn has_url_index(conn: &Connection) -> Result<bool, AccelError> {
-    let mut list_stmt = conn.prepare("PRAGMA index_list('scanned_files')")?;
-    let index_names: Vec<String> = list_stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
+const SCAN_BATCH_SIZE: usize = 5_000;
+const MAX_RESIZE_DIMENSION: u32 = 8_192;
 
-    for idx_name in index_names {
-        let escaped = idx_name.replace('"', "\"\"");
-        let pragma_sql = format!("PRAGMA index_info(\"{}\")", escaped);
-        let mut info_stmt = conn.prepare(&pragma_sql)?;
-        let cols: Vec<(i64, Option<String>)> = info_stmt
+fn ensure_unique_url_index(conn: &mut Connection) -> Result<(), AccelError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    {
+        let mut list_stmt = tx.prepare("PRAGMA index_list('scanned_files')")?;
+        let indexes: Vec<(String, bool, bool)> = list_stmt
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(2)?))
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(4)? == 0,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some((0, Some(col_name))) = cols.first() {
-            if col_name.eq_ignore_ascii_case("url") {
-                return Ok(true);
+
+        let mut has_valid_unique_url_index = false;
+        let mut has_stale_scanned_url_index = false;
+        for (idx_name, is_unique, is_non_partial) in &indexes {
+            let escaped = idx_name.replace('"', "\"\"");
+            let pragma_sql = format!("PRAGMA index_info(\"{}\")", escaped);
+            let mut info_stmt = tx.prepare(&pragma_sql)?;
+            let cols: Vec<(i64, Option<String>)> = info_stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(2)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let is_single_url_col = cols.len() == 1
+                && matches!(
+                    cols.first(),
+                    Some((0, Some(col_name))) if col_name.eq_ignore_ascii_case("url")
+                );
+            if is_single_url_col {
+                if *is_unique && *is_non_partial {
+                    has_valid_unique_url_index = true;
+                    break;
+                }
+                if idx_name.eq_ignore_ascii_case("scannedUrlIndex") {
+                    has_stale_scanned_url_index = true;
+                }
+            }
+        }
+
+        if !has_valid_unique_url_index {
+            if has_stale_scanned_url_index {
+                tx.execute("DROP INDEX IF EXISTS scannedUrlIndex", [])?;
+            }
+
+            let create_sql =
+                "CREATE UNIQUE INDEX IF NOT EXISTS scannedUrlIndex ON scanned_files (url)";
+            if let Err(err) = tx.execute(create_sql, []) {
+                // Pre-existing duplicate rows block unique index creation;
+                // retain the latest row per URL before retrying.
+                if matches!(
+                    err,
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ErrorCode::ConstraintViolation,
+                            ..
+                        },
+                        _
+                    )
+                ) {
+                    tx.execute(
+                        "DELETE FROM scanned_files \
+                         WHERE rowid NOT IN (SELECT MAX(rowid) FROM scanned_files GROUP BY url)",
+                        [],
+                    )?;
+                    tx.execute(create_sql, [])?;
+                } else {
+                    return Err(AccelError::Db(err));
+                }
             }
         }
     }
-    Ok(false)
+    tx.commit()?;
+
+    Ok(())
 }
 
 fn flush_batch(
@@ -216,10 +277,14 @@ fn flush_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO scanned_files (url, timestamp, filesize) VALUES (?1, ?2, ?3)",
+            "INSERT INTO scanned_files (url, timestamp, filesize) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(url) DO UPDATE SET \
+                 timestamp = excluded.timestamp, \
+                 filesize = excluded.filesize",
         )?;
         for (url, mtime, filesize) in batch.iter() {
             stmt.execute(rusqlite::params![url, mtime, filesize])?;
@@ -228,6 +293,68 @@ fn flush_batch(
     tx.commit()?;
     batch.clear();
     Ok(())
+}
+
+#[cfg(unix)]
+const fn unix_o_nonblock() -> i32 {
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6"
+        )
+    ))]
+    {
+        0x0080
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "sparc", target_arch = "sparc64")
+    ))]
+    {
+        0x4000
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    ))]
+    {
+        0o4000
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x0004
+    }
+}
+
+#[cfg(unix)]
+fn open_scanned_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(unix_o_nonblock())
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_scanned_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Scans `basedir` and populates `scanned_files` in `db_path` using default LMS
@@ -247,6 +374,12 @@ pub fn populate_scanned_files_with_extensions(
         return Err(AccelError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("directory not found: {}", basedir.display()),
+        )));
+    }
+    if !basedir.is_dir() {
+        return Err(AccelError::Arg(format!(
+            "basedir is not a directory: {}",
+            basedir.display()
         )));
     }
 
@@ -274,7 +407,7 @@ pub fn populate_scanned_files_with_extensions(
         ));
     }
 
-    let mut conn = Connection::open(db_path)?;
+    let mut conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.execute_batch(
         "PRAGMA busy_timeout = 5000; \
          PRAGMA journal_mode = WAL; \
@@ -284,14 +417,10 @@ pub fn populate_scanned_files_with_extensions(
          PRAGMA temp_store = MEMORY;",
     )?;
 
-    if !has_url_index(&conn)? {
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS scannedUrlIndex ON scanned_files (url)",
-            [],
-        )?;
-    }
+    ensure_unique_url_index(&mut conn)?;
 
-    let mut batch: Vec<(String, i64, i64)> = Vec::with_capacity(5_000);
+    let mut batch: Vec<(String, i64, i64)> = Vec::with_capacity(SCAN_BATCH_SIZE);
+    let mut total_count: usize = 0;
     let walk_root = normalize_lexical_path(basedir);
 
     let walker = walkdir::WalkDir::new(&walk_root)
@@ -320,11 +449,12 @@ pub fn populate_scanned_files_with_extensions(
             continue;
         }
 
-        if std::fs::File::open(entry.path()).is_err() {
-            continue;
-        }
+        let file = match open_scanned_file(entry.path()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
 
-        let metadata = match entry.metadata() {
+        let metadata = match file.metadata() {
             Ok(m) => m,
             Err(err) => {
                 eprintln!(
@@ -336,6 +466,10 @@ pub fn populate_scanned_files_with_extensions(
             }
         };
 
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+
         let url = path_to_file_url(entry.path());
         let mtime = metadata
             .modified()
@@ -346,11 +480,69 @@ pub fn populate_scanned_files_with_extensions(
         let filesize = metadata.len() as i64;
 
         batch.push((url, mtime, filesize));
+        total_count += 1;
+        if batch.len() >= SCAN_BATCH_SIZE {
+            flush_batch(&mut conn, &mut batch)?;
+        }
     }
 
-    let count = batch.len();
     flush_batch(&mut conn, &mut batch)?;
-    Ok(count)
+    Ok(total_count)
+}
+
+fn validate_single_spec(spec: &str) -> Result<(), AccelError> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(AccelError::Image(lms_image::ImageError::InvalidSpec(
+            spec.to_string(),
+        )));
+    }
+
+    let mut remainder = trimmed;
+    if let Some((prefix, ext)) = remainder.rsplit_once('.') {
+        let lower_ext = ext.to_ascii_lowercase();
+        if matches!(
+            lower_ext.as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "gd" | "webp" | "bmp"
+        ) {
+            remainder = prefix;
+        }
+    }
+
+    let first = remainder.split('_').next().unwrap_or("");
+    let Some((w_str, h_str)) = first.split_once('x').or_else(|| first.split_once('X')) else {
+        return Err(AccelError::Image(lms_image::ImageError::InvalidSpec(
+            spec.to_string(),
+        )));
+    };
+
+    let valid_dim = |d: &str| {
+        d.is_empty() || d.eq_ignore_ascii_case("x") || d.chars().all(|c| c.is_ascii_digit())
+    };
+    if !valid_dim(w_str) || !valid_dim(h_str) {
+        return Err(AccelError::Image(lms_image::ImageError::InvalidSpec(
+            spec.to_string(),
+        )));
+    }
+
+    let parsed = lms_image::try_parse_single_spec(trimmed)?;
+    if parsed.width.is_some_and(|w| w > MAX_RESIZE_DIMENSION)
+        || parsed.height.is_some_and(|h| h > MAX_RESIZE_DIMENSION)
+    {
+        return Err(AccelError::Image(lms_image::ImageError::InvalidArguments));
+    }
+
+    Ok(())
+}
+
+fn validate_specs(specs: &[String]) -> Result<(), AccelError> {
+    if specs.is_empty() {
+        return Err(AccelError::Arg("No specs provided".to_string()));
+    }
+    for spec in specs {
+        validate_single_spec(spec)?;
+    }
+    Ok(())
 }
 
 /// Resizes and caches artwork jobs in parallel, propagating fatal cache errors
@@ -360,11 +552,9 @@ pub fn precache_artwork_batch(
     jobs: &[(PathBuf, String)],
     specs: &[String],
 ) -> Result<usize, AccelError> {
+    validate_specs(specs)?;
     if jobs.is_empty() {
         return Ok(0);
-    }
-    if specs.is_empty() {
-        return Err(AccelError::Arg("No specs provided".to_string()));
     }
     let store = lms_cache::DbArtworkStore::open(cache_root, false)?;
 
@@ -382,6 +572,8 @@ pub fn precache_artwork_batch(
             ) {
                 Ok(_) => Ok(1usize),
                 Err(lms_image::ImageError::Cache(cache_err)) => Err(AccelError::Cache(cache_err)),
+                Err(err @ lms_image::ImageError::InvalidSpec(_))
+                | Err(err @ lms_image::ImageError::InvalidArguments) => Err(AccelError::Image(err)),
                 Err(err) => {
                     eprintln!("Failed to resize {}: {}", img_path.display(), err);
                     Ok(0usize)
@@ -415,57 +607,107 @@ enum CliCommand {
     },
 }
 
-fn parse_job_arg(arg: &str) -> (PathBuf, String) {
-    if let Some((f, k)) = arg.split_once("::") {
-        (PathBuf::from(f), k.to_string())
+#[cfg(unix)]
+fn parse_job_arg<S: AsRef<OsStr>>(arg: S) -> Result<(PathBuf, String), AccelError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let os = arg.as_ref();
+    let bytes = os.as_bytes();
+    if let Some(pos) = bytes.windows(2).rposition(|w| w == b"::") {
+        let file_bytes = &bytes[..pos];
+        let key_bytes = &bytes[pos + 2..];
+        let key = std::str::from_utf8(key_bytes)
+            .map_err(|_| AccelError::Arg("Invalid UTF-8 in artwork cache key".to_string()))?;
+        return Ok((
+            PathBuf::from(OsStr::from_bytes(file_bytes)),
+            key.to_string(),
+        ));
+    }
+    Ok((PathBuf::from(os), os.to_string_lossy().into_owned()))
+}
+
+#[cfg(not(unix))]
+fn parse_job_arg<S: AsRef<OsStr>>(arg: S) -> Result<(PathBuf, String), AccelError> {
+    let os = arg.as_ref();
+    let lossy = os.to_string_lossy();
+    if let Some((f, k)) = lossy.rsplit_once("::") {
+        Ok((PathBuf::from(f), k.to_string()))
     } else {
-        (PathBuf::from(arg), arg.to_string())
+        Ok((PathBuf::from(os), lossy.into_owned()))
     }
 }
 
-fn parse_scan_dir_args<I>(mut args: I) -> Result<CliCommand, AccelError>
+#[cfg(unix)]
+fn os_str_starts_with_dash(s: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    s.as_bytes().starts_with(b"-")
+}
+
+#[cfg(not(unix))]
+fn os_str_starts_with_dash(s: &OsStr) -> bool {
+    s.to_string_lossy().starts_with('-')
+}
+
+fn take_flag_value<I, T>(flag: &str, args: &mut I) -> Result<OsString, AccelError>
 where
-    I: Iterator<Item = String>,
+    I: Iterator<Item = T>,
+    T: Into<OsString>,
+{
+    let val = args
+        .next()
+        .map(Into::into)
+        .ok_or_else(|| AccelError::Arg(format!("Missing value for {}", flag)))?;
+    if os_str_starts_with_dash(&val) {
+        return Err(AccelError::Arg(format!(
+            "Missing value for {} (got flag-like value '{}')",
+            flag,
+            val.to_string_lossy()
+        )));
+    }
+    Ok(val)
+}
+
+fn parse_scan_dir_args<I, T>(mut args: I) -> Result<CliCommand, AccelError>
+where
+    I: Iterator<Item = T>,
+    T: Into<OsString>,
 {
     let mut db_path = None;
     let mut basedir = None;
     let mut extensions = None;
     let mut after_double_dash = false;
 
-    while let Some(arg) = args.next() {
+    while let Some(raw_arg) = args.next() {
+        let arg: OsString = raw_arg.into();
         if after_double_dash {
             return Err(AccelError::Arg(format!(
                 "Unexpected positional argument for scan-dir: {}",
-                arg
+                arg.to_string_lossy()
             )));
         }
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(CliCommand::Help),
-            "--" => {
+        match arg.to_str() {
+            Some("-h" | "--help") => return Ok(CliCommand::Help),
+            Some("--") => {
                 after_double_dash = true;
             }
-            "--db" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| AccelError::Arg("Missing value for --db".to_string()))?;
+            Some("--db") => {
+                let val = take_flag_value("--db", &mut args)?;
                 db_path = Some(PathBuf::from(val));
             }
-            "--dir" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| AccelError::Arg("Missing value for --dir".to_string()))?;
+            Some("--dir") => {
+                let val = take_flag_value("--dir", &mut args)?;
                 basedir = Some(PathBuf::from(val));
             }
-            "--extensions" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| AccelError::Arg("Missing value for --extensions".to_string()))?;
-                extensions = Some(parse_extensions_csv(&val)?);
+            Some("--extensions") => {
+                let val = take_flag_value("--extensions", &mut args)?;
+                let csv = val
+                    .to_str()
+                    .ok_or_else(|| AccelError::Arg("Invalid UTF-8 in --extensions".to_string()))?;
+                extensions = Some(parse_extensions_csv(csv)?);
             }
-            other => {
+            _ => {
                 return Err(AccelError::Arg(format!(
                     "Unknown argument for scan-dir: {}",
-                    other
+                    arg.to_string_lossy()
                 )));
             }
         }
@@ -483,56 +725,58 @@ where
     })
 }
 
-fn parse_precache_art_args<I>(mut args: I) -> Result<CliCommand, AccelError>
+fn parse_precache_art_args<I, T>(mut args: I) -> Result<CliCommand, AccelError>
 where
-    I: Iterator<Item = String>,
+    I: Iterator<Item = T>,
+    T: Into<OsString>,
 {
     let mut cache_root = None;
     let mut specs = Vec::new();
     let mut jobs = Vec::new();
     let mut after_double_dash = false;
 
-    while let Some(arg) = args.next() {
+    while let Some(raw_arg) = args.next() {
+        let arg: OsString = raw_arg.into();
         if after_double_dash {
-            jobs.push(parse_job_arg(&arg));
+            jobs.push(parse_job_arg(&arg)?);
             continue;
         }
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(CliCommand::Help),
-            "--" => {
+        match arg.to_str() {
+            Some("-h" | "--help") => return Ok(CliCommand::Help),
+            Some("--") => {
                 after_double_dash = true;
             }
-            "--cache-root" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| AccelError::Arg("Missing value for --cache-root".to_string()))?;
+            Some("--cache-root") => {
+                let val = take_flag_value("--cache-root", &mut args)?;
                 cache_root = Some(PathBuf::from(val));
             }
-            "--spec" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| AccelError::Arg("Missing value for --spec".to_string()))?;
-                for s in val.split(',') {
+            Some("--spec") => {
+                let val = take_flag_value("--spec", &mut args)?;
+                let spec_str = val
+                    .to_str()
+                    .ok_or_else(|| AccelError::Arg("Invalid UTF-8 in --spec".to_string()))?;
+                for s in spec_str.split(',') {
                     let trimmed = s.trim();
                     if !trimmed.is_empty() {
                         specs.push(trimmed.to_string());
                     }
                 }
             }
-            other if other.starts_with('-') => {
+            _ if os_str_starts_with_dash(&arg) => {
                 return Err(AccelError::Arg(format!(
                     "Unknown argument for precache-art: {}",
-                    other
+                    arg.to_string_lossy()
                 )));
             }
-            other => {
-                jobs.push(parse_job_arg(other));
+            _ => {
+                jobs.push(parse_job_arg(&arg)?);
             }
         }
     }
 
     let root = cache_root
         .ok_or_else(|| AccelError::Arg("Missing required --cache-root argument".to_string()))?;
+    validate_specs(&specs)?;
 
     Ok(CliCommand::PrecacheArt {
         cache_root: root,
@@ -541,19 +785,24 @@ where
     })
 }
 
-fn parse_cli<I>(mut args: I) -> Result<CliCommand, AccelError>
+fn parse_cli<I, T>(mut args: I) -> Result<CliCommand, AccelError>
 where
-    I: Iterator<Item = String>,
+    I: Iterator<Item = T>,
+    T: Into<OsString>,
 {
-    let cmd = args
+    let cmd: OsString = args
         .next()
+        .map(Into::into)
         .ok_or_else(|| AccelError::Arg("Missing command".to_string()))?;
 
-    match cmd.as_str() {
-        "-h" | "--help" | "help" => Ok(CliCommand::Help),
-        "scan-dir" => parse_scan_dir_args(args),
-        "precache-art" => parse_precache_art_args(args),
-        other => Err(AccelError::Arg(format!("Unknown command: {}", other))),
+    match cmd.to_str() {
+        Some("-h" | "--help" | "help") => Ok(CliCommand::Help),
+        Some("scan-dir") => parse_scan_dir_args(args),
+        Some("precache-art") => parse_precache_art_args(args),
+        _ => Err(AccelError::Arg(format!(
+            "Unknown command: {}",
+            cmd.to_string_lossy()
+        ))),
     }
 }
 
@@ -566,16 +815,7 @@ fn print_usage() {
     eprintln!("  -h, --help    Show this help message");
 }
 
-fn main() {
-    let command = match parse_cli(std::env::args().skip(1)) {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            print_usage();
-            std::process::exit(1);
-        }
-    };
-
+fn execute_command(command: CliCommand, out: &mut dyn std::io::Write) -> Result<(), AccelError> {
     match command {
         CliCommand::Help => {
             print_usage();
@@ -585,30 +825,36 @@ fn main() {
             basedir,
             extensions,
         } => {
-            match populate_scanned_files_with_extensions(&db_path, &basedir, extensions.as_deref())
-            {
-                Ok(count) => {
-                    println!("Populated {} scanned files", count);
-                }
-                Err(e) => {
-                    eprintln!("Error populating scanned files: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            let count =
+                populate_scanned_files_with_extensions(&db_path, &basedir, extensions.as_deref())?;
+            writeln!(out, "{count}")?;
         }
         CliCommand::PrecacheArt {
             cache_root,
             specs,
             jobs,
-        } => match precache_artwork_batch(&cache_root, &jobs, &specs) {
-            Ok(count) => {
-                println!("Precached {} artwork jobs", count);
-            }
-            Err(e) => {
-                eprintln!("Error precaching artwork: {}", e);
-                std::process::exit(1);
-            }
-        },
+        } => {
+            let count = precache_artwork_batch(&cache_root, &jobs, &specs)?;
+            writeln!(out, "Precached {count} artwork jobs")?;
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let command = match parse_cli(std::env::args_os().skip(1)) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = execute_command(command, &mut stdout) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -1059,5 +1305,334 @@ mod tests {
             .query_row("SELECT url FROM scanned_files", [], |r| r.get(0))
             .unwrap();
         assert!(url.ends_with("/readable.mp3"), "unexpected url: {url}");
+    }
+
+    #[test]
+    fn test_rescan_upserts_without_duplicates_and_missing_db_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("does_not_exist.db");
+        let music_dir = dir.path().join("music");
+        std::fs::create_dir_all(&music_dir).unwrap();
+        let track = music_dir.join("song.mp3");
+        std::fs::write(&track, vec![0u8; 100]).unwrap();
+
+        let err = populate_scanned_files(&missing_db, &music_dir).unwrap_err();
+        assert!(matches!(err, AccelError::Db(_)));
+        assert!(
+            !missing_db.exists(),
+            "missing --db must not create an empty stray database"
+        );
+
+        let db_path = dir.path().join("library.db");
+        create_scanned_files_table(&db_path, true);
+        assert_eq!(populate_scanned_files(&db_path, &music_dir).unwrap(), 1);
+
+        std::fs::write(&track, vec![0u8; 250]).unwrap();
+        assert_eq!(populate_scanned_files(&db_path, &music_dir).unwrap(), 1);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (count, size): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(filesize) FROM scanned_files",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(size, 250);
+    }
+
+    #[test]
+    fn test_scan_dir_incremental_batch_flush_preserves_total_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("batch.db");
+        let music_dir = dir.path().join("music");
+        std::fs::create_dir_all(&music_dir).unwrap();
+
+        let total_files = SCAN_BATCH_SIZE + 5;
+        for idx in 0..total_files {
+            std::fs::write(music_dir.join(format!("track_{idx:05}.mp3")), b"id3").unwrap();
+        }
+
+        create_scanned_files_table(&db_path, true);
+        let count = populate_scanned_files(&db_path, &music_dir).unwrap();
+        assert_eq!(count, total_files);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scanned_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count as usize, total_files);
+    }
+
+    #[test]
+    fn test_precache_validates_specs_with_empty_jobs_and_propagates_invalid_args() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            precache_artwork_batch(dir.path(), &[], &[]),
+            Err(AccelError::Arg(_))
+        ));
+        assert!(matches!(
+            precache_artwork_batch(dir.path(), &[], &["invalid_spec".to_string()]),
+            Err(AccelError::Image(lms_image::ImageError::InvalidSpec(_)))
+        ));
+        assert!(matches!(
+            precache_artwork_batch(dir.path(), &[], &["9000x100_m".to_string()]),
+            Err(AccelError::Image(lms_image::ImageError::InvalidArguments))
+        ));
+
+        let img_path = dir.path().join("cover.jpg");
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(32, 32, |_, _| image::Rgb([1, 2, 3])));
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImgFmt::Jpeg)
+            .unwrap();
+        std::fs::write(&img_path, buf).unwrap();
+
+        let jobs = vec![(img_path, String::new())];
+        let specs = vec!["100x100_o".to_string(), "50x50_m".to_string()];
+        let err = precache_artwork_batch(dir.path(), &jobs, &specs).unwrap_err();
+        assert!(matches!(
+            err,
+            AccelError::Image(lms_image::ImageError::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn test_cli_validation_rsplit_flag_values_and_non_dir_basedir() {
+        assert_eq!(
+            parse_job_arg("/music/A::B/cover.jpg::cachekey").unwrap(),
+            (
+                PathBuf::from("/music/A::B/cover.jpg"),
+                "cachekey".to_string()
+            )
+        );
+
+        let flag_err = parse_cli(
+            [
+                "scan-dir".to_string(),
+                "--db".to_string(),
+                "--dir".to_string(),
+                "/music".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(matches!(flag_err, AccelError::Arg(_)));
+
+        let missing_spec_err = parse_cli(
+            [
+                "precache-art".to_string(),
+                "--cache-root".to_string(),
+                "/cache".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(matches!(missing_spec_err, AccelError::Arg(_)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("library.db");
+        let file_not_dir = dir.path().join("not_a_dir.mp3");
+        std::fs::write(&file_not_dir, b"abc").unwrap();
+        create_scanned_files_table(&db_path, true);
+        let dir_err = populate_scanned_files(&db_path, &file_not_dir).unwrap_err();
+        assert!(matches!(dir_err, AccelError::Arg(_)));
+    }
+
+    #[test]
+    fn test_ensure_unique_url_index_repairs_duplicates_partial_and_rolls_back_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Case 1: Non-unique index + duplicate rows deduplicate atomically.
+        let dup_db = dir.path().join("dup.db");
+        create_scanned_files_table(&dup_db, true);
+        let mut conn = rusqlite::Connection::open(&dup_db).unwrap();
+        conn.execute(
+            "INSERT INTO scanned_files (url, timestamp, filesize) \
+             VALUES ('file:///a.mp3', 100, 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scanned_files (url, timestamp, filesize) \
+             VALUES ('file:///a.mp3', 200, 20)",
+            [],
+        )
+        .unwrap();
+        ensure_unique_url_index(&mut conn).unwrap();
+
+        let (count, ts, size): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(timestamp), MAX(filesize) FROM scanned_files",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((count, ts, size), (1, 200, 20));
+        let (is_unique, is_partial): (i64, i64) = conn
+            .query_row(
+                "SELECT \"unique\", partial FROM pragma_index_list('scanned_files') \
+                 WHERE name = 'scannedUrlIndex'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((is_unique, is_partial), (1, 0));
+
+        // Case 2: Partial unique index is replaced by a full unique index.
+        let partial_db = dir.path().join("partial.db");
+        create_scanned_files_table(&partial_db, false);
+        let mut partial_conn = rusqlite::Connection::open(&partial_db).unwrap();
+        partial_conn
+            .execute(
+                "CREATE UNIQUE INDEX scannedUrlIndex ON scanned_files (url) WHERE filesize > 0",
+                [],
+            )
+            .unwrap();
+        ensure_unique_url_index(&mut partial_conn).unwrap();
+        let (p_unique, p_partial): (i64, i64) = partial_conn
+            .query_row(
+                "SELECT \"unique\", partial FROM pragma_index_list('scanned_files') \
+                 WHERE name = 'scannedUrlIndex'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((p_unique, p_partial), (1, 0));
+
+        // Case 3: Failure during duplicate cleanup rolls back DROP INDEX atomically.
+        let rollback_db = dir.path().join("rollback.db");
+        create_scanned_files_table(&rollback_db, true);
+        let mut rb_conn = rusqlite::Connection::open(&rollback_db).unwrap();
+        rb_conn
+            .execute(
+                "INSERT INTO scanned_files (url, timestamp, filesize) \
+                 VALUES ('file:///x.mp3', 1, 1)",
+                [],
+            )
+            .unwrap();
+        rb_conn
+            .execute(
+                "INSERT INTO scanned_files (url, timestamp, filesize) \
+                 VALUES ('file:///x.mp3', 2, 2)",
+                [],
+            )
+            .unwrap();
+        rb_conn
+            .execute(
+                "CREATE TRIGGER block_delete BEFORE DELETE ON scanned_files \
+                 BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;",
+                [],
+            )
+            .unwrap();
+        let err = ensure_unique_url_index(&mut rb_conn).unwrap_err();
+        assert!(matches!(err, AccelError::Db(_)));
+
+        let (rb_unique, rb_count): (i64, i64) = rb_conn
+            .query_row(
+                "SELECT (SELECT \"unique\" FROM pragma_index_list('scanned_files') \
+                         WHERE name = 'scannedUrlIndex'), \
+                        (SELECT COUNT(*) FROM scanned_files)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rb_unique, 0, "failed repair must roll back DROP INDEX");
+        assert_eq!(rb_count, 2, "failed repair must preserve original rows");
+    }
+
+    #[test]
+    fn test_scan_dir_stdout_prints_exact_numeric_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stdout.db");
+        let music_dir = dir.path().join("music");
+        std::fs::create_dir_all(&music_dir).unwrap();
+        std::fs::write(music_dir.join("a.mp3"), b"mp3").unwrap();
+        std::fs::write(music_dir.join("b.flac"), b"flac").unwrap();
+        create_scanned_files_table(&db_path, true);
+
+        let cmd = CliCommand::ScanDir {
+            db_path,
+            basedir: music_dir,
+            extensions: None,
+        };
+        let mut out = Vec::new();
+        execute_command(cmd, &mut out).unwrap();
+        let stdout = String::from_utf8(out).unwrap();
+        assert_eq!(stdout, "2\n");
+        assert!(stdout.trim().chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_validate_single_spec_rejects_invalid_specs_with_empty_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad_spec in ["99999999999999999999x100_m", "100x100_z", "100x100_m.tiff"] {
+            let Err(err) = precache_artwork_batch(dir.path(), &[], &[bad_spec.to_string()]) else {
+                panic!("expected ImageError for invalid spec '{bad_spec}', got Ok");
+            };
+            assert!(
+                matches!(err, AccelError::Image(_)),
+                "expected ImageError for invalid spec '{bad_spec}', got: {err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_cli_args_os_preserves_non_utf8_unix_paths() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let non_utf8_db = OsString::from_vec(b"/tmp/lib_\xff.db".to_vec());
+        let non_utf8_dir = OsString::from_vec(b"/tmp/music_\xfe".to_vec());
+        let scan_cmd = parse_cli(
+            [
+                OsString::from("scan-dir"),
+                OsString::from("--db"),
+                non_utf8_db.clone(),
+                OsString::from("--dir"),
+                non_utf8_dir.clone(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_cmd,
+            CliCommand::ScanDir {
+                db_path: PathBuf::from(&non_utf8_db),
+                basedir: PathBuf::from(&non_utf8_dir),
+                extensions: None,
+            }
+        );
+
+        let non_utf8_cache = OsString::from_vec(b"/tmp/cache_\xfd".to_vec());
+        let non_utf8_job = OsString::from_vec(b"/tmp/cover_\xfc.jpg::key_1".to_vec());
+        let art_cmd = parse_cli(
+            [
+                OsString::from("precache-art"),
+                OsString::from("--cache-root"),
+                non_utf8_cache.clone(),
+                OsString::from("--spec"),
+                OsString::from("100x100_o"),
+                non_utf8_job,
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            art_cmd,
+            CliCommand::PrecacheArt {
+                cache_root: PathBuf::from(&non_utf8_cache),
+                specs: vec!["100x100_o".to_string()],
+                jobs: vec![(
+                    PathBuf::from(OsStr::from_bytes(b"/tmp/cover_\xfc.jpg")),
+                    "key_1".to_string()
+                )],
+            }
+        );
+
+        let bad_args = [OsString::from_vec(b"bad_\xff".to_vec())];
+        let bad_cmd = parse_cli(bad_args.into_iter()).unwrap_err();
+        assert!(matches!(bad_cmd, AccelError::Arg(_)));
     }
 }

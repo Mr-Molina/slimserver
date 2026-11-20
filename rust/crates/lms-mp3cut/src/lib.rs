@@ -3,12 +3,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use md5::{Digest, Md5};
-use std::fs::{File, OpenOptions};
+use std::collections::hash_map::RandomState;
+use std::collections::HashSet;
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Mp3CutError {
@@ -188,12 +191,13 @@ impl Mp3Metadata {
             self.frames.len()
         };
         if self.sample_rate == 0 {
-            0
-        } else {
-            let total_ms = (audio_frames as u128) * (self.samples_per_frame as u128) * 1000
-                / (self.sample_rate as u128);
-            u64::try_from(total_ms).unwrap_or(u64::MAX)
+            return 0;
         }
+        let raw_samples = (audio_frames as u128) * u128::from(self.samples_per_frame);
+        let trim_samples = u128::from(self.enc_delay).saturating_add(u128::from(self.enc_padding));
+        let net_samples = raw_samples.saturating_sub(trim_samples);
+        let total_ms = (net_samples * 1000) / u128::from(self.sample_rate);
+        u64::try_from(total_ms).unwrap_or(u64::MAX)
     }
 }
 
@@ -202,6 +206,8 @@ const MLLT_VERSION: u32 = 1;
 const MLLT_HEADER_SIZE: usize = 32;
 const MLLT_ENTRY_SIZE: usize = 12;
 const MAX_MLLT_FRAMES: usize = 2_000_000;
+const MAX_MLLT_FILE_BYTES: usize = MLLT_HEADER_SIZE + MAX_MLLT_FRAMES * MLLT_ENTRY_SIZE;
+const MAX_MLLT_FRAME_LENGTH: u32 = 8192;
 const MAX_INITIAL_FRAME_CAPACITY: usize = 65_536;
 const MAX_INITIAL_MLLT_BYTES: usize = 1024 * 1024;
 
@@ -305,6 +311,9 @@ pub fn decode_mllt_cache(data: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
     );
     let frame_count = usize::try_from(frame_count_u32)
         .map_err(|_| Mp3CutError::CacheError("Frame count exceeds addressable range".into()))?;
+    if frame_count == 0 {
+        return Err(Mp3CutError::CacheError("Empty .mllt frame table".into()));
+    }
     if frame_count > MAX_MLLT_FRAMES {
         return Err(Mp3CutError::CacheError(format!(
             "Frame count {frame_count} exceeds maximum {MAX_MLLT_FRAMES}"
@@ -324,6 +333,7 @@ pub fn decode_mllt_cache(data: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
 
     let mut frames = Vec::with_capacity(frame_count.min(MAX_INITIAL_FRAME_CAPACITY));
     let mut offset = MLLT_HEADER_SIZE;
+    let mut prev_end: u64 = 0;
     for _ in 0..frame_count {
         let f_offset = u64::from_le_bytes(
             data[offset..offset + 8]
@@ -335,6 +345,20 @@ pub fn decode_mllt_cache(data: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
                 .try_into()
                 .map_err(|_| Mp3CutError::CacheError("Read error".into()))?,
         );
+        if !(4..=MAX_MLLT_FRAME_LENGTH).contains(&f_len) {
+            return Err(Mp3CutError::CacheError(format!(
+                "Invalid .mllt frame length {f_len}"
+            )));
+        }
+        let f_end = f_offset
+            .checked_add(u64::from(f_len))
+            .ok_or_else(|| Mp3CutError::CacheError("Frame offset overflow in .mllt".into()))?;
+        if f_offset < prev_end {
+            return Err(Mp3CutError::CacheError(
+                "Non-monotonic .mllt frame offsets".into(),
+            ));
+        }
+        prev_end = f_end;
         offset += MLLT_ENTRY_SIZE;
         frames.push(FrameEntry {
             offset: f_offset,
@@ -353,58 +377,46 @@ pub fn decode_mllt_cache(data: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
     })
 }
 
-const MAX_CANDIDATE_RESCAN_STEPS: usize = 64;
-const MAX_CANDIDATE_RESCAN_BYTES: usize = 64 * 1024;
+const STREAM_SCAN_WINDOW_BYTES: usize = 128 * 1024;
+const STREAM_SCAN_LOOKAHEAD_BYTES: usize = 4096;
 
-/// Finds the next valid MPEG Layer III frame header in `bytes`.
-///
-/// Confirms candidates when `next_i == bytes.len()` (terminal frame) or when
-/// `next_i` parses as a valid `FrameHeader` with matching MPEG version, layer,
-/// and sample rate, falling back to the first valid candidate within a bounded
-/// rescan window so repeated sync-like streams remain `O(N)`.
-pub fn find_next_frame_header(bytes: &[u8]) -> Option<(usize, FrameHeader)> {
-    let mut first_candidate: Option<(usize, FrameHeader)> = None;
-    let mut first_candidate_idx: Option<usize> = None;
-    let mut rescan_steps: usize = 0;
-    let limit = bytes.len().saturating_sub(3);
+fn find_next_frame_header_confirmed(
+    bytes: &[u8],
+    at_eof: bool,
+    expected: Option<(MpegVersion, u32)>,
+) -> Option<(usize, FrameHeader)> {
+    let limit = if at_eof {
+        bytes.len().saturating_sub(3)
+    } else {
+        bytes.len().saturating_sub(STREAM_SCAN_LOOKAHEAD_BYTES)
+    };
     let mut i = 0;
     while i < limit {
-        let scan_limit = match first_candidate_idx {
-            Some(start_i) => start_i
-                .saturating_add(MAX_CANDIDATE_RESCAN_BYTES)
-                .min(limit),
-            None => limit,
-        };
-        if i >= scan_limit {
-            return first_candidate;
-        }
-        let Some(rel) = bytes[i..scan_limit].iter().position(|&b| b == 0xFF) else {
-            return first_candidate;
-        };
+        let rel = bytes[i..limit].iter().position(|&b| b == 0xFF)?;
         i += rel;
         if (bytes[i + 1] & 0xE0) == 0xE0 {
-            if first_candidate_idx.is_some() {
-                rescan_steps += 1;
-                if rescan_steps > MAX_CANDIDATE_RESCAN_STEPS {
-                    return first_candidate;
-                }
-            }
             if let Some(header) = parse_frame_header(&bytes[i..]) {
-                if let Some(next_i) = i.checked_add(header.frame_size) {
-                    if next_i <= bytes.len() {
-                        if next_i == bytes.len() {
+                let matches_stream = match expected {
+                    Some((ver, sr)) => header.version == ver && header.sample_rate == sr,
+                    None => true,
+                };
+                if matches_stream {
+                    if let Some(next_i) = i.checked_add(header.frame_size) {
+                        if next_i == bytes.len() && at_eof {
                             return Some((i, header));
                         }
-                        if let Some(next_header) = parse_frame_header(&bytes[next_i..]) {
-                            if next_header.version == header.version
-                                && next_header.sample_rate == header.sample_rate
-                            {
-                                return Some((i, header));
+                        if next_i + 4 <= bytes.len() {
+                            if let Some(next_header) = parse_frame_header(&bytes[next_i..]) {
+                                if next_header.version == header.version
+                                    && next_header.sample_rate == header.sample_rate
+                                {
+                                    return Some((i, header));
+                                }
                             }
                         }
-                        if first_candidate.is_none() {
-                            first_candidate = Some((i, header));
-                            first_candidate_idx = Some(i);
+                        // Accept contiguous frame in locked stream at EOF/tag boundary.
+                        if expected.is_some() && i == 0 && next_i <= bytes.len() {
+                            return Some((i, header));
                         }
                     }
                 }
@@ -412,40 +424,155 @@ pub fn find_next_frame_header(bytes: &[u8]) -> Option<(usize, FrameHeader)> {
         }
         i += 1;
     }
-    first_candidate
+    None
 }
 
-/// Scans an MP3 file and constructs its frame index and Xing/LAME metadata.
-pub fn scan_mp3_frames(bytes: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
-    if bytes.len() < 4 {
+/// Finds the next valid MPEG Layer III frame header in `bytes`.
+///
+/// Confirms candidates via multi-frame sync lock (`next_i` parses as a valid
+/// `FrameHeader` with matching MPEG version, layer, and sample rate) or exact
+/// terminal frame alignment (`next_i == bytes.len()`).
+pub fn find_next_frame_header(bytes: &[u8]) -> Option<(usize, FrameHeader)> {
+    find_next_frame_header_confirmed(bytes, true, None)
+}
+
+fn parse_first_frame_metadata(frame_bytes: &[u8], header: &FrameHeader) -> (bool, u32, u32) {
+    let mut enc_delay = 0;
+    let mut enc_padding = 0;
+    let mut has_xing = false;
+
+    let frame_end = header.frame_size.min(frame_bytes.len());
+    let side_info_len = match (header.version, header.channels) {
+        (MpegVersion::Mpeg1, 1) => 17,
+        (MpegVersion::Mpeg1, _) => 32,
+        (_, 1) => 9,
+        (_, _) => 17,
+    };
+    let xing_rel = 4 + usize::from(header.has_crc) * 2 + side_info_len;
+    if xing_rel + 4 <= frame_end {
+        let tag = &frame_bytes[xing_rel..xing_rel + 4];
+        if tag == b"Xing" || tag == b"Info" {
+            has_xing = true;
+            let mut x_ptr = xing_rel + 4;
+            if x_ptr + 4 <= frame_end {
+                let x_flags = u32::from_be_bytes([
+                    frame_bytes[x_ptr],
+                    frame_bytes[x_ptr + 1],
+                    frame_bytes[x_ptr + 2],
+                    frame_bytes[x_ptr + 3],
+                ]);
+                x_ptr += 4;
+                let mut flags_valid = true;
+                let xing_fields: [(u32, usize); 4] = [
+                    (0x01, 4),   // frames
+                    (0x02, 4),   // bytes
+                    (0x04, 100), // TOC
+                    (0x08, 4),   // quality
+                ];
+                for (flag_bit, field_len) in xing_fields {
+                    if (x_flags & flag_bit) != 0 {
+                        if x_ptr + field_len <= frame_end {
+                            x_ptr += field_len;
+                        } else {
+                            flags_valid = false;
+                            break;
+                        }
+                    }
+                }
+                if flags_valid
+                    && x_ptr + 24 <= frame_end
+                    && &frame_bytes[x_ptr..x_ptr + 4] == b"LAME"
+                {
+                    let delay_bytes = &frame_bytes[x_ptr + 21..x_ptr + 24];
+                    let b_d0 = u32::from(delay_bytes[0]);
+                    let b_d1 = u32::from(delay_bytes[1]);
+                    let b_d2 = u32::from(delay_bytes[2]);
+                    enc_delay = (b_d0 << 4) | (b_d1 >> 4);
+                    enc_padding = ((b_d1 & 0x0F) << 8) | b_d2;
+                }
+            }
+        }
+    }
+
+    let vbri_rel = 4 + 32;
+    if !has_xing && vbri_rel + 26 <= frame_end && &frame_bytes[vbri_rel..vbri_rel + 4] == b"VBRI" {
+        has_xing = true;
+    }
+
+    (has_xing, enc_delay, enc_padding)
+}
+
+fn read_exact_eintr<R: Read>(reader: &mut R, mut buf: &mut [u8]) -> Result<usize, Mp3CutError> {
+    let mut total = 0usize;
+    while !buf.is_empty() {
+        match reader.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                buf = &mut buf[n..];
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(Mp3CutError::Io(err)),
+        }
+    }
+    Ok(total)
+}
+
+/// Scans an MP3 stream of known byte length and builds its frame index.
+pub fn scan_mp3_frames_reader<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+) -> Result<Mp3Metadata, Mp3CutError> {
+    if file_len < 4 {
         return Err(Mp3CutError::NoFramesFound(
             "File is too small to contain MP3 audio".into(),
         ));
     }
 
-    // Skip ID3v2 header if present and synchsafe size bytes are valid.
-    let mut scan_start = 0;
-    if bytes.starts_with(b"ID3")
-        && bytes.len() >= 10
-        && bytes[6..10].iter().all(|&b| (b & 0x80) == 0)
+    reader.seek(SeekFrom::Start(0))?;
+    let mut id3v2_hdr = [0u8; 10];
+    let hdr_read = if file_len >= 10 {
+        read_exact_eintr(reader, &mut id3v2_hdr)?
+    } else {
+        0
+    };
+
+    let mut scan_start: u64 = 0;
+    if hdr_read == 10
+        && id3v2_hdr.starts_with(b"ID3")
+        && id3v2_hdr[6..10].iter().all(|&b| (b & 0x80) == 0)
     {
-        let flags = bytes[5];
-        let tag_size = (usize::from(bytes[6] & 0x7F) << 21)
-            | (usize::from(bytes[7] & 0x7F) << 14)
-            | (usize::from(bytes[8] & 0x7F) << 7)
-            | usize::from(bytes[9] & 0x7F);
-        let footer_size = if (flags & 0x10) != 0 { 10 } else { 0 };
-        scan_start = 10usize.saturating_add(tag_size).saturating_add(footer_size);
+        let flags = id3v2_hdr[5];
+        let tag_size = (u64::from(id3v2_hdr[6] & 0x7F) << 21)
+            | (u64::from(id3v2_hdr[7] & 0x7F) << 14)
+            | (u64::from(id3v2_hdr[8] & 0x7F) << 7)
+            | u64::from(id3v2_hdr[9] & 0x7F);
+        let footer_size: u64 = if (flags & 0x10) != 0 { 10 } else { 0 };
+        scan_start = 10u64.saturating_add(tag_size).saturating_add(footer_size);
     }
 
-    let mut scan_end = bytes.len();
-    // Exclude ID3v1 footer if present
-    if bytes.len() >= 128 && &bytes[bytes.len() - 128..bytes.len() - 125] == b"TAG" {
-        scan_end = bytes.len() - 128;
+    let mut scan_end = file_len;
+    if file_len >= 128 && file_len - 128 >= scan_start {
+        reader.seek(SeekFrom::Start(file_len - 128))?;
+        let mut id3v1_tag = [0u8; 3];
+        if read_exact_eintr(reader, &mut id3v1_tag)? == 3 && &id3v1_tag == b"TAG" {
+            scan_end = file_len - 128;
+        }
     }
 
+    if scan_start.saturating_add(4) > scan_end {
+        return Err(Mp3CutError::NoFramesFound(
+            "No valid MPEG Layer III audio frames identified".into(),
+        ));
+    }
+
+    reader.seek(SeekFrom::Start(scan_start))?;
     let audio_span = scan_end.saturating_sub(scan_start);
-    let mut frames = Vec::with_capacity((audio_span / 417).min(MAX_INITIAL_FRAME_CAPACITY));
+    let est_frames = usize::try_from(audio_span / 417)
+        .unwrap_or(MAX_INITIAL_FRAME_CAPACITY)
+        .min(MAX_INITIAL_FRAME_CAPACITY);
+    let mut frames = Vec::with_capacity(est_frames);
+    let mut expected_stream: Option<(MpegVersion, u32)> = None;
     let mut sample_rate = 0;
     let mut samples_per_frame = 0;
     let mut channels = 0;
@@ -453,91 +580,70 @@ pub fn scan_mp3_frames(bytes: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
     let mut enc_padding = 0;
     let mut has_xing = false;
 
-    let mut offset = scan_start;
-    while offset + 4 <= scan_end {
-        if let Some((rel_offset, header)) = find_next_frame_header(&bytes[offset..scan_end]) {
-            let frame_offset = offset + rel_offset;
-            // If this is the first frame, check for Xing / Info / LAME / VBRI.
+    let mut buf = Vec::with_capacity(STREAM_SCAN_WINDOW_BYTES);
+    let mut window_offset = scan_start;
+    let mut file_cursor = scan_start;
+    let mut pos = 0usize;
+
+    loop {
+        if pos > 0 && (buf.len() - pos <= STREAM_SCAN_LOOKAHEAD_BYTES && file_cursor < scan_end) {
+            buf.drain(..pos);
+            window_offset = window_offset.saturating_add(pos as u64);
+            pos = 0;
+        }
+        while buf.len() < STREAM_SCAN_WINDOW_BYTES && file_cursor < scan_end {
+            let max_chunk = (STREAM_SCAN_WINDOW_BYTES - buf.len())
+                .min(usize::try_from(scan_end - file_cursor).unwrap_or(usize::MAX));
+            if max_chunk == 0 {
+                break;
+            }
+            let old_len = buf.len();
+            buf.resize(old_len + max_chunk, 0);
+            let n = read_exact_eintr(reader, &mut buf[old_len..old_len + max_chunk])?;
+            buf.truncate(old_len + n);
+            file_cursor = file_cursor.saturating_add(n as u64);
+            if n == 0 {
+                file_cursor = scan_end;
+                break;
+            }
+        }
+
+        let at_eof = file_cursor >= scan_end;
+        if pos + 4 > buf.len() {
+            break;
+        }
+
+        if let Some((rel_offset, header)) =
+            find_next_frame_header_confirmed(&buf[pos..], at_eof, expected_stream)
+        {
+            let frame_pos = pos + rel_offset;
+            let frame_offset = window_offset.saturating_add(frame_pos as u64);
             if frames.is_empty() {
                 sample_rate = header.sample_rate;
                 samples_per_frame = header.samples_per_frame;
                 channels = header.channels;
-
-                let frame_end = frame_offset + header.frame_size;
-                let side_info_len = match (header.version, header.channels) {
-                    (MpegVersion::Mpeg1, 1) => 17,
-                    (MpegVersion::Mpeg1, _) => 32,
-                    (_, 1) => 9,
-                    (_, _) => 17,
-                };
-                let xing_rel = 4 + usize::from(header.has_crc) * 2 + side_info_len;
-                if xing_rel + 4 <= header.frame_size {
-                    let tag = &bytes[frame_offset + xing_rel..frame_offset + xing_rel + 4];
-                    if tag == b"Xing" || tag == b"Info" {
-                        has_xing = true;
-                        // Parse Xing flags sequentially without desyncing.
-                        let mut x_ptr = frame_offset + xing_rel + 4;
-                        if x_ptr + 4 <= frame_end {
-                            let x_flags = u32::from_be_bytes([
-                                bytes[x_ptr],
-                                bytes[x_ptr + 1],
-                                bytes[x_ptr + 2],
-                                bytes[x_ptr + 3],
-                            ]);
-                            x_ptr += 4;
-                            let mut flags_valid = true;
-                            let xing_fields: [(u32, usize); 4] = [
-                                (0x01, 4),   // frames
-                                (0x02, 4),   // bytes
-                                (0x04, 100), // TOC
-                                (0x08, 4),   // quality
-                            ];
-                            for (flag_bit, field_len) in xing_fields {
-                                if (x_flags & flag_bit) != 0 {
-                                    if x_ptr + field_len <= frame_end {
-                                        x_ptr += field_len;
-                                    } else {
-                                        flags_valid = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            // Look for LAME tag only if Xing flags stayed in sync.
-                            if flags_valid
-                                && x_ptr + 24 <= frame_end
-                                && &bytes[x_ptr..x_ptr + 4] == b"LAME"
-                            {
-                                // 9B version, 1B rev/vbr, 1B lowpass, 8B rg,
-                                // 1B flags, 1B bitrate = 21 bytes before delay.
-                                let delay_bytes = &bytes[x_ptr + 21..x_ptr + 24];
-                                let b_d0 = u32::from(delay_bytes[0]);
-                                let b_d1 = u32::from(delay_bytes[1]);
-                                let b_d2 = u32::from(delay_bytes[2]);
-                                enc_delay = (b_d0 << 4) | (b_d1 >> 4);
-                                enc_padding = ((b_d1 & 0x0F) << 8) | b_d2;
-                            }
-                        }
-                    }
-                }
-
-                // Check for Fraunhofer VBRI header at fixed offset 36 (4 + 32).
-                let vbri_rel = 4 + 32;
-                if !has_xing
-                    && vbri_rel + 26 <= header.frame_size
-                    && &bytes[frame_offset + vbri_rel..frame_offset + vbri_rel + 4] == b"VBRI"
-                {
-                    has_xing = true;
-                }
+                expected_stream = Some((header.version, header.sample_rate));
+                (has_xing, enc_delay, enc_padding) =
+                    parse_first_frame_metadata(&buf[frame_pos..], &header);
             }
-
             frames.push(FrameEntry {
-                offset: frame_offset as u64,
+                offset: frame_offset,
                 length: header.frame_size as u32,
             });
-            offset = frame_offset + header.frame_size;
+            pos = frame_pos + header.frame_size;
             continue;
         }
-        break;
+
+        if at_eof {
+            break;
+        }
+        let discard = buf.len().saturating_sub(STREAM_SCAN_LOOKAHEAD_BYTES);
+        if discard <= pos {
+            break;
+        }
+        buf.drain(..discard);
+        window_offset = window_offset.saturating_add(discard as u64);
+        pos = 0;
     }
 
     if frames.is_empty() {
@@ -557,7 +663,45 @@ pub fn scan_mp3_frames(bytes: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
     })
 }
 
+/// Scans an MP3 file and constructs its frame index and Xing/LAME metadata.
+pub fn scan_mp3_frames(bytes: &[u8]) -> Result<Mp3Metadata, Mp3CutError> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    scan_mp3_frames_reader(&mut cursor, bytes.len() as u64)
+}
+
 static TEMP_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Computes the `.mllt` cache path from an already-opened MP3 file's metadata.
+pub fn mllt_cache_path_from_metadata(
+    file: &Path,
+    cache_dir: &Path,
+    metadata: &Metadata,
+) -> Result<PathBuf, Mp3CutError> {
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut hasher = Md5::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        hasher.update(file.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        let file_str = file
+            .to_str()
+            .ok_or_else(|| Mp3CutError::InvalidFile("Path contains invalid UTF-8".into()))?;
+        hasher.update(file_str.as_bytes());
+    }
+    hasher.update(format!("{size}{mtime}").as_bytes());
+    let digest = hasher.finalize();
+    let filename = format!("{digest:x}.mllt");
+    Ok(cache_dir.join(filename))
+}
 
 /// Computes the `.mllt` cache path matching `CPAN/MP3/Cut/Gapless.pm:43-47`.
 ///
@@ -568,21 +712,7 @@ static TEMP_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// synchronized with `CPAN/MP3/Cut/Gapless.pm`.
 pub fn get_mllt_cache_path(file: &Path, cache_dir: &Path) -> Result<PathBuf, Mp3CutError> {
     let metadata = std::fs::metadata(file)?;
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let file_str = file
-        .to_str()
-        .ok_or_else(|| Mp3CutError::InvalidFile("Path contains invalid UTF-8".into()))?;
-
-    let key = format!("{file_str}{size}{mtime}");
-    let digest = Md5::digest(key.as_bytes());
-    let filename = format!("{digest:x}.mllt");
-    Ok(cache_dir.join(filename))
+    mllt_cache_path_from_metadata(file, cache_dir, &metadata)
 }
 
 struct TempFileGuard(Option<PathBuf>);
@@ -612,7 +742,120 @@ fn reject_symlink_cache_target(path: &Path) -> Result<(), Mp3CutError> {
     }
 }
 
-fn write_mllt_cache_atomic(path: &Path, data: &[u8]) -> Result<(), Mp3CutError> {
+#[cfg(unix)]
+const fn unix_o_nonblock_flag() -> i32 {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x0004
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        0o4000
+    }
+}
+
+#[cfg(unix)]
+const fn unix_o_nofollow_flag() -> i32 {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x0100
+    }
+    #[cfg(target_os = "netbsd")]
+    {
+        0x0200
+    }
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+    {
+        0o100_000
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm"))
+    )))]
+    {
+        0o400_000
+    }
+}
+
+#[cfg(unix)]
+fn is_eloop_error(err: &std::io::Error) -> bool {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    const ELOOP_CODE: i32 = 62;
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    const ELOOP_CODE: i32 = 40;
+    err.raw_os_error() == Some(ELOOP_CODE)
+}
+
+/// Opens an MP3 source file non-blockingly and verifies it is a regular file.
+pub fn open_source_mp3(path: &Path) -> Result<(File, Metadata), Mp3CutError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(unix_o_nonblock_flag());
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(Mp3CutError::InvalidFile(
+            "MP3 input path is not a regular file".into(),
+        ));
+    }
+    Ok((file, meta))
+}
+
+fn random_temp_token() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let state = RandomState::new();
+    let mut hasher = state.build_hasher();
+    let seq = TEMP_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    hasher.write_u64(seq);
+    hasher.write_u32(std::process::id());
+    hasher.finish()
+}
+
+/// Atomically writes encoded `.mllt` bytes using a CSPRNG temporary file
+/// and symlink checks.
+pub fn write_mllt_cache_atomic(path: &Path, data: &[u8]) -> Result<(), Mp3CutError> {
     reject_symlink_cache_target(path)?;
 
     let parent = path
@@ -626,24 +869,42 @@ fn write_mllt_cache_atomic(path: &Path, data: &[u8]) -> Result<(), Mp3CutError> 
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| Mp3CutError::CacheError("Invalid .mllt cache filename".into()))?;
-    let pid = std::process::id();
-    let seq = TEMP_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
-
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        opts.mode(0o600);
-    }
 
     let mut guard = TempFileGuard(None);
-    {
-        let mut tmp_file = opts.open(&tmp_path)?;
-        guard.0 = Some(tmp_path.clone());
-        tmp_file.write_all(data)?;
-        tmp_file.sync_all()?;
+    let mut tmp_path_opt = None;
+    let mut tmp_file_opt = None;
+
+    for _ in 0..16 {
+        let token = random_temp_token();
+        let candidate = parent.join(format!(".{file_name}.tmp.{token:016x}"));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+            opts.custom_flags(unix_o_nofollow_flag());
+        }
+        match opts.open(&candidate) {
+            Ok(file) => {
+                guard.0 = Some(candidate.clone());
+                tmp_path_opt = Some(candidate);
+                tmp_file_opt = Some(file);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Mp3CutError::Io(err)),
+        }
     }
+
+    let (Some(tmp_path), Some(mut tmp_file)) = (tmp_path_opt, tmp_file_opt) else {
+        return Err(Mp3CutError::CacheError(
+            "Unable to allocate unique .mllt temporary file".into(),
+        ));
+    };
+
+    tmp_file.write_all(data)?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
 
     reject_symlink_cache_target(path)?;
     std::fs::rename(&tmp_path, path)?;
@@ -651,28 +912,87 @@ fn write_mllt_cache_atomic(path: &Path, data: &[u8]) -> Result<(), Mp3CutError> 
     Ok(())
 }
 
-fn load_or_build_metadata(
-    file: &Path,
-    cache_path: Option<&Path>,
-) -> Result<Mp3Metadata, Mp3CutError> {
-    let Some(path) = cache_path else {
-        let file_bytes = std::fs::read(file)?;
-        return scan_mp3_frames(&file_bytes);
+/// Safely reads an `.mllt` cache file using `O_NOFOLLOW | O_NONBLOCK`,
+/// regular-file validation, and `MAX_MLLT_FILE_BYTES` bounds.
+pub fn read_mllt_cache_safe(path: &Path) -> Result<Option<Vec<u8>>, Mp3CutError> {
+    reject_symlink_cache_target(path)?;
+
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(unix_o_nofollow_flag() | unix_o_nonblock_flag());
+    }
+
+    let file = match opts.open(path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(err) if is_eloop_error(&err) => {
+            return Err(Mp3CutError::CacheError(
+                "Refusing symlinked .mllt cache target".into(),
+            ));
+        }
+        Err(_) => return Ok(None),
     };
 
-    reject_symlink_cache_target(path)?;
-    if let Ok(data) = std::fs::read(path) {
-        if let Ok(meta) = decode_mllt_cache(&data) {
-            return Ok(meta);
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(Mp3CutError::CacheError(
+            "Refusing non-regular .mllt cache target".into(),
+        ));
+    }
+
+    let max_bytes_u64 = MAX_MLLT_FILE_BYTES as u64;
+    if meta.len() < MLLT_HEADER_SIZE as u64 || meta.len() > max_bytes_u64 {
+        return Ok(None);
+    }
+
+    let cap = usize::try_from(meta.len()).unwrap_or(MAX_INITIAL_MLLT_BYTES);
+    let mut data = Vec::with_capacity(cap.min(MAX_INITIAL_MLLT_BYTES));
+    let mut limited = file.take(max_bytes_u64.saturating_add(1));
+    if limited.read_to_end(&mut data).is_err() {
+        return Ok(None);
+    }
+    if data.len() > MAX_MLLT_FILE_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(data))
+}
+
+/// Returns `true` when all indexed frames fall within `mp3_size`.
+pub fn is_metadata_valid_for_file(meta: &Mp3Metadata, mp3_size: u64) -> bool {
+    let Some(last) = meta.frames.last() else {
+        return false;
+    };
+    let Some(last_end) = last.offset.checked_add(u64::from(last.length)) else {
+        return false;
+    };
+    last_end <= mp3_size
+}
+
+fn load_or_build_metadata(
+    mp3_file: &mut File,
+    mp3_size: u64,
+    cache_path: Option<&Path>,
+) -> Result<Mp3Metadata, Mp3CutError> {
+    if let Some(path) = cache_path {
+        if let Some(data) = read_mllt_cache_safe(path)? {
+            if let Ok(meta) = decode_mllt_cache(&data) {
+                if is_metadata_valid_for_file(&meta, mp3_size) {
+                    return Ok(meta);
+                }
+            }
         }
     }
 
-    let file_bytes = std::fs::read(file)?;
-    let meta = scan_mp3_frames(&file_bytes)?;
-    let encoded = encode_mllt_cache(&meta)?;
-    if let Err(err) = write_mllt_cache_atomic(path, &encoded) {
-        if matches!(err, Mp3CutError::CacheError(_)) {
-            return Err(err);
+    let meta = scan_mp3_frames_reader(mp3_file, mp3_size)?;
+    if let Some(path) = cache_path {
+        let encoded = encode_mllt_cache(&meta)?;
+        if let Err(err) = write_mllt_cache_atomic(path, &encoded) {
+            if matches!(err, Mp3CutError::CacheError(_)) {
+                return Err(err);
+            }
         }
     }
     Ok(meta)
@@ -692,17 +1012,28 @@ impl GaplessCutStream {
         start_ms: Option<u64>,
         end_ms: Option<u64>,
     ) -> Result<Self, Mp3CutError> {
+        if let (Some(start), Some(end)) = (start_ms, end_ms) {
+            if start > end {
+                return Err(Mp3CutError::InvalidFile(format!(
+                    "start_ms ({start}) must not exceed end_ms ({end})"
+                )));
+            }
+        }
+
+        let (mut mp3_file, mp3_meta) = open_source_mp3(file)?;
+        let mp3_size = mp3_meta.len();
         let cache_path = match cache_dir {
-            Some(dir) => Some(get_mllt_cache_path(file, dir)?),
+            Some(dir) => Some(mllt_cache_path_from_metadata(file, dir, &mp3_meta)?),
             None => None,
         };
 
-        let metadata = load_or_build_metadata(file, cache_path.as_deref())?;
+        let metadata = load_or_build_metadata(&mut mp3_file, mp3_size, cache_path.as_deref())?;
 
         let audio_start_frame = if metadata.has_xing { 1 } else { 0 };
         let total_frames = metadata.frames.len();
+        let is_empty_slice = matches!((start_ms, end_ms), (Some(s), Some(e)) if s == e);
 
-        let (byte_start, byte_end) = if total_frames <= audio_start_frame {
+        let (byte_start, byte_end) = if total_frames <= audio_start_frame || is_empty_slice {
             (0, 0)
         } else {
             let meta = &metadata;
@@ -711,24 +1042,36 @@ impl GaplessCutStream {
 
             let (start_idx, end_idx) = if meta.sample_rate > 0 && meta.samples_per_frame > 0 {
                 let sample_rate = u128::from(meta.sample_rate);
-                let denom = 1000u128 * u128::from(meta.samples_per_frame);
+                let spf = u128::from(meta.samples_per_frame);
+                let raw_total_samples = (frame_count as u128) * spf;
+                let delay_samples = u128::from(meta.enc_delay);
+                let max_audio_sample =
+                    raw_total_samples.saturating_sub(u128::from(meta.enc_padding));
+                let max_end_idx = usize::try_from(max_audio_sample.div_ceil(spf))
+                    .unwrap_or(usize::MAX)
+                    .min(frame_count);
+
                 let start_idx = match start_ms {
-                    None => 0,
+                    None => usize::try_from(delay_samples / spf)
+                        .unwrap_or(usize::MAX)
+                        .min(max_end_idx),
                     Some(ms) => {
-                        let frame_idx = (u128::from(ms) * sample_rate) / denom;
-                        usize::try_from(frame_idx)
+                        let start_sample =
+                            delay_samples.saturating_add((u128::from(ms) * sample_rate) / 1000);
+                        usize::try_from(start_sample / spf)
                             .unwrap_or(usize::MAX)
-                            .min(frame_count)
+                            .min(max_end_idx)
                     }
                 };
                 let end_idx = match end_ms {
-                    None => frame_count,
+                    None => max_end_idx,
                     Some(ms) => {
-                        let numer = u128::from(ms) * sample_rate;
-                        let frame_idx = numer.div_ceil(denom);
-                        usize::try_from(frame_idx)
+                        let end_sample = delay_samples
+                            .saturating_add((u128::from(ms) * sample_rate).div_ceil(1000))
+                            .min(max_audio_sample);
+                        usize::try_from(end_sample.div_ceil(spf))
                             .unwrap_or(usize::MAX)
-                            .min(frame_count)
+                            .min(max_end_idx)
                     }
                 };
                 (start_idx, end_idx)
@@ -754,13 +1097,10 @@ impl GaplessCutStream {
             }
         };
 
-        let mut f = File::open(file)?;
-        if byte_start > 0 {
-            f.seek(SeekFrom::Start(byte_start))?;
-        }
+        mp3_file.seek(SeekFrom::Start(byte_start))?;
 
         Ok(Self {
-            file: BufReader::with_capacity(64 * 1024, f),
+            file: BufReader::with_capacity(64 * 1024, mp3_file),
             current_offset: byte_start,
             end_offset: byte_end,
             metadata,
@@ -777,7 +1117,13 @@ impl GaplessCutStream {
         };
         let max_read = usize::try_from(remaining).unwrap_or(usize::MAX);
         let to_read = buf.len().min(max_read);
-        let n = self.file.read(&mut buf[..to_read])?;
+        let n = loop {
+            match self.file.read(&mut buf[..to_read]) {
+                Ok(bytes_read) => break bytes_read,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(Mp3CutError::Io(err)),
+            }
+        };
         let n_u64 =
             u64::try_from(n).map_err(|_| Mp3CutError::InvalidFile("Read count overflow".into()))?;
         self.current_offset = self
@@ -798,16 +1144,53 @@ pub struct LmsMp3CutStream {
     _private: [u8; 0],
 }
 
+const FFI_READ_SCRATCH_CAP: usize = 64 * 1024;
+static LIVE_HANDLES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+fn live_handles() -> &'static Mutex<HashSet<usize>> {
+    LIVE_HANDLES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn is_valid_stream_ptr(stream: *mut LmsMp3CutStream) -> bool {
     !stream.is_null() && (stream as usize).is_multiple_of(std::mem::align_of::<GaplessCutStream>())
+}
+
+fn is_registered_stream_ptr(stream: *mut LmsMp3CutStream) -> bool {
+    if !is_valid_stream_ptr(stream) {
+        return false;
+    }
+    let Ok(guard) = live_handles().lock() else {
+        return false;
+    };
+    guard.contains(&(stream as usize))
+}
+
+fn cstr_to_pathbuf(cstr: &std::ffi::CStr) -> Result<PathBuf, ()> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let bytes = cstr.to_bytes();
+        if bytes.is_empty() {
+            return Err(());
+        }
+        Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let s = cstr.to_str().map_err(|_| ())?;
+        if s.is_empty() {
+            return Err(());
+        }
+        Ok(PathBuf::from(s))
+    }
 }
 
 /// Opens a gapless MP3 cut stream across the C-ABI boundary.
 ///
 /// # Arguments
-/// - `file_path`: null-terminated UTF-8 C string path to the MP3 file.
-/// - `cache_dir`: null-terminated UTF-8 C string path to cache directory, or
-///   NULL.
+/// - `file_path`: null-terminated C string path to the MP3 file.
+/// - `cache_dir`: null-terminated C string path to cache directory, or NULL.
 /// - `start_ms`: start time in milliseconds, or negative (< 0) for stream
 ///   start.
 /// - `end_ms`: end time in milliseconds, or negative (< 0) for stream end.
@@ -817,8 +1200,8 @@ fn is_valid_stream_ptr(stream: *mut LmsMp3CutStream) -> bool {
 ///
 /// # Safety
 /// Caller must ensure `file_path` is non-null and points to a valid
-/// null-terminated UTF-8 C string readable for this call, and `cache_dir`
-/// (if non-null) likewise points to a valid null-terminated UTF-8 C string.
+/// null-terminated C string readable for this call, and `cache_dir` (if
+/// non-null) likewise points to a valid null-terminated C string.
 // JUSTIFICATION: C-ABI entrypoint returning an opaque stream handle for
 // external FFI callers without exposing Rust struct layout.
 // SAFETY:
@@ -828,7 +1211,8 @@ fn is_valid_stream_ptr(stream: *mut LmsMp3CutStream) -> bool {
 //    boxed on the Rust heap before casting to `*mut LmsMp3CutStream`.
 // 3. Bounds/Lifetime: `CStr::from_ptr` borrows caller strings only during this
 //    call and does not retain raw pointers afterward.
-// 4. Aliasing: Returned handle uniquely owns the heap-allocated stream.
+// 4. Aliasing: Returned handle uniquely owns the heap-allocated stream and is
+//    tracked in `LIVE_HANDLES`.
 // 5. Thread/FFI safety: Panic-free `Result`-driven path; no unwinds cross ABI.
 // 6. Ownership: Caller receives ownership and must free once with
 //    `lms_mp3cut_close`.
@@ -843,7 +1227,7 @@ pub unsafe extern "C" fn lms_mp3cut_open(
         return std::ptr::null_mut();
     }
 
-    // JUSTIFICATION: Convert C-ABI path string argument into Rust `&str`.
+    // JUSTIFICATION: Convert C-ABI path string argument into Rust `PathBuf`.
     // SAFETY:
     // 1. Validity: `file_path` is verified non-null above.
     // 2. Alignment: `c_char` has 1-byte alignment.
@@ -853,10 +1237,9 @@ pub unsafe extern "C" fn lms_mp3cut_open(
     // 5. Thread/FFI safety: No mutation or unwinding occurs during inspection.
     // 6. Ownership: Borrowed C string remains owned by the caller.
     let c_file = unsafe { std::ffi::CStr::from_ptr(file_path) };
-    let Ok(file_str) = c_file.to_str() else {
+    let Ok(file_p) = cstr_to_pathbuf(c_file) else {
         return std::ptr::null_mut();
     };
-    let file_p = Path::new(file_str);
 
     let cache_p = if !cache_dir.is_null() {
         // JUSTIFICATION: Convert optional C-ABI cache directory path string.
@@ -866,12 +1249,12 @@ pub unsafe extern "C" fn lms_mp3cut_open(
         // 3. Bounds/Lifetime: Caller guarantees a null-terminated string for
         //    this call's duration.
         // 4. Aliasing: Read-only borrow is dropped before returning.
-        // 5. Thread/FFI safety: Panic-free UTF-8 validation only.
+        // 5. Thread/FFI safety: Panic-free path conversion only.
         // 6. Ownership: Caller retains ownership of the C string buffer.
         let c_cache = unsafe { std::ffi::CStr::from_ptr(cache_dir) };
-        match c_cache.to_str() {
-            Ok(s) => Some(Path::new(s)),
-            Err(_) => return std::ptr::null_mut(),
+        match cstr_to_pathbuf(c_cache) {
+            Ok(p) => Some(p),
+            Err(()) => return std::ptr::null_mut(),
         }
     } else {
         None
@@ -888,10 +1271,33 @@ pub unsafe extern "C" fn lms_mp3cut_open(
         None
     };
 
-    match GaplessCutStream::open(file_p, cache_p, s_ms, e_ms) {
-        Ok(stream) => Box::into_raw(Box::new(stream)).cast::<LmsMp3CutStream>(),
-        Err(_) => std::ptr::null_mut(),
+    if let (Some(s), Some(e)) = (s_ms, e_ms) {
+        if s > e {
+            return std::ptr::null_mut();
+        }
     }
+
+    let Ok(stream) = GaplessCutStream::open(&file_p, cache_p.as_deref(), s_ms, e_ms) else {
+        return std::ptr::null_mut();
+    };
+
+    let raw = Box::into_raw(Box::new(stream));
+    let Ok(mut guard) = live_handles().lock() else {
+        // JUSTIFICATION: Reclaim newly boxed stream if handle registry lock fails.
+        // SAFETY:
+        // 1. Validity: `raw` was just produced by `Box::into_raw`.
+        // 2. Alignment: `raw` is properly aligned for `GaplessCutStream`.
+        // 3. Bounds/Lifetime: Single ownership before pointer exposure to C.
+        // 4. Aliasing: Unexposed pointer; no aliases exist.
+        // 5. Thread/FFI safety: Panic-free drop before returning null.
+        // 6. Ownership: Reclaims and frees local allocation cleanly.
+        unsafe {
+            drop(Box::from_raw(raw));
+        }
+        return std::ptr::null_mut();
+    };
+    guard.insert(raw as usize);
+    raw.cast::<LmsMp3CutStream>()
 }
 
 /// Reads a chunk from `LmsMp3CutStream` into `buf`.
@@ -904,17 +1310,18 @@ pub unsafe extern "C" fn lms_mp3cut_open(
 /// `lms_mp3cut_open` and not yet closed, `buf` (when `buf_len > 0`) points to
 /// at least `buf_len` writable bytes, `buf_len <= isize::MAX as usize`, and
 /// no concurrent calls access `stream`.
-// JUSTIFICATION: C-ABI stream read entrypoint writing cut audio bytes into a
-// caller-owned output buffer.
+// JUSTIFICATION: C-ABI stream read entrypoint copying initialized audio bytes
+// into a caller-owned output buffer.
 // SAFETY:
-// 1. Validity: `stream` is checked non-null and aligned; `buf` is checked
-//    non-null whenever `buf_len > 0`.
+// 1. Validity: `stream` is verified non-null, aligned, and registered in
+//    `LIVE_HANDLES`; `buf` is checked non-null whenever `buf_len > 0`.
 // 2. Alignment: `stream` matches `align_of::<GaplessCutStream>()`; `buf` is
 //    `*mut u8` with 1-byte alignment.
-// 3. Bounds/Lifetime: `buf_len` is bounded to `<= isize::MAX as usize` before
-//    `from_raw_parts_mut`, and the slice does not outlive this call.
+// 3. Bounds/Lifetime: `buf_len` is bounded to `<= isize::MAX as usize`; reads
+//    go into an initialized Rust scratch buffer first, then `n <= buf_len`
+//    bytes are copied via `copy_nonoverlapping`.
 // 4. Aliasing: Caller contract guarantees exclusive access to `stream` and
-//    `buf`.
+//    `buf`; scratch buffer is disjoint from `buf`.
 // 5. Thread/FFI safety: Panic-free `Result`-driven path with checked `isize`
 //    conversion on the returned byte count.
 // 6. Ownership: Stream handle and output buffer remain caller-owned.
@@ -924,7 +1331,7 @@ pub unsafe extern "C" fn lms_mp3cut_read(
     buf: *mut u8,
     buf_len: usize,
 ) -> isize {
-    if !is_valid_stream_ptr(stream) {
+    if !is_registered_stream_ptr(stream) {
         return -1;
     }
     if buf_len == 0 {
@@ -936,7 +1343,7 @@ pub unsafe extern "C" fn lms_mp3cut_read(
 
     // JUSTIFICATION: Borrow boxed `GaplessCutStream` behind opaque C handle.
     // SAFETY:
-    // 1. Validity: `stream` was verified non-null by `is_valid_stream_ptr`.
+    // 1. Validity: `stream` is non-null and registered in `LIVE_HANDLES`.
     // 2. Alignment: `stream` was verified aligned to `GaplessCutStream`.
     // 3. Bounds/Lifetime: Live `Box::into_raw` object; borrow ends before
     //    function return.
@@ -945,21 +1352,33 @@ pub unsafe extern "C" fn lms_mp3cut_read(
     // 6. Ownership: Borrowed mutably without reclaiming `Box`.
     let stream_ref = unsafe { &mut *stream.cast::<GaplessCutStream>() };
 
-    // JUSTIFICATION: Construct bounded mutable slice over FFI output buffer.
-    // SAFETY:
-    // 1. Validity: `buf` is verified non-null and `buf_len > 0` above.
-    // 2. Alignment: `u8` has 1-byte alignment.
-    // 3. Bounds/Lifetime: `buf_len <= isize::MAX as usize` verified above;
-    //    caller guarantees `buf_len` writable bytes for this call.
-    // 4. Aliasing: Caller guarantees `buf` is unaliased for this call.
-    // 5. Thread/FFI safety: Slice is dropped before returning to C.
-    // 6. Ownership: Buffer remains owned by the caller.
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
-
-    match stream_ref.read_chunk(slice) {
-        Ok(n) => isize::try_from(n).unwrap_or(-1),
-        Err(_) => -1,
+    let mut scratch = vec![0u8; buf_len.min(FFI_READ_SCRATCH_CAP)];
+    let n = match stream_ref.read_chunk(&mut scratch) {
+        Ok(bytes_read) => bytes_read,
+        Err(_) => return -1,
+    };
+    if n > scratch.len() || n > buf_len {
+        return -1;
     }
+    if n > 0 {
+        // JUSTIFICATION: Copy initialized scratch bytes into caller-owned C
+        // buffer without creating `&mut [u8]` over uninitialized C memory.
+        // SAFETY:
+        // 1. Validity: `scratch.as_ptr()` points to `n` initialized bytes;
+        //    `buf` was verified non-null above.
+        // 2. Alignment: `u8` has 1-byte alignment for source and destination.
+        // 3. Bounds/Lifetime: `n <= scratch.len() <= buf_len <= isize::MAX`;
+        //    caller guarantees `buf` is writable for `buf_len` bytes.
+        // 4. Aliasing: `scratch` is a fresh Rust heap allocation disjoint from
+        //    caller-owned `buf`.
+        // 5. Thread/FFI safety: Pure byte copy with no panics or unwinds.
+        // 6. Ownership: Caller retains ownership of `buf`; `scratch` drops here.
+        unsafe {
+            std::ptr::copy_nonoverlapping(scratch.as_ptr(), buf, n);
+        }
+    }
+
+    isize::try_from(n).unwrap_or(-1)
 }
 
 /// Closes and frees an `LmsMp3CutStream`.
@@ -970,24 +1389,32 @@ pub unsafe extern "C" fn lms_mp3cut_read(
 /// accesses `stream` concurrently.
 // JUSTIFICATION: C-ABI destructor freeing heap-allocated `GaplessCutStream`.
 // SAFETY:
-// 1. Validity: Null pointers are ignored safely; non-null pointers are
-//    assumed live handles from `lms_mp3cut_open`.
+// 1. Validity: Null, misaligned, and unregistered/already-closed pointers are
+//    ignored safely via `LIVE_HANDLES` membership removal.
 // 2. Alignment: `is_valid_stream_ptr` verifies `GaplessCutStream` alignment.
 // 3. Bounds/Lifetime: Single reclamation of `Box::into_raw` allocation.
 // 4. Aliasing: Caller contract guarantees unique ownership and no active
-//    borrows.
+//    borrows; atomic removal from `LIVE_HANDLES` blocks duplicate closes.
 // 5. Thread/FFI safety: Panic-free drop path; no unwinds cross the C ABI.
 // 6. Ownership: Reclaims ownership via `Box::from_raw` and drops immediately.
 #[no_mangle]
 pub unsafe extern "C" fn lms_mp3cut_close(stream: *mut LmsMp3CutStream) {
-    if is_valid_stream_ptr(stream) {
+    if !is_valid_stream_ptr(stream) {
+        return;
+    }
+    let removed = match live_handles().lock() {
+        Ok(mut guard) => guard.remove(&(stream as usize)),
+        Err(_) => false,
+    };
+    if removed {
         // JUSTIFICATION: Reclaim boxed `GaplessCutStream` created by
         // `lms_mp3cut_open` when the C caller closes the handle.
         // SAFETY:
-        // 1. Validity: `stream` is verified non-null above.
+        // 1. Validity: `stream` was removed from `LIVE_HANDLES`, proving it is
+        //    a live, unclosed allocation from `lms_mp3cut_open`.
         // 2. Alignment: `stream` alignment for `GaplessCutStream` is verified.
         // 3. Bounds/Lifetime: Allocated by `Box::into_raw` in `lms_mp3cut_open`.
-        // 4. Aliasing: Caller guarantees no concurrent or duplicate close.
+        // 4. Aliasing: Caller guarantees no concurrent `lms_mp3cut_read`.
         // 5. Thread/FFI safety: `Drop` for `GaplessCutStream` is panic-free.
         // 6. Ownership: Reconstructs `Box<GaplessCutStream>` once to drop it.
         unsafe {
@@ -1340,5 +1767,228 @@ mod tests {
         assert!(meta.has_xing);
         assert_eq!(meta.enc_delay, 576);
         assert_eq!(meta.enc_padding, 1000);
+    }
+
+    #[test]
+    fn test_c_abi_uninit_buf_inverted_range_and_double_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp3_path = dir.path().join("c_abi_edge.mp3");
+        write_synthetic_mp3_frames(&mp3_path, 10);
+        let c_file = std::ffi::CString::new(mp3_path.to_str().unwrap()).unwrap();
+
+        // JUSTIFICATION: Verify `lms_mp3cut_open` rejects `start_ms > end_ms`.
+        // SAFETY: `c_file` is a valid null-terminated UTF-8 string.
+        let inverted = unsafe { lms_mp3cut_open(c_file.as_ptr(), std::ptr::null(), 500, 100) };
+        assert!(inverted.is_null());
+
+        // JUSTIFICATION: Open valid C-ABI stream handle for uninit/close tests.
+        // SAFETY: `c_file` is a valid null-terminated UTF-8 string.
+        let stream = unsafe { lms_mp3cut_open(c_file.as_ptr(), std::ptr::null(), 0, 500) };
+        assert!(!stream.is_null());
+
+        let mut uninit_buf = std::mem::MaybeUninit::<[u8; 512]>::uninit();
+        // JUSTIFICATION: Exercise `lms_mp3cut_read` writing into uninitialized
+        // stack storage.
+        // SAFETY: `stream` is live; `uninit_buf` provides 512 writable bytes.
+        let n = unsafe { lms_mp3cut_read(stream, uninit_buf.as_mut_ptr().cast::<u8>(), 512) };
+        assert!(n > 0 && (n as usize) <= 512);
+
+        // JUSTIFICATION: Close live stream handle once, then verify duplicate
+        // close and read-after-close are rejected cleanly.
+        // SAFETY: First close frees `stream`; `LIVE_HANDLES` blocks UAF/double
+        // free on subsequent calls.
+        unsafe {
+            lms_mp3cut_close(stream);
+            lms_mp3cut_close(stream);
+        }
+        let after_close = {
+            // JUSTIFICATION: Verify read after close returns error cleanly.
+            // SAFETY: `LIVE_HANDLES` rejects closed pointer without deref.
+            unsafe { lms_mp3cut_read(stream, uninit_buf.as_mut_ptr().cast::<u8>(), 64) }
+        };
+        assert_eq!(after_close, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_c_abi_non_utf8_unix_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let non_utf8_name = std::ffi::OsStr::from_bytes(b"track_\xff.mp3");
+        let mp3_path = dir.path().join(non_utf8_name);
+        write_synthetic_mp3_frames(&mp3_path, 4);
+
+        let c_file = std::ffi::CString::new(mp3_path.as_os_str().as_bytes()).unwrap();
+        let c_cache = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // JUSTIFICATION: Exercise C-ABI stream open with non-UTF-8 Unix path.
+        // SAFETY: `c_file` and `c_cache` are valid null-terminated C strings.
+        let stream = unsafe { lms_mp3cut_open(c_file.as_ptr(), c_cache.as_ptr(), 0, 100) };
+        assert!(!stream.is_null());
+
+        let mut buf = [0u8; 1024];
+        // JUSTIFICATION: Verify non-UTF-8 opened stream reads valid bytes.
+        // SAFETY: `stream` is live and `buf` has 1024 writable bytes.
+        let n = unsafe { lms_mp3cut_read(stream, buf.as_mut_ptr(), buf.len()) };
+        assert!(n > 0);
+        // JUSTIFICATION: Free C-ABI stream handle created in test.
+        // SAFETY: `stream` is live and not previously closed.
+        unsafe {
+            lms_mp3cut_close(stream);
+        }
+    }
+
+    #[test]
+    fn test_mllt_rejects_empty_non_monotonic_and_rebuilds() {
+        let empty_meta = Mp3Metadata {
+            sample_rate: 44100,
+            samples_per_frame: 1152,
+            channels: 2,
+            enc_delay: 0,
+            enc_padding: 0,
+            has_xing: false,
+            frames: Vec::new(),
+        };
+        let empty_bytes = encode_mllt_cache(&empty_meta).unwrap();
+        assert!(matches!(
+            decode_mllt_cache(&empty_bytes),
+            Err(Mp3CutError::CacheError(_))
+        ));
+
+        let bad_order_meta = Mp3Metadata {
+            sample_rate: 44100,
+            samples_per_frame: 1152,
+            channels: 2,
+            enc_delay: 0,
+            enc_padding: 0,
+            has_xing: false,
+            frames: vec![
+                FrameEntry {
+                    offset: 417,
+                    length: 417,
+                },
+                FrameEntry {
+                    offset: 100,
+                    length: 417,
+                },
+            ],
+        };
+        let bad_order_bytes = encode_mllt_cache(&bad_order_meta).unwrap();
+        assert!(matches!(
+            decode_mllt_cache(&bad_order_bytes),
+            Err(Mp3CutError::CacheError(_))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mp3_path = dir.path().join("rebuild_empty.mp3");
+        write_synthetic_mp3_frames(&mp3_path, 8);
+        let cache_path = get_mllt_cache_path(&mp3_path, dir.path()).unwrap();
+        std::fs::write(&cache_path, &empty_bytes).unwrap();
+
+        let mut stream = GaplessCutStream::open(&mp3_path, Some(dir.path()), None, None).unwrap();
+        assert_eq!(stream.metadata().frames.len(), 8);
+        assert_eq!(read_all_stream(&mut stream).len(), 8 * 417);
+    }
+
+    #[test]
+    fn test_rejects_false_sync_and_inconsistent_sample_rate() {
+        // Construct garbage buffer with false sync followed by valid stream.
+        let mut data = vec![0x11u8; 256];
+        // False sync header at offset 16 (417-byte frame pointing to 0xAA).
+        data[16] = 0xFF;
+        data[17] = 0xFB;
+        data[18] = 0x90;
+        data[19] = 0x00;
+        let valid = synthetic_mp3_bytes(3);
+        let valid_start = data.len();
+        data.extend_from_slice(&valid);
+        // Append an inconsistent 48kHz MPEG-1 frame header at the tail.
+        data.extend_from_slice(&[0xFF, 0xFB, 0x94, 0x00]);
+        data.resize(data.len() + 380, 0);
+
+        let meta = scan_mp3_frames(&data).unwrap();
+        assert_eq!(meta.frames.len(), 3);
+        assert_eq!(meta.frames[0].offset, valid_start as u64);
+        assert_eq!(meta.sample_rate, 44100);
+
+        // Pure false sync stream with zero confirmed frames must fail.
+        let mut only_false = vec![0x22u8; 1024];
+        only_false[10] = 0xFF;
+        only_false[11] = 0xFB;
+        only_false[12] = 0x90;
+        only_false[13] = 0x00;
+        assert!(matches!(
+            scan_mp3_frames(&only_false),
+            Err(Mp3CutError::NoFramesFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_streaming_scan_exceeding_window_and_bufreader() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp3_path = dir.path().join("large_stream.mp3");
+        // 360 * 417 = 150,120 bytes (> 128 KiB scan window & 64 KiB BufReader).
+        write_synthetic_mp3_frames(&mp3_path, 360);
+
+        let mut stream = GaplessCutStream::open(&mp3_path, Some(dir.path()), None, None).unwrap();
+        assert_eq!(stream.metadata().frames.len(), 360);
+        let out = read_all_stream(&mut stream);
+        assert_eq!(out.len(), 360 * 417);
+    }
+
+    #[test]
+    fn test_streaming_scan_exact_lookahead_boundary_refill() {
+        // Align frame 304's start to `pos == 127_072` (128 KiB - 4096 B lookahead):
+        // 304 leading non-sync bytes + 303 * 417 = 126_655, plus 417 = 127_072.
+        let mut data = vec![0u8; 304];
+        data.extend_from_slice(&synthetic_mp3_bytes(320));
+        assert!(data.len() > STREAM_SCAN_WINDOW_BYTES);
+        assert_eq!(data.len(), 304 + 320 * 417);
+
+        let meta = scan_mp3_frames(&data).unwrap();
+        assert_eq!(meta.frames.len(), 320);
+        assert_eq!(meta.frames[0].offset, 304);
+        assert_eq!(
+            meta.frames.last().unwrap().offset + u64::from(meta.frames.last().unwrap().length),
+            data.len() as u64
+        );
+    }
+
+    #[test]
+    fn test_enc_delay_padding_and_start_ge_end_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp3_path = dir.path().join("gapless_trim.mp3");
+
+        // Frame 0: Xing/LAME header with enc_delay = 1152 (1 full frame),
+        // enc_padding = 1152 (1 full frame). Followed by 5 audio frames.
+        let mut bytes = vec![0u8; 417];
+        bytes[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        bytes[36..40].copy_from_slice(b"Xing");
+        bytes[40..44].copy_from_slice(&1u32.to_be_bytes());
+        bytes[44..48].copy_from_slice(&5u32.to_be_bytes());
+        bytes[48..57].copy_from_slice(b"LAME3.99r");
+        // 1152 = 0x480: d0 = 0x48, d1 = 0x04, d2 = 0x80
+        bytes[69] = 0x48;
+        bytes[70] = 0x04;
+        bytes[71] = 0x80;
+        bytes.extend_from_slice(&synthetic_mp3_bytes(5));
+        std::fs::write(&mp3_path, &bytes).unwrap();
+
+        let meta = scan_mp3_frames(&bytes).unwrap();
+        // 5 audio frames * 1152 = 5760 raw samples; minus 2304 trim = 3456 samples.
+        // 3456 * 1000 / 44100 = 78 ms.
+        assert_eq!(meta.duration_ms(), 78);
+
+        // Full cut skips 1 pure-delay leading frame and 1 pure-padding trailing frame.
+        let mut trimmed = GaplessCutStream::open(&mp3_path, None, None, None).unwrap();
+        assert_eq!(read_all_stream(&mut trimmed).len(), 3 * 417);
+
+        // Non-zero equal start_ms == end_ms returns empty slice (0 bytes).
+        let mut equal_non_zero =
+            GaplessCutStream::open(&mp3_path, None, Some(25), Some(25)).unwrap();
+        assert_eq!(read_all_stream(&mut equal_non_zero).len(), 0);
+
+        // Inverted range start_ms > end_ms returns error.
+        let inverted = GaplessCutStream::open(&mp3_path, None, Some(50), Some(10));
+        assert!(matches!(inverted, Err(Mp3CutError::InvalidFile(_))));
     }
 }

@@ -7,8 +7,11 @@ package Slim::Utils::Scanner::Local;
 
 use strict;
 
+use Cwd ();
+use DBI ();
 use File::Basename qw(basename dirname);
 use File::Next;
+use File::Spec ();
 use FileHandle;
 use Path::Class ();
 use Scalar::Util qw(blessed);
@@ -27,14 +30,28 @@ use constant PENDING_CHANGED => 0x04;
 # If more than this many items are changed during a scan, the database is optimized
 use constant OPTIMIZE_THRESHOLD => 100;
 
-use constant IS_SQLITE => (Slim::Utils::OSDetect->getOS()->sqlHelperClass() =~ /SQLite/ ? 1 : 0);
+my $log   = logger('scan.scanner');
+my $prefs = preferences('server');
+
+sub _isSQLite {
+	if ( defined $main::dbtype && $main::dbtype ne '' ) {
+		return $main::dbtype =~ /SQLite/i ? 1 : 0;
+	}
+	if ( my $dbtype = eval { $prefs && $prefs->get('dbtype') } ) {
+		return $dbtype =~ /SQLite/i ? 1 : 0;
+	}
+	if ( Slim::Schema->can('sqlHelperClass') ) {
+		my $helper = eval { Slim::Schema->sqlHelperClass() };
+		return ($helper =~ /SQLite/i ? 1 : 0) if defined $helper && $helper ne '';
+	}
+	return Slim::Utils::OSDetect->getOS()->sqlHelperClass() =~ /SQLite/i ? 1 : 0;
+}
 
 # Number of items to process at once, this value will affect the max size of the WAL file.
 # Chunking is only required with SQLite, as we don't have this kind of concurrency problem with MySQL.
-use constant CHUNK_SIZE => IS_SQLITE ? 50 : 1000;
-
-my $log   = logger('scan.scanner');
-my $prefs = preferences('server');
+sub _chunkSize {
+	return _isSQLite() ? 50 : 1000;
+}
 
 my $findclass;
 if ( main::HAS_AIO ) {
@@ -54,70 +71,121 @@ my $pluginHandlers = {};
 sub find {
 	my ( $class, $path, $args, $cb ) = @_;
 
+	if ( !defined $path || $path eq '' || $path =~ /\0/ ) {
+		$cb->(0);
+		return;
+	}
+
 	# Before looking for files, ensure the path and all children are deleted
 	# from the list of scanned files
 	my $dbh = Slim::Schema->dbh;
 
 	my $file = Slim::Utils::Misc::fileURLFromPath($path);
+	my $likeEsc = _likeEscapeClause();
+	my $filePat = _likeChildrenPattern($file);
 
-	if ( $args->{recursive} && !$args->{dirs} ) {
-		# XXX how best to delete files in non-recursive mode?
-		# Delete the directory itself and all children
-		$dbh->do("DELETE FROM scanned_files WHERE url = '${file}' OR url LIKE '${file}/%'");
-	}
+	my @stat = stat $path;
 
-	stat $path;
-
-	if ( -f _ ) {
+	if ( @stat && -f _ ) {
 		# A single file was passed in, handle it directly here
-		my $types = Slim::Music::Info::validTypeExtensions( $args->{types} || 'audio' );
-
-		if ( Slim::Utils::Misc::fileFilter( dirname($path), basename($path), $types, 0 ) ) {
-			# Add single file to scanned_files
-			my $sth = $dbh->prepare_cached( qq{
-				INSERT INTO scanned_files
-				(url, timestamp, filesize)
-				VALUES
-				(?, ?, ?)
-			} );
-
-			my @stat = stat $path;
-			my $mtime = $stat[9] || 0;
-			my $size  = $stat[7] || 0;
-			$sth->execute(
-				$file,
-				$mtime, # mtime
-				$size,  # size
-			);
-
-			# Callback that we found 1 file
-			$cb->(1);
-		}
-		else {
+		if ( !-r _ ) {
+			if ( $args->{recursive} && !$args->{dirs} ) {
+				_withTxn($dbh, sub {
+					$dbh->do("DELETE FROM scanned_files WHERE url = ? OR url LIKE ? $likeEsc", undef, $file, $filePat);
+				});
+			}
 			$cb->(0);
+			return;
 		}
 
+		my $types = Slim::Music::Info::validTypeExtensions( $args->{types} || 'audio' );
+		my $matched = Slim::Utils::Misc::fileFilter( dirname($path), basename($path), $types, 0 );
+
+		_withTxn($dbh, sub {
+			if ( $args->{recursive} && !$args->{dirs} ) {
+				$dbh->do("DELETE FROM scanned_files WHERE url = ? OR url LIKE ? $likeEsc", undef, $file, $filePat);
+			}
+
+			if ( $matched ) {
+				# Add single file to scanned_files
+				my $sth = $dbh->prepare_cached( qq{
+					INSERT INTO scanned_files
+					(url, timestamp, filesize)
+					VALUES
+					(?, ?, ?)
+				} );
+
+				my $mtime = $stat[9] || 0;
+				my $size  = $stat[7] || 0;
+				$sth->execute(
+					$file,
+					$mtime, # mtime
+					$size,  # size
+				);
+			}
+		});
+
+		$cb->($matched ? 1 : 0);
 		return;
 	}
-	elsif ( -d _ ) {
+	elsif ( @stat && -d _ ) {
+		if ( $args->{recursive} && !$args->{dirs} ) {
+			# XXX how best to delete files in non-recursive mode?
+			# Delete the directory itself and all children
+			_withTxn($dbh, sub {
+				$dbh->do("DELETE FROM scanned_files WHERE url = ? OR url LIKE ? $likeEsc", undef, $file, $filePat);
+			});
+		}
+
+		if ( !-r _ || !-x _ ) {
+			$cb->(0);
+			return;
+		}
+
 		# Scan the directory for files
 		if ( $args->{no_async} ) {
-			if ( !$args->{dirs} && $args->{recursive} && ($args->{types} || 'audio') eq 'audio' && IS_SQLITE && (my $accel = rustScannerAccelBin()) ) {
-				my $dbname_str = eval { Slim::Schema->dbh->{Name} } || '';
-				if ( $dbname_str =~ /dbname=([^;]+)/ ) {
-					my $dbfile = $1;
-					my @exts = grep { /^[a-z0-9+]+$/i }
-					           map  { s/^\.//r }
-					           Slim::Music::Info::validTypeExtensions( $args->{types} || 'audio' );
-					if ( -f $dbfile && @exts ) {
-						Slim::Schema->forceCommit;
-						if ( open my $afh, '-|', $accel, 'scan-dir', '--db', $dbfile, '--dir', $path, '--extensions', join(',', @exts) ) {
-							my $out = do { local $/; <$afh> };
-							my ($count) = $out =~ /(\d+)/;
-							if ( close($afh) && defined $count && $count =~ /^\d+$/ ) {
-								$cb->(int($count), []);
-								return;
+			if ( !$args->{dirs} && !$args->{scan} && $args->{recursive} && ($args->{types} || 'audio') eq 'audio' && _isSQLite() && !-l $path && (my $bin = rustScannerAccelBin()) ) {
+				my $abs_path  = File::Spec->rel2abs($path);
+				my $real_path = eval { Cwd::realpath($abs_path) };
+				if ( $bin && !$args->{scan} && !-l $path && defined $real_path && $real_path eq $abs_path ) {
+					my $dbname_str = eval { Slim::Schema->dbh->{Name} } || '';
+					if ( $dbname_str =~ /dbname=([^;]+)/ ) {
+						my $dbfile   = $1;
+						my $scan_dir = $real_path;
+						my @exts = grep { /\A[a-z0-9+]+\z/i }
+						           map  { s/^\.//r }
+						           Slim::Music::Info::validTypeExtensions( $args->{types} || 'audio' );
+
+						my $db_ok = defined $dbfile && length $dbfile && $dbfile !~ /\0/;
+						if ( $db_ok ) {
+							$dbfile = File::Spec->file_name_is_absolute($dbfile) ? $dbfile : File::Spec->rel2abs($dbfile);
+							my @dbst = lstat($dbfile);
+							$db_ok = @dbst && $dbfile !~ /\A-/ && !-l _ && -f _ && -r _ && -w _ && !($dbst[2] & 0002);
+						}
+
+						my $dir_ok = defined $scan_dir && length $scan_dir && $scan_dir !~ /\0/ && $scan_dir !~ /\A-/ && !-l $scan_dir && -d $scan_dir && -r _ && -x _;
+
+						if ( $db_ok && $dir_ok && @exts ) {
+							Slim::Schema->forceCommit;
+							if ( open my $afh, '-|', $bin, 'scan-dir', '--db', $dbfile, '--dir', $scan_dir, '--extensions', join(',', @exts) ) {
+								my $out = do { local $/; <$afh> };
+								if ( close($afh) && defined $out && $out =~ /\A\s*(\d+)\s*\z/ ) {
+									my $count = int($1);
+									my $others = _findSymlinkDirs($path);
+									$cb->($count, $others);
+									return;
+								}
 							}
+
+							# Clean any partial rows written by lms-scanner-accel before falling back
+							my $scan_file     = Slim::Utils::Misc::fileURLFromPath($scan_dir);
+							my $scan_file_pat = _likeChildrenPattern($scan_file);
+							_withTxn($dbh, sub {
+								$dbh->do("DELETE FROM scanned_files WHERE url = ? OR url LIKE ? $likeEsc", undef, $scan_file, $scan_file_pat);
+								if ( $scan_file ne $file ) {
+									$dbh->do("DELETE FROM scanned_files WHERE url = ? OR url LIKE ? $likeEsc", undef, $file, $filePat);
+								}
+							});
 						}
 					}
 				}
@@ -133,13 +201,20 @@ sub find {
 		}
 	}
 	else {
+		if ( $args->{recursive} && !$args->{dirs} ) {
+			_withTxn($dbh, sub {
+				$dbh->do("DELETE FROM scanned_files WHERE url = ? OR url LIKE ? $likeEsc", undef, $file, $filePat);
+			});
+		}
+
 		# Item does not exist
 		$cb->(0);
 	}
 }
 
 sub rustScannerAccelBin {
-	return undef unless ($ENV{LMS_USE_RUST} // 1);
+	my $use_rust = $ENV{LMS_USE_RUST};
+	return undef if defined $use_rust && ($use_rust eq '' || $use_rust eq '0' || lc($use_rust) eq 'false' || lc($use_rust) eq 'no');
 	return undef unless $^O eq 'linux';
 	require Config;
 	require FindBin;
@@ -147,13 +222,36 @@ sub rustScannerAccelBin {
 	my $arch = $archname =~ /^(?:aarch64|arm64)(?:-|$)/i ? 'aarch64-linux'
 	         : $archname =~ /^(?:x86_64|amd64)(?:-|$)/i  ? 'x86_64-linux'
 	         : return undef;
-	my $bin_dir = (defined $FindBin::Bin && $FindBin::Bin ne '') ? "$FindBin::Bin/Bin/$arch" : undef;
-	for my $dir (
-		$bin_dir ? ($bin_dir) : (),
-		"/usr/share/squeezeboxserver/Bin/$arch",
-	) {
+
+	my $is_safe_dir = sub {
+		my ($d) = @_;
+		return 0 unless defined $d && $d ne '' && $d !~ /\0/ && $d !~ /\A-/;
+		my @st = lstat($d) or return 0;
+		return 0 if -l _ || !-d _;
+		return 0 if ($st[2] & 0002) || ($st[4] != 0 && $st[4] != $>);
+		return 1;
+	};
+
+	my %seen_base;
+	my @bases;
+	for my $b ( $FindBin::Bin, $FindBin::RealBin, '/usr/share/squeezeboxserver' ) {
+		next unless defined $b && $b ne '';
+		next if $seen_base{$b}++;
+		push @bases, $b;
+	}
+
+	for my $base ( @bases ) {
+		next unless $is_safe_dir->($base);
+		my $bin_parent = "$base/Bin";
+		next unless $is_safe_dir->($bin_parent);
+		my $dir = "$bin_parent/$arch";
+		next unless $is_safe_dir->($dir);
+
 		my $bin = "$dir/lms-scanner-accel";
-		return $bin if -f $bin && -x _;
+		my @bst = lstat($bin) or next;
+		next if -l _ || !-f _ || !-x _;
+		next if ($bst[2] & 0002) || ($bst[2] & 06000) || ($bst[4] != 0 && $bst[4] != $>);
+		return $bin;
 	}
 	return undef;
 }
@@ -191,8 +289,13 @@ sub rescan {
 	# to upgrade the path to UTF-8 which caused -d tests to fail in some cases
 	$next = Slim::Utils::Unicode::encode_locale($next);
 
-	# Strip trailing slashes
-	$next =~ s{/$}{};
+	# Strip trailing slashes, keeping single filesystem root intact
+	if ( $next =~ m{\A/+\z} ) {
+		$next = '/';
+	}
+	elsif ( $next !~ m{\A[A-Za-z]:/\z} ) {
+		$next =~ s{/+$}{};
+	}
 
 	# don't continue if our path is empty!
 	return unless $next;
@@ -227,7 +330,9 @@ sub rescan {
 	# if we should optimize the database or not, and also so we know if
 	# we need to udpate lastRescanTime
 	my $changes = 0;
-	my $ctFilter = $args->{types} eq 'list' ? "= 'ssp'" : "!= 'dir'";
+	my $isListScan = ($args->{types} || '') eq 'list';
+	my $ctOp       = $isListScan ? '=' : '!=';
+	my $ctVal      = $isListScan ? 'ssp' : 'dir';
 
 	# Get list of files within this path
 	Slim::Utils::Scanner::Local->find( $next, $args, sub {
@@ -239,7 +344,9 @@ sub rescan {
 		my $others = shift || [];
 		push @{$paths}, @{$others};
 
-		my $basedir = Slim::Utils::Misc::fileURLFromPath($next);
+		my $basedir    = Slim::Utils::Misc::fileURLFromPath($next);
+		my $basedirPat = _likeChildrenPattern($basedir);
+		my $likeEsc    = _likeEscapeClause();
 
 		$log->error("Connect do DB") unless main::SCANNER && $main::progress;
 		my $dbh = Slim::Schema->dbh;
@@ -259,104 +366,120 @@ sub rescan {
 
 				$log->error("DST has changed since last scan - fix timestamps in tracks table");
 
-				$dbh->do("UPDATE tracks SET timestamp = (timestamp + $offset)");
+				_withTxn($dbh, sub {
+					$dbh->do('UPDATE tracks SET timestamp = (timestamp + ?)', undef, $offset);
+				});
 				Slim::Music::Import->setLastScanTimeIsDST();
 			}
 		}
-
-		# Generate 3 lists of files:
-		my $createTemporary = (main::DEBUGLOG && $log->is_debug) ? '' : 'TEMPORARY';
 
 		# 1. Files that no longer exist on disk
 		#    and are not virtual (from a cue sheet)
 		$log->error("Build temporary table for deleted tracks") unless main::SCANNER && $main::progress;
 		$dbh->do('DROP TABLE IF EXISTS dbonly');
 		$dbh->do( qq{
-			CREATE $createTemporary TABLE dbonly AS
+			CREATE TEMPORARY TABLE dbonly AS
 				SELECT DISTINCT(url) AS url
 				FROM   tracks
 				WHERE  url NOT IN (
 					SELECT url FROM scanned_files
 					WHERE filesize != 0
 				)
-				AND             url LIKE '$basedir%'
+				AND             (url = ? OR url LIKE ? $likeEsc)
 				AND             `virtual` IS NULL
-				AND             content_type $ctFilter
-		} );
+				AND             content_type $ctOp ?
+		}, undef, $basedir, $basedirPat, $ctVal );
 
 		my $inDBOnlySQL = qq{
-			SELECT          url
-			FROM            dbonly
-		} . (IS_SQLITE ? '' : ' ORDER BY url');
+			SELECT   url
+			FROM     dbonly
+			ORDER BY url
+		};
 
 		# 2. Files that are new and not in the database.
 		$log->error("Build temporary table for new tracks") unless main::SCANNER && $main::progress;
 		$dbh->do('DROP TABLE IF EXISTS diskonly');
 		$dbh->do( qq{
-			CREATE $createTemporary TABLE diskonly AS
+			CREATE TEMPORARY TABLE diskonly AS
 				SELECT          DISTINCT(url) AS url
 				FROM            scanned_files
 				WHERE           url NOT IN (
 					SELECT url FROM tracks
-					WHERE id <= $maxTrackId
+					WHERE id <= ?
 				)
-				AND             url LIKE '$basedir%'
+				AND             (url = ? OR url LIKE ? $likeEsc)
 				AND             filesize != 0
-		} );
+		}, undef, int($maxTrackId), $basedir, $basedirPat );
 
 		my $onDiskOnlySQL = qq{
-			SELECT url
-			FROM   diskonly
-		} . (IS_SQLITE ? '' : ' ORDER BY url');
+			SELECT   url
+			FROM     diskonly
+			ORDER BY url
+		};
 
 		# 3. Files that have changed mtime or size.
 		$log->error("Build temporary table for changed tracks") unless main::SCANNER && $main::progress;
 		$dbh->do('DROP TABLE IF EXISTS changed');
 
-		my $trackFilter = $args->{trackList}
-			? "tracks.id IN (" . join(',', @{$args->{trackList}}) . ")"
-			: "scanned_files.timestamp != tracks.timestamp OR scanned_files.filesize  != tracks.filesize";
+		my @trackBind;
+		my $trackFilter;
+		if ( defined $args->{trackList} ) {
+			my @ids = ref $args->{trackList} eq 'ARRAY'
+				? grep { defined && !ref($_) && /\A\d+\z/ } @{$args->{trackList}}
+				: ();
+			if ( @ids ) {
+				$trackFilter = 'tracks.id IN (' . join(',', ('?') x @ids) . ')';
+				@trackBind = map { int($_) } @ids;
+			}
+			else {
+				$trackFilter = '1 = 0';
+			}
+		}
+		else {
+			$trackFilter = 'scanned_files.timestamp != tracks.timestamp OR scanned_files.filesize != tracks.filesize';
+		}
 
 		$dbh->do( qq{
-			CREATE $createTemporary TABLE changed AS
+			CREATE TEMPORARY TABLE changed AS
 				SELECT DISTINCT(scanned_files.url) AS url
 				FROM   scanned_files
 				JOIN   tracks ON (
 					scanned_files.url = tracks.url
 					AND ( $trackFilter )
-					AND tracks.content_type $ctFilter
+					AND tracks.content_type $ctOp ?
 				)
-				WHERE  scanned_files.url LIKE '$basedir%'
-		} );
+				WHERE  (scanned_files.url = ? OR scanned_files.url LIKE ? $likeEsc)
+		}, undef, @trackBind, $ctVal, $basedir, $basedirPat );
 
 		my $changedOnlySQL = qq{
-			SELECT url
-			FROM   changed
-		} . (IS_SQLITE ? '' : ' ORDER BY scanned_files.url');
+			SELECT   url
+			FROM     changed
+			ORDER BY url
+		};
 
 		$log->error("Get deleted tracks count") unless main::SCANNER && $main::progress;
 		# only remove missing tracks when looking for audio tracks
 		my $inDBOnlyCount = 0;
-		($inDBOnlyCount) = $dbh->selectrow_array( qq{
-			SELECT COUNT(*) FROM ( $inDBOnlySQL ) AS t1
-		} ) if !(main::SCANNER && $main::wipe) && $args->{types} =~ /audio|list/;
+		($inDBOnlyCount) = $dbh->selectrow_array('SELECT COUNT(*) FROM dbonly')
+			if !(main::SCANNER && $main::wipe) && ($args->{types} || '') =~ /audio|list/;
 
 		$log->error("Get new tracks count") unless main::SCANNER && $main::progress;
-		my ($onDiskOnlyCount) = $dbh->selectrow_array( qq{
-			SELECT COUNT(*) FROM ( $onDiskOnlySQL ) AS t1
-		} );
+		my ($onDiskOnlyCount) = $dbh->selectrow_array('SELECT COUNT(*) FROM diskonly');
 
 		$log->error("Get changed tracks count") unless main::SCANNER && $main::progress;
 		my $changedOnlyCount = 0;
-		($changedOnlyCount) = $dbh->selectrow_array( qq{
-			SELECT COUNT(*) FROM ( $changedOnlySQL ) AS t1
-		} ) if !(main::SCANNER && $main::wipe);
+		($changedOnlyCount) = $dbh->selectrow_array('SELECT COUNT(*) FROM changed')
+			if !(main::SCANNER && $main::wipe);
+
+		$dbh->do('DROP TABLE IF EXISTS dbonly')   unless $inDBOnlyCount;
+		$dbh->do('DROP TABLE IF EXISTS diskonly') unless $onDiskOnlyCount;
+		$dbh->do('DROP TABLE IF EXISTS changed')  unless $changedOnlyCount;
 
 		# if we've got changed tracks, add a table of albums being changed
 		if ( $changedOnlyCount ) {
 			$log->error("Build temporary table for changed albums") unless main::SCANNER && $main::progress;
 			$dbh->do('DROP TABLE IF EXISTS changed_albums');
-			$dbh->do("CREATE $createTemporary TABLE changed_albums (album INTEGER PRIMARY KEY UNIQUE)");
+			$dbh->do('CREATE TEMPORARY TABLE changed_albums (album INTEGER PRIMARY KEY UNIQUE)');
 			$dbh->do( qq{
 				INSERT INTO changed_albums
 					SELECT DISTINCT(tracks.album) AS album
@@ -378,26 +501,30 @@ sub rescan {
 		if ( $changedOnlyCount ) {
 			# ... first, now that tracks has been updated, add albums referenced now which weren't referenced before (in case the user has moved a track to a different album)
 			$log->error("Adding to temporary table for changed albums") unless main::SCANNER && $main::progress;
-			$dbh->do( qq{
-				INSERT OR IGNORE INTO changed_albums
-					SELECT DISTINCT(tracks.album) AS album
-					FROM changed
-						JOIN tracks ON changed.url = tracks.url
-			} );
+			_withTxn($dbh, sub {
+				$dbh->do( qq{
+					INSERT OR IGNORE INTO changed_albums
+						SELECT DISTINCT(tracks.album) AS album
+						FROM changed
+							JOIN tracks ON changed.url = tracks.url
+				} );
 
-			# ... now, rebuild contributor_album
-			$dbh->do( qq{
-				DELETE FROM contributor_album
-				WHERE contributor_album.album IN (SELECT album FROM changed_albums)
-			} );
+				# ... now, rebuild contributor_album
+				$dbh->do( qq{
+					DELETE FROM contributor_album
+					WHERE contributor_album.album IN (SELECT album FROM changed_albums)
+				} );
 
-			$dbh->do( qq{
-				INSERT INTO contributor_album (role,contributor,album)
-					SELECT DISTINCT role,contributor, tracks.album
-					FROM contributor_track
-						JOIN tracks ON tracks.id = contributor_track.track
-						JOIN changed_albums ON tracks.album = changed_albums.album
-			} );
+				$dbh->do( qq{
+					INSERT INTO contributor_album (role,contributor,album)
+						SELECT DISTINCT role,contributor, tracks.album
+						FROM contributor_track
+							JOIN tracks ON tracks.id = contributor_track.track
+							JOIN changed_albums ON tracks.album = changed_albums.album
+				} );
+			});
+
+			$dbh->do('DROP TABLE IF EXISTS changed_albums');
 
 			main::SCANNER && Slim::Schema->forceCommit;
 		}
@@ -405,9 +532,10 @@ sub rescan {
 		$class->addTracks($dbh, \$changes, $paths, $next, $onDiskOnlyCount, $onDiskOnlySQL, $args);
 
 		if ( hasAborted() ) {
-			# nothing to do here - should be handled in hasAborted()
+			_cleanupScanTables($dbh);
 		}
 		elsif ( !$inDBOnlyCount && !$onDiskOnlyCount && !$changedOnlyCount ) {
+			_cleanupScanTables($dbh);
 			if ( !main::SCANNER && !$args->{no_async} ) {
 				# Nothing changed, but we may have more paths to scan
 				if ( scalar @{$paths} ) {
@@ -470,22 +598,29 @@ sub deleteTracks {
 		}
 
 		my $deleted;
+		my $chunkRows = 0;
+		my $chunkSize = _chunkSize();
 		my $handle_deleted = sub {
 			if ( hasAborted($progress, $args->{no_async}) ) {
 				$deleteSth && $deleteSth->finish;
+				_cleanupScanTables($dbh);
 				return 0;
 			}
 
 			# Page through the files, this is to avoid a long-running read query which
 			# would prevent WAL checkpoints from occurring.
 			if ( !$deleteSth ) {
-				my $sql = $toDeleteSQL . " LIMIT $toDeleteDone, " . CHUNK_SIZE;
+				$chunkRows = 0;
+				my $sql = $toDeleteSQL . ' LIMIT ?, ?';
 				$deleteSth = $dbh->prepare_cached($sql);
+				$deleteSth->bind_param(1, int($toDeleteDone), DBI::SQL_INTEGER());
+				$deleteSth->bind_param(2, int($chunkSize), DBI::SQL_INTEGER());
 				$deleteSth->execute;
 				$deleteSth->bind_col(1, \$deleted);
 			}
 
-			if ( $deleteSth->fetch ) {
+			if ( $toDeleteDone < $toDeleteCount && $deleteSth->fetch ) {
+				$chunkRows++;
 				$progress && $progress->update( Slim::Music::Info::isFileURL($deleted) ? Slim::Utils::Misc::pathFromFileURL($deleted) : $deleted );
 				$$changes++;
 				$toDeleteDone++;
@@ -497,7 +632,9 @@ sub deleteTracks {
 			else {
 				my $more = 1;
 
-				if ( !$deleteSth->rows ) {
+				if ( $toDeleteDone >= $toDeleteCount || $chunkRows < $chunkSize ) {
+					$dbh->do('DROP TABLE IF EXISTS dbonly');
+
 					if ( !$args->{no_async} ) {
 						$args->{paths} = $paths;
 						markDone( $nextFolder => PENDING_DELETE, $$changes, $args );
@@ -552,22 +689,29 @@ sub addTracks {
 		}
 
 		my $new;
+		my $chunkRows = 0;
+		my $chunkSize = _chunkSize();
 		my $handle_new = sub {
 			if ( hasAborted($progress, $args->{no_async}) ) {
 				$onDiskOnlySth && $onDiskOnlySth->finish;
+				_cleanupScanTables($dbh);
 				return 0;
 			}
 
 			# Page through the files, this is to avoid a long-running read query which
 			# would prevent WAL checkpoints from occurring.
 			if ( !$onDiskOnlySth ) {
-				my $sql = $onDiskOnlySQL . " LIMIT $onDiskOnlyDone, " . CHUNK_SIZE;
+				$chunkRows = 0;
+				my $sql = $onDiskOnlySQL . ' LIMIT ?, ?';
 				$onDiskOnlySth = $dbh->prepare_cached($sql);
+				$onDiskOnlySth->bind_param(1, int($onDiskOnlyDone), DBI::SQL_INTEGER());
+				$onDiskOnlySth->bind_param(2, int($chunkSize), DBI::SQL_INTEGER());
 				$onDiskOnlySth->execute;
 				$onDiskOnlySth->bind_col(1, \$new);
 			}
 
-			if ( $onDiskOnlySth->fetch ) {
+			if ( $onDiskOnlyDone < $onDiskOnlyCount && $onDiskOnlySth->fetch ) {
+				$chunkRows++;
 				$progress && $progress->update( Slim::Utils::Misc::pathFromFileURL($new) );
 				$$changes++;
 				$onDiskOnlyDone++;
@@ -579,7 +723,7 @@ sub addTracks {
 			else {
 				my $more = 1;
 
-				if ( !$onDiskOnlySth->rows ) {
+				if ( $onDiskOnlyDone >= $onDiskOnlyCount || $chunkRows < $chunkSize ) {
 					$dbh->do('DROP TABLE IF EXISTS diskonly');
 
 					if ( !$args->{no_async} ) {
@@ -636,22 +780,29 @@ sub updateTracks {
 		}
 
 		my $changed;
+		my $chunkRows = 0;
+		my $chunkSize = _chunkSize();
 		my $handle_changed = sub {
 			if ( hasAborted($progress, $args->{no_async}) ) {
 				$changedOnlySth && $changedOnlySth->finish;
+				_cleanupScanTables($dbh);
 				return 0;
 			}
 
 			# Page through the files, this is to avoid a long-running read query which
 			# would prevent WAL checkpoints from occurring.
 			if ( !$changedOnlySth ) {
-				my $sql = $changedOnlySQL . " LIMIT $changedOnlyDone, " . CHUNK_SIZE;
+				$chunkRows = 0;
+				my $sql = $changedOnlySQL . ' LIMIT ?, ?';
 				$changedOnlySth = $dbh->prepare_cached($sql);
+				$changedOnlySth->bind_param(1, int($changedOnlyDone), DBI::SQL_INTEGER());
+				$changedOnlySth->bind_param(2, int($chunkSize), DBI::SQL_INTEGER());
 				$changedOnlySth->execute;
 				$changedOnlySth->bind_col(1, \$changed);
 			}
 
 			if ( $changedOnlyDone < $changedOnlyCount && $changedOnlySth->fetch ) {
+				$chunkRows++;
 				$progress && $progress->update( Slim::Utils::Misc::pathFromFileURL($changed) );
 				$$changes++;
 				$changedOnlyDone++;
@@ -663,7 +814,9 @@ sub updateTracks {
 			else {
 				my $more = 1;
 
-				if ( $changedOnlyDone >= $changedOnlyCount || !$changedOnlySth->rows ) {
+				if ( $changedOnlyDone >= $changedOnlyCount || $chunkRows < $chunkSize ) {
+					$dbh->do('DROP TABLE IF EXISTS changed');
+
 					if ( !$args->{no_async} ) {
 						$args->{paths} = $paths;
 						markDone( $nextFolder => PENDING_CHANGED, $$changes, $args );
@@ -826,63 +979,75 @@ sub deleted {
 			my ($playlist) = $sth->fetchrow_hashref;
 			$sth->finish;
 
-			# Get the list of all virtual tracks from the cue sheet
-			# This has to be done before deleting the playlist because
-			# it cascades to deleting the playlist_track entries
-			$sth = $dbh->prepare_cached( qq{
-				SELECT id, album, year FROM tracks
-				WHERE url IN (
-					SELECT track
-					FROM playlist_track
-					WHERE playlist = ?
-				)
-			} );
-			$sth->execute( $playlist->{id} );
-			my $ptracks = $sth->fetchall_arrayref( {} );
-			$sth->finish;
+			my $playlistId = blessed($playlist)
+				? $playlist->id
+				: (ref $playlist eq 'HASH' ? $playlist->{id} : undef);
 
-			# Bug 10636, FLAC+CUE doesn't use playlist_track entries for some reason
-			# so we need to find the virtual tracks by looking at the URL
-			if ( !scalar @{$ptracks} ) {
+			my $ptracks = [];
+			if ( defined $playlistId ) {
+				# Get the list of all virtual tracks from the cue sheet
+				# This has to be done before deleting the playlist because
+				# it cascades to deleting the playlist_track entries
 				$sth = $dbh->prepare_cached( qq{
-					SELECT id, album, year
-					FROM   tracks
-					WHERE  url LIKE '$url#%'
-					AND    `virtual` = 1
+					SELECT id, album, year FROM tracks
+					WHERE url IN (
+						SELECT track
+						FROM playlist_track
+						WHERE playlist = ?
+					)
 				} );
-				$sth->execute;
+				$sth->execute( $playlistId );
 				$ptracks = $sth->fetchall_arrayref( {} );
 				$sth->finish;
 			}
 
-			# plugin hook
-			if ( my $handler = $pluginHandlers->{onDeletedPlaylistHandler} ) {
-				$handler->( { id => $playlist->{id}, url => $url } );
+			# Bug 10636, FLAC+CUE doesn't use playlist_track entries for some reason
+			# so we need to find the virtual tracks by looking at the URL
+			if ( !scalar @{$ptracks} ) {
+				my $likeEsc = _likeEscapeClause();
+				$sth = $dbh->prepare_cached( qq{
+					SELECT id, album, year
+					FROM   tracks
+					WHERE  url LIKE ? $likeEsc
+					AND    `virtual` = 1
+				} );
+				$sth->execute( _escapeLike($url) . '#%' );
+				$ptracks = $sth->fetchall_arrayref( {} );
+				$sth->finish;
 			}
 
-			# Delete the playlist
-			# This will cascade to remove the playlist_track entries
-			$sth = $dbh->prepare_cached( qq{
-				DELETE FROM tracks WHERE id = ?
-			} );
-			$sth->execute( $playlist->{id} );
+			if ( defined $playlistId ) {
+				# plugin hook
+				if ( my $handler = $pluginHandlers->{onDeletedPlaylistHandler} ) {
+					$handler->( { id => $playlistId, url => $url } );
+				}
+
+				# Delete the playlist
+				# This will cascade to remove the playlist_track entries
+				$sth = $dbh->prepare_cached( qq{
+					DELETE FROM tracks WHERE id = ?
+				} );
+				$sth->execute( $playlistId );
+			}
 
 			# Continue cue handling after playlist/playlist_tracks have been deleted
+			my @trackIds = grep { defined && !ref($_) && /\A\d+\z/ } map { $_->{id} } @{$ptracks};
+			return unless @trackIds;
 
 			# Get contributors for tracks before we delete them
-			my $ids = join( ',', map { $_->{id} } @{$ptracks} );
+			my $ph = join( ',', ('?') x @trackIds );
 			my $contribs = $dbh->selectall_arrayref( qq{
 				SELECT DISTINCT(contributor)
 				FROM contributor_track
-				WHERE track IN ($ids)
-			}, { Slice => {} } );
+				WHERE track IN ($ph)
+			}, { Slice => {} }, @trackIds );
 
 			# Get genres for tracks before we delete them
 			my $genres = $dbh->selectall_arrayref( qq{
 				SELECT DISTINCT(genre)
 				FROM genre_track
-				WHERE track IN ($ids)
-			}, { Slice => {} } );
+				WHERE track IN ($ph)
+			}, { Slice => {} }, @trackIds );
 
 			# 1. Delete the virtual tracks from this cue sheet
 			# This will cascade to:
@@ -892,26 +1057,28 @@ sub deleted {
 			$sth = $dbh->prepare_cached( qq{
 				DELETE FROM tracks WHERE id = ?
 			} );
-			for my $ptrack ( @{$ptracks} ) {
-				$sth->execute( $ptrack->{id} );
+			for my $ptrackId ( @trackIds ) {
+				$sth->execute( $ptrackId );
 			}
 			$sth->finish;
 
 			# 2. Rescan the album(s) created from the cue sheet
 			my %seen;
 			my @albums = grep { defined $_ && !$seen{$_}++ } map { $_->{album} } @{$ptracks};
-			Slim::Schema::Album->rescan( @albums );
+			Slim::Schema::Album->rescan( @albums ) if @albums;
 
 			# 3. Rescan contributors created from the cue sheet
-			Slim::Schema::Contributor->rescan( [map { $_->{contributor} } @{$contribs}] );
+			my @contribIds = map { $_->{contributor} } @{$contribs};
+			Slim::Schema::Contributor->rescan( \@contribIds ) if @contribIds;
 
 			# 4. Rescan genres created from the cue sheet
-			Slim::Schema::Genre->rescan( map { $_->{genre} } @{$genres} );
+			my @genreIds = map { $_->{genre} } @{$genres};
+			Slim::Schema::Genre->rescan( @genreIds ) if @genreIds;
 
 			# 5. Rescan years created from the cue sheet
 			%seen = ();
 			my @years = grep { defined $_ && !$seen{$_}++ } map { $_->{year} } @{$ptracks};
-			Slim::Schema::Year->rescan( @years );
+			Slim::Schema::Year->rescan( @years ) if @years;
 		};
 	}
 	elsif ( Slim::Music::Info::isList($url, $content_type) ) {
@@ -926,9 +1093,14 @@ sub deleted {
 			my ($playlist) = $sth->fetchrow_hashref;
 			$sth->finish;
 
+			my $playlistId = blessed($playlist)
+				? $playlist->id
+				: (ref $playlist eq 'HASH' ? $playlist->{id} : undef);
+			return unless defined $playlistId;
+
 			# plugin hook
 			if ( my $handler = $pluginHandlers->{onDeletedPlaylistHandler} ) {
-				$handler->( { id => $playlist->{id}, url => $url } );
+				$handler->( { id => $playlistId, url => $url } );
 			}
 
 			# Delete the playlist
@@ -936,7 +1108,7 @@ sub deleted {
 			$sth = $dbh->prepare_cached( qq{
 				DELETE FROM tracks WHERE id = ?
 			} );
-			$sth->execute( $playlist->{id} );
+			$sth->execute( $playlistId );
 		};
 	}
 	else {
@@ -1065,27 +1237,31 @@ sub changed {
 			my $sth = $dbh->prepare_cached( qq{
 				SELECT tracks.id, tracks.year, albums.id AS album_id, albums.artwork
 				FROM   tracks
-				JOIN   albums ON (tracks.album = albums.id)
+				LEFT JOIN albums ON (tracks.album = albums.id)
 				WHERE  tracks.url = ?
 			} );
 			my $origTrack = $dbh->selectrow_hashref($sth, undef, $url);
 
 			my $orig = {
-				year => $origTrack->{year},
-				album => $origTrack->{album_id} || 0,
+				year     => $origTrack ? ($origTrack->{year} || 0) : 0,
+				album    => $origTrack ? ($origTrack->{album_id} || 0) : 0,
+				contribs => [],
+				genres   => [],
 			};
 
-			# Fetch all contributor IDs used on the original track
-			$sth = $dbh->prepare_cached( qq{
-				SELECT DISTINCT(contributor) FROM contributor_track WHERE track = ?
-			} );
-			$orig->{contribs} = $dbh->selectall_arrayref( $sth, { Slice => {} }, $origTrack->{id} );
+			if ( $origTrack && $origTrack->{id} ) {
+				# Fetch all contributor IDs used on the original track
+				$sth = $dbh->prepare_cached( qq{
+					SELECT DISTINCT(contributor) FROM contributor_track WHERE track = ?
+				} );
+				$orig->{contribs} = $dbh->selectall_arrayref( $sth, { Slice => {} }, $origTrack->{id} );
 
-			# Fetch all genres used on the original track
-			$sth = $dbh->prepare_cached( qq{
-				SELECT genre FROM genre_track WHERE track = ?
-			} );
-			$orig->{genres} = $dbh->selectall_arrayref( $sth, { Slice => {} }, $origTrack->{id} );
+				# Fetch all genres used on the original track
+				$sth = $dbh->prepare_cached( qq{
+					SELECT genre FROM genre_track WHERE track = ?
+				} );
+				$orig->{genres} = $dbh->selectall_arrayref( $sth, { Slice => {} }, $origTrack->{id} );
+			}
 
 			# Scan tags & update track row
 			# XXX no DBIC objects
@@ -1104,7 +1280,7 @@ sub changed {
 			# Tell Contributors to rescan, if no other tracks left, remove contributor.
 			# This will also remove entries from contributor_track and contributor_album
 			for my $contrib ( @{ $orig->{contribs} } ) {
-				Slim::Schema::Contributor->rescan( [$contrib->{contributor}], $origTrack->{album_id} );
+				Slim::Schema::Contributor->rescan( [$contrib->{contributor}], $origTrack ? $origTrack->{album_id} : undef );
 			}
 
 			my $album = $track->album;
@@ -1133,8 +1309,8 @@ sub changed {
 
 			# Make sure album.artwork points to this track, so the album
 			# uses the newest available artwork
-			if ( my $coverid = $track->coverid ) {
-				if ( $album->artwork ne $coverid ) {
+			if ( $album && (my $coverid = $track->coverid) ) {
+				if ( !defined $album->artwork || $album->artwork ne $coverid ) {
 					$album->artwork($coverid);
 				}
 			}
@@ -1150,7 +1326,7 @@ sub changed {
 			}
 
 			# remove album if we've removed its last track
-			if ( !$album || $album->id != $orig->{album} ) {
+			if ( $orig->{album} && (!$album || $album->id != $orig->{album}) ) {
 				Slim::Schema::Album->rescan($orig->{album});
 			}
 
@@ -1168,10 +1344,11 @@ sub changed {
 			}
 
 			# Bug 8034, Rescan years if year value changed, to remove the old year
-			if ( $orig->{year} != $track->year ) {
-				$isDebug && $log->debug( "Rescanning changed year " . $orig->{year} . " -> " . $track->year );
+			my $newYear = $track->year || 0;
+			if ( $orig->{year} != $newYear ) {
+				$isDebug && $log->debug( "Rescanning changed year " . $orig->{year} . " -> " . $newYear );
 
-				Slim::Schema::Year->rescan( $orig->{year} );
+				Slim::Schema::Year->rescan( $orig->{year} ) if $orig->{year};
 			}
 
 			# plugin hook
@@ -1180,26 +1357,25 @@ sub changed {
 			}
 		};
 
-		if ( Slim::Schema->dbh->{AutoCommit} ) {
-			Slim::Schema->txn_do($work);
-		}
-		else {
-			$work->();
-		}
+		_withTxn($dbh, $work);
 	}
 	elsif ( Slim::Music::Info::isCUE($url, $content_type) ) {
 		$log->error("Handling changed cue sheet $url") unless main::SCANNER && $main::progress;
 
 		# XXX could probably be more intelligent but this works for now
-		deleted($url);
-		new($url);
+		_withTxn($dbh, sub {
+			deleted($url);
+			new($url);
+		});
 	}
 	elsif ( Slim::Music::Info::isList($url, $content_type) ) {
 		$log->error("Handling changed playlist $url") unless main::SCANNER && $main::progress;
 
 		# For a changed playlist, just delete it and then re-scan it
-		deleted($url);
-		new($url);
+		_withTxn($dbh, sub {
+			deleted($url);
+			new($url);
+		});
 	}
 }
 
@@ -1209,11 +1385,10 @@ sub markDone {
 
 	$type && $path && main::DEBUGLOG && $log->is_debug && $log->debug("Finished scan type $type for $path");
 
-	# Update the last rescan time if any changes were made
-	if (!main::SCANNER && $changes) {
-		main::DEBUGLOG && $log->is_debug && $log->debug("Scanner made $changes changes, updating last rescan timestamp");
-		Slim::Music::Import->setLastScanTime();
-		Slim::Music::Import->setLastScanTimeIsDST();
+	if ( hasAborted(undef, $args->{no_async}) ) {
+		_cleanupScanTables(Slim::Schema->dbh);
+		%pending = ();
+		return;
 	}
 
 	$pending{$path} &= ~$type if $type;
@@ -1234,6 +1409,8 @@ sub markDone {
 
 	main::DEBUGLOG && $log->is_debug && $log->debug("All rescan tasks finished (total changes: $changes)");
 
+	_cleanupScanTables(Slim::Schema->dbh);
+
 	# plugin hook
 	if ( my $handler = $pluginHandlers->{onFinishedHandler} ) {
 		$handler->($changes);
@@ -1245,7 +1422,11 @@ sub markDone {
 
 			# Precache artwork, when done send rescan done event
 			Slim::Music::Artwork->precacheAllArtwork( sub {
-				# Update the last rescan time if any changes were made
+				if ( hasAborted(undef, $args->{no_async}) ) {
+					return;
+				}
+
+				# Update the last rescan time only on success when changes were made
 				if ($changes) {
 					main::DEBUGLOG && $log->is_debug && $log->debug("Scanner made $changes changes, updating last rescan timestamp");
 					Slim::Music::Import->setLastScanTime();
@@ -1410,19 +1591,94 @@ sub _setChangeCount {
 	my $changes = shift;
 
 	my $dbh = Slim::Schema->dbh;
+	my $sql = _isSQLite()
+		? q{INSERT INTO metainformation (name, value) VALUES ('scanChangeCount', ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value}
+		: q{INSERT INTO metainformation (name, value) VALUES ('scanChangeCount', ?) ON DUPLICATE KEY UPDATE value = VALUES(value)};
 
-	my $sth = $dbh->prepare_cached("SELECT 1 FROM metainformation WHERE name = 'scanChangeCount'");
-	$sth->execute;
-	if ( $sth->fetchrow_array ) {
-		my $sta = $dbh->prepare_cached( "UPDATE metainformation SET value = ? WHERE name = 'scanChangeCount'" );
-		$sta->execute($changes);
-	}
-	else {
-		my $sta = $dbh->prepare_cached( "INSERT INTO metainformation (name, value) VALUES (?, ?)" );
-		$sta->execute( 'scanChangeCount', $changes );
-	}
-
+	my $sth = $dbh->prepare_cached($sql);
+	$sth->execute($changes);
 	$sth->finish;
+}
+
+sub _escapeLike {
+	my $str = shift;
+	return '' unless defined $str;
+	$str =~ s/([!%_])/!$1/g;
+	return $str;
+}
+
+sub _likeEscapeClause {
+	return q{ESCAPE '!'};
+}
+
+sub _likeChildrenPattern {
+	my $url = shift;
+	return _escapeLike($url) . ($url =~ m{/$} ? '%' : '/%');
+}
+
+sub _withTxn {
+	my ($dbh, $work) = @_;
+	if ( $dbh->{AutoCommit} ) {
+		return Slim::Schema->txn_do($work);
+	}
+	return $work->();
+}
+
+sub _cleanupScanTables {
+	my $dbh = shift || return;
+	for my $tbl ( qw(dbonly diskonly changed changed_albums) ) {
+		$dbh->do("DROP TABLE IF EXISTS $tbl");
+	}
+}
+
+sub _findSymlinkDirs {
+	my ($root) = @_;
+
+	my $real_root = Cwd::abs_path($root);
+	my @others;
+	my %seen_walk;
+	my %seen_symlink;
+
+	if ( my @rst = stat $root ) {
+		$seen_walk{"$rst[0]:$rst[1]"} = 1;
+	}
+
+	my @queue = ($root);
+	while ( defined(my $dir = shift @queue) ) {
+		opendir(my $dh, $dir) or next;
+		my @entries = readdir($dh);
+		closedir($dh);
+
+		for my $entry ( @entries ) {
+			next if $entry eq '.' || $entry eq '..';
+			my $full = "$dir/$entry";
+			my @lst = lstat($full) or next;
+			if ( -l _ ) {
+				my @st = stat($full) or next;
+				if ( -d _ && -r _ && -x _ ) {
+					my $key = "$st[0]:$st[1]";
+					next if $seen_symlink{$key}++;
+
+					if ( defined $real_root ) {
+						my $real_target = Cwd::abs_path($full);
+						if ( defined $real_target ) {
+							next if $real_target eq $real_root;
+							next if $real_root eq '/' || index($real_target, "$real_root/") == 0;
+						}
+					}
+
+					push @others, $full;
+				}
+			}
+			elsif ( -d _ && -r _ && -x _ ) {
+				my $key = "$lst[0]:$lst[1]";
+				next if $seen_walk{$key}++;
+				push @queue, $full;
+			}
+		}
+	}
+
+	return \@others;
 }
 
 1;

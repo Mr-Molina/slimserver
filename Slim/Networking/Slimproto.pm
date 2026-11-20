@@ -10,6 +10,7 @@ package Slim::Networking::Slimproto;
 use strict;
 
 use Slim::Utils::Errno;
+use Errno qw(EAGAIN);
 use FindBin qw($Bin);
 use Socket qw(inet_ntoa inet_aton pack_sockaddr_in SOMAXCONN);
 use IO::Socket qw(sockaddr_in);
@@ -24,6 +25,8 @@ use Slim::Utils::Strings qw(string);
 use Slim::Utils::Prefs;
 
 use constant SLIMPROTO_PORT   => 3483;
+use constant MAX_PREAUTH_LEN  => 4096;
+use constant MAX_FRAME_LEN    => 65536;
 
 our @deviceids = (undef, undef, 'squeezebox', 'softsqueeze','squeezebox2','transporter', 'softsqueeze3', 'receiver', 'squeezeslave', 'controller', 'boom', 'softboom', 'squeezeplay');
 my %deviceClasses;
@@ -148,7 +151,11 @@ sub slimproto_accept {
 
 	return unless $clientsock;
 
-	defined(Slim::Utils::Network::blocking($clientsock,0)) || die "Cannot set port nonblocking";
+	if ( !defined(Slim::Utils::Network::blocking($clientsock, 0)) ) {
+		$log->warn("accept failed; cannot set socket nonblocking.");
+		$clientsock->close();
+		return;
+	}
 
 	# Use the Socket variables this way to silence a warning on perl 5.6
 	setsockopt ($clientsock, Socket::IPPROTO_TCP(), Socket::TCP_NODELAY(), 1);
@@ -167,7 +174,7 @@ sub slimproto_accept {
 		return;
 	}
 
-	if (!$peer) {
+	if (!$peer || length($peer) != 4) {
 
 		$log->warn("accept failed; couldn't get peer address.");
 		$clientsock->close();
@@ -175,6 +182,14 @@ sub slimproto_accept {
 	}
 
 	my $tmpaddr = inet_ntoa($peer);
+	my $tmpport = $clientsock->peerport;
+
+	if (!defined $tmpaddr || !defined $tmpport) {
+
+		$log->warn("accept failed; couldn't get peer address/port.");
+		$clientsock->close();
+		return;
+	}
 
 	if (preferences('server')->get('filterHosts') && !(Slim::Utils::Network::isAllowedHost($tmpaddr))) {
 
@@ -184,7 +199,7 @@ sub slimproto_accept {
 		return;
 	}
 
-	$ipport{$clientsock} = join(':', $tmpaddr, $clientsock->peerport);
+	$ipport{$clientsock} = join(':', $tmpaddr, $tmpport);
 
 	Slim::Networking::Select::addRead($clientsock, \&client_readable, 1); # processed during idleStreams
 	Slim::Networking::Select::addError($clientsock, \&slimproto_close);
@@ -194,7 +209,7 @@ sub slimproto_accept {
 	# Set a timer to close the connection if we haven't recieved a HELO in 5 seconds.
 	main::INFOLOG && $log->info("Setting timer in 5 seconds to close bogus connection");
 
-	Slim::Utils::Timers::setTimer($clientsock, Time::HiRes::time () + 5, \&slimproto_close, $clientsock);
+	Slim::Utils::Timers::setTimer($clientsock, Time::HiRes::time () + 5, \&slimproto_close);
 }
 
 sub check_all_clients {
@@ -228,7 +243,7 @@ sub check_all_clients {
 				));
 			}
 
-			slimproto_close( $client->tcpsock );
+			slimproto_close( $client->tcpsock ) if $client->tcpsock;
 			next;
 		}
 
@@ -245,7 +260,11 @@ sub slimproto_close {
 	my $clientsock = shift;
 	my $reconnect  = shift;
 
+	return unless $clientsock;
+
 	main::INFOLOG && $log->info("connection closed");
+
+	Slim::Utils::Timers::killTimers($clientsock, \&slimproto_close);
 
 	# stop selecting
 	Slim::Networking::Select::removeRead($clientsock);
@@ -295,6 +314,8 @@ sub slimproto_close {
 					forget_disconnected_client($client);
 				}
 			}
+
+			delete $status{$client};
 		}
 	}
 
@@ -325,6 +346,8 @@ sub forget_disconnected_client {
 	my $client = shift;
 
 	main::INFOLOG && $log->info("forgetting disconnected client");
+
+	delete $status{$client} if defined $client;
 
 	Slim::Control::Request::executeRequest($client, ['client', 'forget']);
 }
@@ -365,18 +388,25 @@ sub client_readable {
 
 		if ( defined $nb ) {
 			if ( $nb > 0 ) {
-				# Parse slimproto frame(s) in packet
-				while ( $buf ) {
-					my ($op, $len, $data);
-
-					# Check for previous partial data
-					if ( my $partial = delete ${*$s}{_partial} ) {
-						if ( main::DEBUGLOG && $log->is_debug ) {
-							$log->debug( "Client sent additional header / data: " . Data::Dump::dump($buf) );
-						}
-
-						$buf = $partial . $buf;
+				# Check for previous partial data
+				if ( my $partial = delete ${*$s}{_partial} ) {
+					if ( main::DEBUGLOG && $log->is_debug ) {
+						$log->debug( "Client sent additional header / data: " . Data::Dump::dump($buf) );
 					}
+
+					$buf = $partial . $buf;
+				}
+
+				# Enforce pre-auth buffer cap before HELO completes
+				if ( !exists $sock2client{$s} && length($buf) > MAX_PREAUTH_LEN ) {
+					$log->error("Pre-auth slimproto buffer exceeded MAX_PREAUTH_LEN (" . length($buf) . ")");
+					slimproto_close($s);
+					return;
+				}
+
+				# Parse slimproto frame(s) in packet
+				while ( length($buf) ) {
+					my ($op, $len, $data);
 
 					# Make sure we have at op and len
 					if ( length($buf) < 8 ) {
@@ -391,6 +421,13 @@ sub client_readable {
 
 					$op  = substr $buf, 0, 4;
 					$len = unpack 'N', substr( $buf, 4, 4 );
+
+					my $max_len = exists $sock2client{$s} ? MAX_FRAME_LEN : MAX_PREAUTH_LEN;
+					if ( !defined $len || $len > $max_len ) {
+						$log->error("Slimproto frame length $len exceeds limit $max_len for op $op");
+						slimproto_close($s);
+						return;
+					}
 
 					# Now having read len, make sure that all the data is available
 					if ( length($buf) < $len + 8 ) {
@@ -413,6 +450,7 @@ sub client_readable {
 					# Sanity check for bad data
 					unless ( length($op) == 4 && defined $len && length($data) == $len ) {
 						$log->error( "Client sent bad data: $op / $len / " . length($data) . " data: " . Data::Dump::dump($data) );
+						slimproto_close($s);
 						return;
 					}
 
@@ -434,12 +472,18 @@ sub client_readable {
 					else {
 						if ( $op eq 'HELO' ) {
 							_hello_handler( $s, \$data );
+							return unless exists $sock2client{$s};
 						}
 						else {
-							if ( $s->peeraddr ) {
-								$log->error( "Client not found for slimproto msg op: $op", ' from ', inet_ntoa($s->peeraddr) );
+							my $peer = $s->peeraddr;
+							if ( defined $peer && length($peer) == 4 ) {
+								$log->error( "Client not found for slimproto msg op: $op", ' from ', inet_ntoa($peer) );
+							}
+							else {
+								$log->error( "Client not found for slimproto msg op: $op" );
 							}
 							slimproto_close($s);
+							return;
 						}
 					}
 				}
@@ -447,14 +491,14 @@ sub client_readable {
 				return;
 			}
 			else {
-				main::INFOLOG && $log->info("half-close from client: $ipport{$s}");
+				main::INFOLOG && $log->info("half-close from client: " . ($ipport{$s} // 'unknown'));
 
 				slimproto_close($s);
 				return;
 			}
 		}
-		elsif ( $! == EWOULDBLOCK ) {
-			next;
+		elsif ( $! == EWOULDBLOCK || $! == EAGAIN ) {
+			return;
 		}
 		else {
 			main::INFOLOG && $log->info( "Error reading from client: $!" );
@@ -566,6 +610,12 @@ sub _raw_ir_handler {
 sub _ambient_light_sensor_handler {
 	my $client = shift;
 	my $data_ref = shift;
+
+	if ( length($$data_ref) < 13 ) {
+		$log->warn("bad length " . length($$data_ref) . " for ALSS. Ignoring");
+		return;
+	}
+
 	my ($packet_rev, $time, $lux, $channel_0, $channel_1) = unpack("CNNnn", $$data_ref);
 	# print "ALS: $time, $lux, $channel_0, $channel_1\n";
 	# Do something with the Ambient lightsensor data here.
@@ -601,6 +651,11 @@ sub _disco_handler {
 	my $client = shift;
 	my $data_ref = shift;
 
+	if ( length($$data_ref) < 1 ) {
+		$log->warn("bad length " . length($$data_ref) . " for DSCO. Ignoring");
+		return;
+	}
+
 	# disconnection reasons
 	my %reasons = (
 		0 => 'Connection closed normally',              # TCP_CLOSE_FIN
@@ -611,11 +666,12 @@ sub _disco_handler {
 	);
 
 	my $reason = unpack('C', $$data_ref);
+	my $reason_str = $reasons{$reason} // "Unknown disconnect reason ($reason)";
 
-	main::INFOLOG && $log->info("Squeezebox got disconnection on the data channel: $reasons{$reason}");
+	main::INFOLOG && $log->info("Squeezebox got disconnection on the data channel: $reason_str");
 
 	if ($reason) {
-		$log->warn('Unexpected data stream disconnect type: ', $reasons{$reason});
+		$log->warn('Unexpected data stream disconnect type: ', $reason_str);
 	}
 
 	# It may be that we get this disconnect before we had completed connecting.
@@ -652,7 +708,7 @@ sub _disco_handler {
 			# bug 10407 - make sure ready to stream again
 			$client->readyToStream(1);
 
-			$handler->handleDirectError( $client, $controller->streamUrl(), $reason, $reasons{$reason} );
+			$handler->handleDirectError( $client, $controller->streamUrl(), $reason, $reason_str );
 		}
 
 		elsif ($reason && $client->isPlaying(1)) {
@@ -660,10 +716,10 @@ sub _disco_handler {
 			# then give the controller the opportunity to retry the stream
 			# by signalling with the third param to to playerStreamingFailed.
 			# We still expect to get STMd/STMo notifications.
-			$client->controller()->playerStreamingFailed($client, $reasons{$reason}, 'errorDisconnect');
+			$client->controller()->playerStreamingFailed($client, $reason_str, 'errorDisconnect');
 		}
 		else {
-			$client->failedDirectStream( $reasons{$reason} );
+			$client->failedDirectStream( $reason_str );
 		}
 
 		# If we have a connection-failure for a client and it has already run out of
@@ -693,6 +749,12 @@ sub _http_body_handler {
 sub _stat_handler {
 	my $client = shift;
 	my $data_ref = shift;
+
+	my $len = length($$data_ref);
+	if ( $len < 29 ) {
+		$log->warn("bad length $len for STAT. Ignoring");
+		return;
+	}
 
 	my $now = Time::HiRes::time();
 
@@ -768,8 +830,6 @@ sub _stat_handler {
 		$stat->{'error_code'},
 	) = unpack ('a4CCCNNNNnNNNNnNNn', $$data_ref);
 
-	my $len = length($$data_ref);
-
 	if ( $len != 53 && $len != 57 ) {
 		# Older firmware that doesn't report error_code
 		# 57 = current firmware (4 junk bytes)
@@ -825,8 +885,8 @@ sub _stat_handler {
 			#"\tmas_mode:        $stat->{'mas_mode'}",
 			"\tbytes_rec_H      $stat->{'bytes_received_H'}",
 			"\tbytes_rec_L      $stat->{'bytes_received_L'}",
-			"\tfullness:        $stat->{'fullness'} (" . int($stat->{'fullness'}/$client->bufferSize()*100) . "%)",
-			"\tbufferSize      " . $client->bufferSize,
+			"\tfullness:        $stat->{'fullness'} (" . ($client->bufferSize() ? int($stat->{'fullness'}/$client->bufferSize()*100) : 0) . "%)",
+			"\tbufferSize      " . ($client->bufferSize() // 0),
 			"\tfullness         $stat->{'fullness'}",
 			"\tbytes_received   $stat->{'bytes_received'}",
 			"\tsignal_strength: $stat->{'signal_strength'}",
@@ -930,16 +990,26 @@ sub _bye_handler {
 
 		main::INFOLOG && $log->info("Going out for upgrade...");
 
-		# give the player a chance to get into upgrade mode
-		sleep(2);
-		$client->unblock();
-		$client->upgradeFirmware();
+		# give the player a chance to get into upgrade mode without blocking the event loop
+		Slim::Utils::Timers::setTimer(
+			$client,
+			Time::HiRes::time() + 2,
+			sub {
+				my $c = shift || return;
+				$c->unblock();
+				$c->upgradeFirmware();
+			},
+		);
 	}
 }
 
 sub _shut_handler {
 	my $client = shift;
-	slimproto_close($client->tcpsock) if $client->tcpsock;
+
+	if ( $client && $client->tcpsock ) {
+		$log->warn("Received SHUT from client " . $client->id . ", closing connection");
+		slimproto_close($client->tcpsock);
+	}
 }
 
 my $warnNoSB1Support = 0;
@@ -956,7 +1026,13 @@ sub _hello_handler {
 	my ($deviceid, $revision, @mac, $uuid, $bitmapped, $reconnect, $wlan_channellist, $bytes_received_H, $bytes_received_L, $bytes_received, $lang);
 
 	# Newer player fw reports a uuid. With uuid, length is 36; without uuid, length is 20
-	my $data_ref_length = length( $$data_ref);
+	my $data_ref_length = length( $$data_ref );
+
+	if ( $data_ref_length < 20 ) {
+		$log->warn("HELO frame too short ($data_ref_length bytes); closing connection.");
+		slimproto_close($s);
+		return;
+	}
 
 	if( $data_ref_length >= 36) {
 		(	$deviceid, $revision,
@@ -968,6 +1044,19 @@ sub _hello_handler {
 			$mac[0], $mac[1], $mac[2], $mac[3], $mac[4], $mac[5],
 			$wlan_channellist, $bytes_received_H, $bytes_received_L, $lang
 		) = unpack("CCH2H2H2H2H2H2nNNA2", $$data_ref);
+	}
+
+	if ( scalar(@mac) != 6 || grep { !defined($_) || $_ !~ /^[0-9a-fA-F]{2}$/ } @mac ) {
+		$log->warn("Malformed MAC address in HELO frame; closing connection.");
+		slimproto_close($s);
+		return;
+	}
+
+	my $mac = lc(join(':', @mac));
+	if ( $mac eq '00:00:00:00:00:00' || $mac eq 'ff:ff:ff:ff:ff:ff' || (hex($mac[0]) & 0x01) ) {
+		$log->warn("Rejected invalid HELO MAC address ($mac); closing connection.");
+		slimproto_close($s);
+		return;
 	}
 
 	$bitmapped = $wlan_channellist & 0x8000;
@@ -988,8 +1077,7 @@ sub _hello_handler {
 		}
 	}
 
-	my $mac = join(':', @mac);
-	my $id  = $mac;
+	my $id = $mac;
 
 	if (main::INFOLOG && $log->is_info) {
 
@@ -1016,14 +1104,53 @@ sub _hello_handler {
 	}
 
 	# sanity check on socket
-	if (!$s->peerport || !$s->peeraddr) {
+	if (!$s->peerport || !$s->peeraddr || !defined $ipport{$s}) {
+		slimproto_close($s);
 		return;
 	}
 
 	my ($ascii_ip, $ascii_port) = split(/:/, $ipport{$s});
-	my $paddr  = pack_sockaddr_in($ascii_port, inet_aton($ascii_ip));
+	my $ip_aton = defined $ascii_ip ? inet_aton($ascii_ip) : undef;
+	if ( !defined $ip_aton || !defined $ascii_port ) {
+		$log->warn("Invalid peer address for HELO; closing connection.");
+		slimproto_close($s);
+		return;
+	}
+	my $paddr  = pack_sockaddr_in($ascii_port, $ip_aton);
 
 	my $client = Slim::Player::Client::getClient($id);
+
+	# Prevent session hijacking / forced forgetClient from conflicting peer IP or mismatched UUID
+	if ( defined $client ) {
+		my $oldsock = $client->tcpsock();
+		my $has_live_sock = defined($oldsock) && exists($sock2client{$oldsock});
+
+		if ( $has_live_sock ) {
+			my ($old_ip) = split(/:/, $ipport{$oldsock} || '');
+			if ( !defined($old_ip) && $oldsock->peeraddr && length($oldsock->peeraddr) == 4 ) {
+				$old_ip = inet_ntoa($oldsock->peeraddr);
+			}
+			if ( defined($old_ip) && $old_ip ne $ascii_ip ) {
+				$log->warn("Rejected HELO for $id from conflicting IP $ascii_ip (active socket on $old_ip)");
+				slimproto_close($s);
+				return;
+			}
+		}
+
+		my $norm_uuid = (defined $uuid && length($uuid) == 32 && $uuid !~ /^0+$/) ? lc($uuid) : undef;
+		my $client_uuid = ($client->can('uuid') && defined $client->uuid && length($client->uuid) && $client->uuid !~ /^0+$/) ? lc($client->uuid) : undef;
+
+		if ( defined($client_uuid) && (!defined($norm_uuid) || $norm_uuid ne $client_uuid) ) {
+			$log->warn("Rejected HELO for $id due to UUID mismatch");
+			slimproto_close($s);
+			return;
+		}
+		if ( $has_live_sock && !defined($client_uuid) && defined($norm_uuid) ) {
+			$log->warn("Rejected HELO for $id due to unexpected UUID on active session");
+			slimproto_close($s);
+			return;
+		}
+	}
 
 	my ($client_class, $display_class);
 
@@ -1125,6 +1252,7 @@ sub _hello_handler {
 
 		main::INFOLOG && $log->info("Forgetting client, it is not a $client_class");
 
+		delete $status{$client};
 		$client->forgetClient();
 
 		$client = undef;
@@ -1187,9 +1315,11 @@ sub _hello_handler {
 		if (defined($oldsock) && exists($sock2client{$oldsock})) {
 
 			if ( main::INFOLOG && $log->is_info ) {
+				my $old_peer = ($oldsock->peeraddr && length($oldsock->peeraddr) == 4) ? inet_ntoa($oldsock->peeraddr) : 'unknown';
+				my $old_port = $oldsock->peerport // 'unknown';
 				$log->info("Closing previous socket to client: $id on ipport: " .
-					join(':', inet_ntoa($oldsock->peeraddr), $oldsock->peerport) .
-					" (" . $ipport{$oldsock} . ") "
+					join(':', $old_peer, $old_port) .
+					" (" . ($ipport{$oldsock} // 'unknown') . ") "
 				);
 			}
 
@@ -1272,6 +1402,11 @@ sub _button_handler {
 	my $client = shift;
 	my $data_ref = shift;
 
+	if ( length($$data_ref) < 8 ) {
+		$log->warn("bad length " . length($$data_ref) . " for BUTN. Ignoring");
+		return;
+	}
+
 	# handle hard buttons
 	my ($time, $button) = unpack( 'NH8', $$data_ref);
 
@@ -1284,6 +1419,11 @@ sub _knob_handler {
 	my $client = shift;
 	my $data_ref = shift;
 
+	if ( length($$data_ref) < 9 ) {
+		$log->warn("bad length " . length($$data_ref) . " for KNOB. Ignoring");
+		return;
+	}
+
 	# handle knob movement
 	my ($time, $position, $sync) = unpack('NNC', $$data_ref);
 
@@ -1295,9 +1435,9 @@ sub _knob_handler {
 	my $oldPos   = $client->knobPos();
 	my $knobSync = $client->knobSync();
 
-	if ($knobSync != $sync) {
+	if ( (($knobSync // 0) & 0xFF) != $sync ) {
 
-		main::INFOLOG && $log->info("Stale knob sync code: $position (old: $oldPos) time: $time sync: $sync");
+		main::INFOLOG && $log->info(sprintf("Stale knob sync code: $position (old: %s) time: $time sync: $sync", defined $oldPos ? $oldPos : 'undef'));
 		return;
 	}
 
@@ -1322,7 +1462,12 @@ sub _settings_handler {
 	my $client = shift;
 	my $data_ref = shift;
 
-	if ($client->can('directBodyFrame')) {
+	if ( length($$data_ref) < 1 ) {
+		$log->warn("bad length " . length($$data_ref) . " for SETD. Ignoring");
+		return;
+	}
+
+	if ($client->can('playerSettingsFrame')) {
 		$client->playerSettingsFrame($data_ref);
 	}
 }

@@ -2,8 +2,11 @@ package Slim::Utils::GDResizer;
 
 use strict;
 
+use Errno ();
 use FindBin;
 use Image::Scale;
+
+use constant MAX_SLURP_BYTES => 64 * 1024 * 1024;
 
 my $debug;
 
@@ -54,8 +57,8 @@ sub resize {
 	my $origref = $args{original};
 	my $file    = $args{file};
 	my $format  = $args{format};
-	my $width   = $args{width}  || 'X';
-	my $height  = $args{height} || 'X';
+	my $width   = $args{width};
+	my $height  = $args{height};
 	my $bgcolor = $args{bgcolor};
 	my $mode    = $args{mode};
 
@@ -96,15 +99,44 @@ sub resize {
 		}
 	}
 
+	# Validate and normalize width/height ('X' and all-zero '0'/'00' mean unspecified)
+	if ( defined $width && length $width && $width ne 'X' ) {
+		die "Invalid resize width: $width\n" unless $width =~ /^\d+$/;
+		$width = ($width =~ /^0+$/) ? undef : int($width);
+	}
+	else {
+		$width = undef;
+	}
+
+	if ( defined $height && length $height && $height ne 'X' ) {
+		die "Invalid resize height: $height\n" unless $height =~ /^\d+$/;
+		$height = ($height =~ /^0+$/) ? undef : int($height);
+	}
+	else {
+		$height = undef;
+	}
+
+	if ( defined $mode && length $mode ) {
+		die "Invalid resize mode: $mode\n" unless $mode =~ /^[mpoF]$/;
+	}
+	else {
+		$mode = 'm';
+	}
+
+	if ( defined $format && length $format ) {
+		$format = lc($format);
+		$format = 'jpg' if $format eq 'jpeg';
+		die "Invalid output format: $format\n" unless $format =~ /^(?:png|jpg)$/;
+	}
+	else {
+		$format = undef;
+	}
+
 	# Remember if user requested a specific format
 	my $explicit_format = $format;
 
 	# Format of original image
 	$in_format ||= $file ? _content_type_file($file, $offset) : _content_type($origref);
-
-	# Ignore width/height of 'X'
-	$width  = undef if $width eq 'X';
-	$height = undef if $height eq 'X';
 
 	# Short-circuit if no width/height specified, and formats match, return original image
 	if ( !$width && !$height ) {
@@ -113,19 +145,15 @@ sub resize {
 		}
 	}
 
-	# Abort if invalid params
-	if ( ($width && $width !~ /^\d+$/) || ($height && $height !~ /^\d+$/) ) {
-		return $file ? (_slurp($file, $length ? $offset : undef, $length || undef), $in_format) : ($origref, $in_format);
-	}
-
-	# Fixup bgcolor and convert from hex
-	if ( $bgcolor && length($bgcolor) != 6 && length($bgcolor) != 8 ) {
-		$bgcolor = 0xFFFFFF;
-	}
-
-	if ( !$mode ) {
-		# default mode is always max
-		$mode = 'm';
+	# Fixup bgcolor and convert from hex safely
+	my $bgcolor_val = 0xFFFFFF;
+	if ( defined $bgcolor && length $bgcolor ) {
+		if ( $bgcolor =~ /^([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/ ) {
+			$bgcolor_val = hex($1);
+		}
+		else {
+			die "Invalid bgcolor hex value: $bgcolor\n";
+		}
 	}
 
 	if ( $debug && $file ) {
@@ -136,7 +164,10 @@ sub resize {
 		? Image::Scale->new( $file, { offset => $offset, length => $length } )
 		: Image::Scale->new($origref);
 
+	die "Unable to load image\n" unless $im;
+
 	my ($in_width, $in_height) = ($im->width, $im->height);
+	die "Invalid source image dimensions\n" unless $in_width && $in_height && $in_width > 0 && $in_height > 0;
 
 	# Output format
 	if ( !$format ) {
@@ -159,69 +190,61 @@ sub resize {
 		# Bug 17140, switch to png if image will contain any padded space.
 		# But if a format was explicitly requested in the URL/spec, honor it.
 		if ( !$explicit_format && $format ne 'png' ) {
-			if ( $width && $in_width && ($in_height / $in_width) != ($height / $width) ) {
-				$format = 'png';
-			}
-			elsif ( $height && $in_height && ($in_width / $in_height) != ($width / $height) ) {
-				$format = 'png';
-			}
-		}
-
-		# requested size is larger than original - don't upscale
-		if ( $width > $in_width && $height > $in_height ) {
-			if ( $in_height / $in_width > 1 ) {
-				$height = $height * ($in_width / $width);
-				$width  = $in_width;
+			if ( $width && $height ) {
+				if ( ($in_height / $in_width) != ($height / $width) ) {
+					$format = 'png';
+				}
 			}
 			else {
-				$width  = $width * ($in_height / $height);
-				$height = $in_height;
+				$format = 'png';
 			}
 		}
 
-		$debug && warn "Resizing from ${in_width}x${in_height} $in_format @ ${offset} to ${width}x${height} $format\n";
+		# Requested size exceeds original on either dimension - don't upscale
+		if ( ($width && $width > $in_width) || ($height && $height > $in_height) ) {
+			$width  = $in_width  if $width  && $width  > $in_width;
+			$height = $in_height if $height && $height > $in_height;
+		}
+
+		$debug && warn sprintf("Resizing from %dx%d %s @ %d to %sx%s %s\n", $in_width, $in_height, $in_format, $offset, $width // 'X', $height // 'X', $format);
 
 		$im->resize( {
 			width       => $width,
 			height      => $height,
-			bgcolor     => hex($bgcolor),
+			bgcolor     => $bgcolor_val,
 			keep_aspect => 1,
 		} );
 	}
 
 	elsif ( $mode eq 'F' ) {
+		my $req_w = $width  || $in_width;
+		my $req_h = $height || $in_height;
+
 		# Requested size is bigger than original -> return original size
-		if (( $width >= $in_width ) && ( $height >= $in_height)) {
-			$debug && warn "Return original size ${in_width}x${in_height} $in_format @ ${offset} to ${width}x${height} $format\n";
+		if ( $req_w >= $in_width && $req_h >= $in_height ) {
+			$debug && warn "Return original size ${in_width}x${in_height} $in_format @ ${offset} to ${req_w}x${req_h} $format\n";
 			$im->resize( {
 				width       => $in_width,
 				height      => $in_height,
-				bgcolor     => hex($bgcolor),
+				bgcolor     => $bgcolor_val,
 				keep_aspect => 1,
 			} );
 		# Requested size is smaller than original -> resize to requested size
 		} else {
-			$debug && warn "Resizing from ${in_width}x${in_height} $in_format @ ${offset} to ${width}x${height} $format\n";
+			$debug && warn sprintf("Resizing from %dx%d %s @ %d to %sx%s %s\n", $in_width, $in_height, $in_format, $offset, $width // 'X', $height // 'X', $format);
 			$im->resize( {
 				width       => $width,
 				height      => $height,
-				bgcolor     => hex($bgcolor),
+				bgcolor     => $bgcolor_val,
 				keep_aspect => 1,
 			} );
 		}
 	}
 
 	else { # mode 'o', only use the width
-		$debug && warn "Resizing from ${in_width}x${in_height} $in_format @ ${offset} to ${width}xX $format\n";
+		$width = $in_width if !$width || $width > $in_width;
 
-		if ( $width > $in_width && $height > $in_height ) {
-			if ( $in_height / $in_width > 1 ) {
-				$width = $width * ($in_height / $height);
-			}
-			else {
-				$width = $in_width;
-			}
-		}
+		$debug && warn "Resizing from ${in_width}x${in_height} $in_format @ ${offset} to ${width}xX $format\n";
 
 		$im->resize( {
 			width => $width,
@@ -273,7 +296,7 @@ Returns arrayref of [ resized image data as a scalar ref, image format, width, h
 sub resizeSeries {
 	my ( $class, %args ) = @_;
 
-	my @series  = sort { $b->{width} <=> $a->{width} } @{ delete $args{series} };
+	my @series  = sort { ($b->{width} || 0) <=> ($a->{width} || 0) } @{ delete $args{series} };
 
 	$debug      = $args{debug} if defined $args{debug};
 
@@ -304,8 +327,6 @@ sub resizeSeries {
 sub _read_tag {
 	my $file = shift;
 
-	my ($offset, $length);
-
 	require Audio::Scan;
 
 	# First try to get offset/length if possible
@@ -319,7 +340,7 @@ sub _read_tag {
 		die "Unable to read image tag from $file: $@\n";
 	}
 
-	my $tags = $s->{tags};
+	my $tags = ($s && $s->{tags}) || {};
 
 	# MP3, other files with ID3v2
 	if ( my $pic = $tags->{APIC} ) {
@@ -382,8 +403,12 @@ sub _read_data_from_tag {
 
 	$debug && warn "Offset information not found or invalid, re-reading file for direct artwork\n";
 
-	my $s = Audio::Scan->scan_tags($file);
-	my $tags = $s->{tags};
+	my $s = eval { Audio::Scan->scan_tags($file) };
+	if ( $@ ) {
+		die "Unable to read image tag from $file: $@\n";
+	}
+
+	my $tags = ($s && $s->{tags}) or return;
 
 	# MP3, other files with ID3v2
 	if ( my $pic = $tags->{APIC} ) {
@@ -407,16 +432,31 @@ sub _read_data_from_tag {
 sub _content_type_file {
 	my $file = shift;
 	my $offset = shift;
+	my $silent = $_[0];
 
-	open my $fh, '<', $file;
+	open my $fh, '<', $file or do {
+		return if $silent;
+		die "Cannot open $file: $!\n";
+	};
 	binmode $fh;
 
 	if ($offset) {
-		sysseek $fh, $offset, 0;
+		defined sysseek($fh, $offset, 0) or do {
+			my $err = $!;
+			close $fh;
+			return if $silent;
+			die "Cannot seek in $file: $err\n";
+		};
 	}
 
-	sysread $fh, my $buf, 8;
+	my $buf = '';
+	my $n = sysread $fh, $buf, 8;
 	close $fh;
+
+	if ( !defined $n ) {
+		return if $silent;
+		die "Cannot read $file: $!\n";
+	}
 
 	return _content_type(\$buf, @_);
 }
@@ -426,7 +466,7 @@ sub _content_type {
 
 	my $ct;
 
-	my $magic = substr $$dataref, 0, 8;
+	my $magic = (defined $dataref && defined $$dataref) ? substr($$dataref, 0, 8) : '';
 	if ( $magic =~ /^\x89PNG\x0d\x0a\x1a\x0a/ ) {
 		$ct = 'png';
 	}
@@ -455,24 +495,53 @@ sub _content_type {
 sub _slurp {
 	my $file = shift;
 	my $offset = shift;
-	my $data;
+	my $data = '';
 
-	open my $fh, '<', $file or die "Cannot open $file";
+	open my $fh, '<', $file or die "Cannot open $file: $!\n";
 	binmode $fh;
 
 	if ( defined $offset ) {
 		my $length = shift;
+		die "Invalid slurp length\n" if !defined $length || $length < 0;
+		die "Image data exceeds maximum allowed size ($length bytes)\n" if $length > MAX_SLURP_BYTES;
+
 		# Read only a portion of the file
-		sysseek $fh, $offset, 0;
-		while ( $length ) {
-			my $n = sysread $fh, my $buf, $length > 4096 ? 4096 : $length;
+		defined sysseek($fh, $offset, 0) or die "Cannot seek in $file: $!\n";
+		while ( $length > 0 ) {
+			my $chunk = $length > 65536 ? 65536 : $length;
+			my $n = sysread $fh, my $buf, $chunk;
+			if ( !defined $n ) {
+				next if $!{EINTR};
+				die "Cannot read $file: $!\n";
+			}
+			last if $n <= 0;
 			$data .= $buf;
 			$length -= $n;
 		}
 	}
 	else {
-		# Read entire file
-		$data = do { local $/; <$fh> };
+		my $size = -s $fh;
+		if ( defined $size && $size > MAX_SLURP_BYTES ) {
+			close $fh;
+			die "File $file exceeds maximum allowed size ($size bytes)\n";
+		}
+
+		# Read entire file up to MAX_SLURP_BYTES
+		my $total = 0;
+		while (1) {
+			my $n = sysread $fh, my $buf, 65536;
+			if ( !defined $n ) {
+				next if $!{EINTR};
+				die "Cannot read $file: $!\n";
+			}
+			last if $n <= 0;
+			$total += $n;
+			if ( $total > MAX_SLURP_BYTES ) {
+				close $fh;
+				die "File $file exceeds maximum allowed size\n";
+			}
+			$data .= $buf;
+		}
 	}
 
 	close $fh;
@@ -490,17 +559,20 @@ sub gdresize {
 
 	$debug       = $args{debug};
 
+	if ( !$spec || !@$spec ) {
+		die "Invalid spec: missing\n";
+	}
+
 	if ( @$spec > 1 ) {
 		# Resize in series
 
 		# Construct spec hashes
 		my $specs = [];
 		for my $s ( @$spec ) {
-			my ($width, $height, $mode) = $s =~ /^([^x]+)x([^_]+)_(\w)$/;
+			my ($width, $height, $mode) = defined($s) ? ($s =~ /^([0-9X]+)x([0-9X]+)_([mpoF])$/) : ();
 
 			if ( !$width || !$height || !$mode ) {
-				warn "Invalid spec: $s\n";
-				next;
+				die "Invalid spec: " . (defined $s ? $s : '<undef>') . "\n";
 			}
 
 			push @{$specs}, {
@@ -538,9 +610,16 @@ sub gdresize {
 				_cache( $cache, $key, $s->[0], $file, $s->[1] );
 			}
 		}
+
+		return wantarray ? ($series->[0][0], $series->[0][1]) : $series;
 	}
 	else {
-		my ($width, $height, $mode, $bgcolor, $ext) = $spec->[0] =~ /^(?:([0-9X]+)x([0-9X]+))?(?:_(\w))?(?:_([\da-fA-F]+))?(?:\.(\w+))?$/;
+		my $raw_spec = defined $spec->[0] ? $spec->[0] : '';
+		die "Invalid spec: empty\n" unless length $raw_spec;
+
+		my ($width, $height, $mode, $bgcolor, $ext) = $raw_spec =~ /^(?:([0-9X]+)x([0-9X]+))?(?:_([mpoF]))?(?:_([\da-fA-F]{6}|[\da-fA-F]{8}))?(?:\.(png|jpe?g))?$/i;
+		die "Invalid spec: $raw_spec\n"
+			unless defined $width || defined $height || defined $mode || defined $bgcolor || defined $ext;
 
 		# XXX If cache is available, pull pre-cached size values from cache
 		# to see if we can use a smaller version of this image than the source

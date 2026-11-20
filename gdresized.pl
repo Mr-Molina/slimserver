@@ -10,17 +10,19 @@ use strict;
 use FindBin qw($Bin);
 use lib $Bin;
 
-use constant RESIZER      => 1;
-use constant SLIM_SERVICE => 0;
-use constant PERFMON      => 0;
-use constant SCANNER      => 0;
-use constant ISWINDOWS    => ( $^O =~ /^m?s?win/i ) ? 1 : 0;
-use constant DEBUG        => ( grep { /--debug/ } @ARGV ) ? 1 : 0;
-use constant DEBUGLOG     => DEBUG;
-use constant INFOLOG      => 0;
-use constant SOCKET_PATH  => '/tmp/sbs_artwork';
-use constant LOCALFILE    => 0;
-use constant NOMYSB       => 1;
+use constant RESIZER           => 1;
+use constant SLIM_SERVICE      => 0;
+use constant PERFMON           => 0;
+use constant SCANNER           => 0;
+use constant ISWINDOWS         => ( $^O =~ /^m?s?win/i ) ? 1 : 0;
+use constant DEBUG             => ( grep { /--debug/ } @ARGV ) ? 1 : 0;
+use constant DEBUGLOG          => DEBUG;
+use constant INFOLOG           => 0;
+use constant SOCKET_PATH       => '/tmp/sbs_artwork';
+use constant SOCKET_IO_TIMEOUT => 15;
+use constant MAX_FRAME_BYTES   => 32 * 1024 * 1024;
+use constant LOCALFILE         => 0;
+use constant NOMYSB            => 1;
 
 # Copied from Slim::bootstrap to reduce memory overhead of unnecessary stuff
 BEGIN {
@@ -86,11 +88,18 @@ BEGIN {
 	unshift @INC, @SlimINC;
 };
 
+use Cwd qw(realpath);
+use Errno ();
+use File::Basename qw(dirname);
+use File::Spec;
+use File::Temp qw(tempdir);
+use IO::Select;
 use IO::Socket::UNIX;
+use Socket qw(SOL_SOCKET);
+use Time::HiRes ();
+
 use Slim::Utils::ArtworkCache;
 use Slim::Utils::GDResizer;
-
-DEBUG && require Time::HiRes;
 
 our ($faster);
 
@@ -100,45 +109,255 @@ while ($_ = shift @ARGV) {
 	}
 }
 
-# Remove socket if it didn't get cleaned up
-if ( -e SOCKET_PATH ) {
-	unlink SOCKET_PATH || die "Unable to remove old socket";
+sub _inspect_existing_socket {
+	my ($sock_path) = @_;
+	return 'missing' unless lstat($sock_path);
+
+	if (-l _ || !-S _) {
+		die "Refusing to replace non-socket path: $sock_path\n";
+	}
+	if (!-o _) {
+		die "Refusing to replace socket not owned by current user: $sock_path\n";
+	}
+
+	my $probe = IO::Socket::UNIX->new(
+		Type => SOCK_STREAM,
+		Peer => $sock_path,
+	);
+	if ($probe) {
+		close($probe);
+		die "Refusing to replace active socket in use by live peer: $sock_path\n";
+	}
+	if ($!{ENOENT}) {
+		return 'missing';
+	}
+	if ($!{ECONNREFUSED}) {
+		return 'stale';
+	}
+	die "Failed probing existing socket $sock_path: $!\n";
 }
 
-# Open UNIX domain socket
-my $socket = IO::Socket::UNIX->new(
-	Type   => SOCK_STREAM,
-	Local  => SOCKET_PATH,
-	Listen => SOMAXCONN,
-) || die "Unable to open socket: $!";
+sub _bind_owner_only_socket {
+	my ($sock_path) = @_;
+	my $state = _inspect_existing_socket($sock_path);
 
-$SIG{HUP} = 'IGNORE';
+	my $parent = dirname($sock_path);
+	my $stage_dir = tempdir('.gdresized-sock-XXXXXX', DIR => $parent, CLEANUP => 1);
+	chmod(0700, $stage_dir) or die "Failed to secure staging dir $stage_dir: $!\n";
 
+	my $staged_sock = "$stage_dir/s";
+	my $old_umask = umask(0077);
+	my $sock = eval {
+		IO::Socket::UNIX->new(
+			Type   => SOCK_STREAM,
+			Local  => $staged_sock,
+			Listen => SOMAXCONN,
+		);
+	};
+	my $bind_err = $@ || $!;
+	umask($old_umask);
+	$sock || die "Unable to open socket: $bind_err\n";
+
+	chmod(0600, $staged_sock) or die "Failed to set permissions on $staged_sock: $!\n";
+
+	# Re-verify target immediately before publishing
+	$state = _inspect_existing_socket($sock_path);
+	if ($state eq 'missing') {
+		if (!link($staged_sock, $sock_path)) {
+			die "Unable to publish socket $sock_path: $!\n";
+		}
+		unlink($staged_sock);
+	}
+	else {
+		rename($staged_sock, $sock_path) or die "Unable to replace stale socket $sock_path: $!\n";
+	}
+
+	my @st = lstat($sock_path);
+	if (!@st || -l _ || !-S _ || !-o _) {
+		die "Socket validation failed after bind: $sock_path\n";
+	}
+
+	return ($sock, $st[0], $st[1]);
+}
+
+sub _validate_peer {
+	my ($client) = @_;
+	return 1 unless $^O eq 'linux' && Socket->can('SO_PEERCRED');
+	my $so_peercred = eval { Socket::SO_PEERCRED() };
+	return 1 unless defined $so_peercred;
+
+	my $cred = getsockopt($client, SOL_SOCKET, $so_peercred);
+	return 0 unless defined $cred && length($cred) == 12;
+	my ($pid, $uid, $gid) = unpack('i I I', $cred);
+	return (defined $uid && $uid == $> && defined $pid && $pid > 0) ? 1 : 0;
+}
+
+sub _set_socket_timeouts {
+	my ($sock, $secs) = @_;
+	my $tv = eval { pack('l!l!', $secs, 0) };
+	return unless defined $tv;
+	if (Socket->can('SO_RCVTIMEO')) {
+		my $opt = eval { Socket::SO_RCVTIMEO() };
+		setsockopt($sock, SOL_SOCKET, $opt, $tv) if defined $opt;
+	}
+	if (Socket->can('SO_SNDTIMEO')) {
+		my $opt = eval { Socket::SO_SNDTIMEO() };
+		setsockopt($sock, SOL_SOCKET, $opt, $tv) if defined $opt;
+	}
+}
+
+sub _read_frame_with_timeout {
+	my ($client, $timeout_secs) = @_;
+	my $sel = IO::Select->new($client);
+	my $deadline = Time::HiRes::time() + $timeout_secs;
+	my $buf = '';
+
+	while (1) {
+		my $nl = index($buf, "\n");
+		if ($nl >= 0) {
+			return substr($buf, 0, $nl + 1);
+		}
+
+		my $remaining = $deadline - Time::HiRes::time();
+		die "Client read timed out\n" if $remaining <= 0;
+
+		my @ready = $sel->can_read($remaining);
+		die "Client read timed out\n" unless @ready;
+
+		my $n = sysread($client, my $chunk, 65536);
+		if (!defined $n) {
+			next if $!{EINTR};
+			die "Client read failed: $!\n";
+		}
+		if ($n == 0) {
+			die "Malformed frame: unexpected EOF before newline\n";
+		}
+		if (length($buf) + $n > MAX_FRAME_BYTES) {
+			die "Frame exceeds maximum allowed size\n";
+		}
+		$buf .= $chunk;
+	}
+}
+
+sub _write_all_with_timeout {
+	my ($client, $payload, $timeout_secs) = @_;
+	my $sel = IO::Select->new($client);
+	my $deadline = Time::HiRes::time() + $timeout_secs;
+	my $offset = 0;
+	my $len = length($payload);
+
+	while ($offset < $len) {
+		my $remaining = $deadline - Time::HiRes::time();
+		return 0 if $remaining <= 0;
+		my @ready = $sel->can_write($remaining);
+		return 0 unless @ready;
+
+		my $n = syswrite($client, $payload, $len - $offset, $offset);
+		if (!defined $n) {
+			next if $!{EINTR};
+			return 0;
+		}
+		return 0 if $n == 0;
+		$offset += $n;
+	}
+	return 1;
+}
+
+sub _validate_canonical_dir {
+	my ($dir) = @_;
+	die "Invalid cacheroot: undefined\n" unless defined $dir && length $dir;
+	die "Invalid cacheroot: disallowed control characters\n" if $dir =~ /[;\0\r\n?%]/;
+	die "Invalid cacheroot: must be absolute\n" unless File::Spec->file_name_is_absolute($dir);
+	die "Invalid cacheroot: dot-traversal disallowed\n" if $dir =~ m{(?:^|/)\.\.(?:/|$)};
+	die "Invalid cacheroot: does not exist\n" unless lstat($dir);
+	die "Invalid cacheroot: symlink disallowed\n" if -l _;
+	die "Invalid cacheroot: not a directory\n" unless -d _;
+	die "Invalid cacheroot: ownership mismatch\n" unless -o _;
+
+	my $canon = realpath($dir);
+	die "Invalid cacheroot: canonicalize failed\n" unless defined $canon && length $canon;
+	die "Invalid cacheroot: symlink traversal disallowed\n" unless $canon eq $dir;
+	die "Invalid cacheroot: canonical target invalid\n" unless lstat($canon) && !-l _ && -d _ && -o _;
+	return $canon;
+}
+
+sub _validate_canonical_file {
+	my ($path) = @_;
+	die "Invalid input file: undefined\n" unless defined $path && length $path;
+	die "Invalid input file: disallowed control characters\n" if $path =~ /[\0\r\n]/;
+	die "Invalid input file: must be absolute\n" unless File::Spec->file_name_is_absolute($path);
+	die "Invalid input file: dot-traversal disallowed\n" if $path =~ m{(?:^|/)\.\.(?:/|$)};
+	die "Invalid input file: does not exist\n" unless lstat($path);
+	die "Invalid input file: symlink disallowed\n" if -l _;
+	die "Invalid input file: not a regular file\n" unless -f _ && -r _;
+
+	my $canon = realpath($path);
+	die "Invalid input file: canonicalize failed\n" unless defined $canon && length $canon;
+	die "Invalid input file: symlink traversal disallowed\n" unless $canon eq $path;
+	die "Invalid input file: canonical target invalid\n" unless lstat($canon) && !-l _ && -f _ && -r _;
+	return $canon;
+}
+
+my ($socket, $sock_dev, $sock_ino) = _bind_owner_only_socket(SOCKET_PATH);
+
+my $shutdown_requested = 0;
+$SIG{PIPE} = 'IGNORE';
+$SIG{HUP}  = 'IGNORE';
 $SIG{TERM} = $SIG{INT} = $SIG{QUIT} = sub {
-	DEBUG && warn "SIG received, removing " . SOCKET_PATH . "\n";
-	unlink SOCKET_PATH if -e SOCKET_PATH;
-	exit 0;
+	$shutdown_requested = 1;
 };
 
-my $artworkCache = Slim::Utils::ArtworkCache->new('.');
-my $imageProxyCache = Slim::Web::ImageProxy::Cache->new('.');
+# Lazily instantiate cache stores only after validated cacheroot is received (no '.' CWD fallback)
+my ($artworkCache, $imageProxyCache);
 
 DEBUG && warn "$0 listening on " . SOCKET_PATH . "\n";
 
-while (1) {
+my $accept_sel = IO::Select->new($socket);
+
+while (!$shutdown_requested) {
+	my @ready = $accept_sel->can_read(0.5);
+	last if $shutdown_requested;
+	next unless @ready;
+
 	my $client = $socket->accept();
+	if (!$client) {
+		last if $shutdown_requested;
+		next if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK} || $!{ECONNABORTED};
+		warn "accept() failed: $!\n" if DEBUG;
+		last;
+	}
+
+	if (!_validate_peer($client)) {
+		warn "Rejected unauthorized peer on " . SOCKET_PATH . "\n" if DEBUG;
+		close($client);
+		next;
+	}
+
+	_set_socket_timeouts($client, SOCKET_IO_TIMEOUT);
 
 	eval {
 		DEBUG && (my $tv = Time::HiRes::time());
 
-		# get command
-		my $buf = <$client>;
+		my $buf = _read_frame_with_timeout($client, SOCKET_IO_TIMEOUT);
+		$buf =~ s/\r?\n\z// or die "Malformed frame: missing trailing newline\n";
 
-		my ($file, $spec, $cacheroot, $cachekey, $data) = unpack 'Z* Z* Z* Z* Z*', $buf;
+		my @parts = split(/\0/, $buf, 6);
+		if (@parts != 6 || $parts[5] ne '') {
+			die "Malformed frame: expected exactly 5 NUL-terminated fields\n";
+		}
+		my ($file, $spec, $cacheroot, $cachekey, $data) = @parts[0..4];
 
-		if ($data) {
+		for my $f ($file, $spec, $cacheroot, $cachekey, $data) {
+			die "Malformed frame: embedded CR/LF disallowed\n" if $f =~ /[\r\n]/;
+		}
+
+		if (length($data)) {
 			require MIME::Base64;
 			$data = MIME::Base64::decode_base64($data);
+			die "Decoded inline image data is empty\n" unless defined $data && length($data);
+		}
+		elsif ($file eq 'data') {
+			die "Missing inline image data\n";
 		}
 
 		# An empty spec is allowed, this returns the original image
@@ -151,17 +370,31 @@ while (1) {
 			die sprintf("Invalid parameters: file=%s, spec=%s, cacheroot=%s, cachekey=%s, imageproxy=%s, imagedata=%s bytes\n", $file, $spec, $cacheroot, $cachekey, $imageproxy || 0, length($data || ''));
 		}
 
+		my $canon_root = _validate_canonical_dir($cacheroot);
+		my $input_arg  = length($data) ? \$data : _validate_canonical_file($file);
+
 		my @spec = split ',', $spec;
 
-		my $cache = $imageproxy ? $imageProxyCache : $artworkCache;
-		if ( $cache->getRoot() ne $cacheroot ) {
-			$cache->setRoot($cacheroot);
-			$cache->pragma('locking_mode = NORMAL');
+		my $cache;
+		if ($imageproxy) {
+			$imageProxyCache ||= Slim::Web::ImageProxy::Cache->new($canon_root);
+			if ($imageProxyCache->getRoot() ne $canon_root) {
+				$imageProxyCache->setRoot($canon_root);
+			}
+			$cache = $imageProxyCache;
 		}
+		else {
+			$artworkCache ||= Slim::Utils::ArtworkCache->new($canon_root);
+			if ($artworkCache->getRoot() ne $canon_root) {
+				$artworkCache->setRoot($canon_root);
+			}
+			$cache = $artworkCache;
+		}
+		$cache->pragma('locking_mode = NORMAL');
 
 		# do resize
 		Slim::Utils::GDResizer->gdresize(
-			file     => $data ? \$data : $file,
+			file     => $input_arg,
 			debug    => DEBUG,
 			faster   => $faster,
 			cache    => $cache,
@@ -170,14 +403,27 @@ while (1) {
 		);
 
 		# send result
-		print $client "OK\015\012";
+		_write_all_with_timeout($client, "OK\015\012", SOCKET_IO_TIMEOUT)
+			or warn "Failed writing OK response to client\n";
 
 		DEBUG && warn "OK (" . (Time::HiRes::time() - $tv) . " seconds)\n";
 	};
 
 	if ( $@ ) {
-		print $client "Error: $@\015\012";
-		warn "$@\n";
+		my $err = "$@";
+		$err =~ s/[\r\n]+$//;
+		_write_all_with_timeout($client, "Error: $err\015\012", SOCKET_IO_TIMEOUT);
+		warn "$err\n";
+	}
+
+	close($client);
+}
+
+close($socket) if $socket;
+if (defined $sock_dev && defined $sock_ino) {
+	my @st = lstat(SOCKET_PATH);
+	if (@st && !-l _ && -S _ && -o _ && $st[0] == $sock_dev && $st[1] == $sock_ino) {
+		unlink(SOCKET_PATH);
 	}
 }
 

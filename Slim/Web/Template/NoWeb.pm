@@ -8,6 +8,7 @@ package Slim::Web::Template::NoWeb;
 # version 2.
 
 use strict;
+use Cwd ();
 use FileHandle ();
 use File::Spec::Functions qw(catdir);
 
@@ -51,9 +52,11 @@ sub addTemplateDirectory {
 
 sub isaSkin {
 	my $class = shift;
-	my $name  = uc shift;
+	my $name  = uc(shift // '');
 
-	return $name =~ /^(?:DEFAULT|EN)$/;
+	return 'Default' if $name eq 'DEFAULT';
+	return 'EN'      if $name eq 'EN';
+	return 0;
 }
 
 sub _generateContentFromFile {
@@ -106,25 +109,29 @@ sub _getFileContent {
 
 	my ($content, $template, $mtime, $inode, $size);
 
+	return if !defined $path || $path eq '' || $path =~ /\0|%2e|\.\./i;
+
 	if ( $path !~ $absolutePathRegex  ) {
 		# Fixup relative paths according to skin
 		$path = $class->fixHttpPath($skin, $path) || return;
 	}
 
+	return unless -f $path && -r _;
+
 	main::INFOLOG && $log->is_info && $log->info("Reading http file for ($path)");
 
 	if ( $statOnly ) {
-		($inode, $size, $mtime) = (stat($path))[1,7,9];
+		($inode, $size, $mtime) = (stat(_))[1,7,9];
 		return (\$content, $mtime, $inode, $size);
 	}
 
 	if ( $contentAsFh ) {
-		my $fh = FileHandle->new($path);
+		my $fh = FileHandle->new($path, 'r') || return;
 		binmode $fh if $binary;
 		return $fh;
 	}
 
-	open($template, $path);
+	open($template, '<', $path);
 
 	if ($template) {
 		($inode, $size, $mtime) = (stat($template))[1,7,9];
@@ -154,35 +161,39 @@ sub _getFileContent {
 sub fixHttpPath {
 	my ($class, $skin, $path) = @_;
 
+	return undef if !defined $path || $path eq '' || $path =~ /\0|%2e|\.\./i;
+
 	my $skindirs = $class->_getSkinDirs($skin);
 
-	my $lang = lc($prefs->get('language'));
+	my $lang = lc($prefs->get('language') // 'en');
+	my $sep  = main::ISWINDOWS ? qr{[\\/]} : qr{/};
 
 	for my $dir (@{$skindirs}) {
 
-		my $fullpath = catdir($dir, $path);
+		my $canonDir = Cwd::abs_path($dir);
+		next unless defined $canonDir;
+		$canonDir =~ s{[\\/]+$}{};
+
+		my $fullpath = catdir($canonDir, $path);
 
 		# We can have $file.$language files that need to be processed.
 		my $langpath = join('.', $fullpath, $lang);
 		my $found    = '';
 
-		if ($lang ne 'en' && -f $langpath) {
+		if ($lang ne 'en' && -f $langpath && -r _) {
 
 			$found = $langpath;
 
-		} elsif (-r $fullpath) {
+		} elsif (-f $fullpath && -r _) {
 
 			$found = $fullpath;
 		}
 
-		# bug 17841 - don't allow directory traversal, ignore requests to files outside the HTML base directories
-		if ($found && $found =~ /\.\./) {
-			# we probably don't use Cwd anywhere else
-			require Cwd;
+		# Always canonicalize via abs_path and enforce separator-bounded directory containment
+		if ($found) {
 			$found = Cwd::abs_path($found);
 
-			# reset path if it's outside the skin path ($dir)
-			if ($found !~ m|^$dir|) {
+			if (!$found || $found !~ m{^\Q$canonDir\E$sep} || !-f $found || !-r _) {
 				$found = '';
 			}
 		}
@@ -201,20 +212,25 @@ sub fixHttpPath {
 }
 
 sub _getSkinDirs {
-	my ($class) = @_;
+	my ($class, $skin) = @_;
 
-	return $class->{skinDirs} if $class->{skinDirs};
+	$skin = 'Default' unless defined $skin && $skin =~ /^[A-Za-z0-9_-]+$/;
+	my $cacheKey = uc($skin);
 
+	return $class->{skinDirs}->{$cacheKey} if $class->{skinDirs} && $class->{skinDirs}->{$cacheKey};
+
+	my %seen;
+	my @skins = grep { !$seen{uc($_)}++ } ($skin, 'Default', 'EN');
 	my @dirs = ();
-	foreach my $skin ('Default', 'EN') {
+	foreach my $s (@skins) {
 		foreach ( @{ $class->{templateDirs} } ) {
-			push @dirs, catdir($_, $skin);
+			push @dirs, catdir($_, $s);
 		}
 	}
 
-	$class->{skinDirs} = \@dirs;
+	$class->{skinDirs}->{$cacheKey} = \@dirs;
 
-	return $class->{skinDirs};
+	return $class->{skinDirs}->{$cacheKey};
 }
 
 1;

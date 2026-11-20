@@ -72,11 +72,11 @@ original artwork is of considerable size, where the bandwidth to download the im
 =cut
 
 use strict;
-use HTTP::Status qw(
-	RC_MOVED_PERMANENTLY
-);
+use Cwd ();
 use Image::Scale;
+use Socket qw(AF_INET AF_INET6 SOCK_STREAM getaddrinfo unpack_sockaddr_in unpack_sockaddr_in6);
 use Tie::RegexpHash;
+use URI ();
 use URI::Escape qw(uri_escape_utf8);
 
 use Exporter::Lite;
@@ -93,6 +93,8 @@ tie my %handlers, 'Tie::RegexpHash';
 my %externalHandlers;
 
 use constant ONE_YEAR => 86400 * 365;
+use constant MAX_FETCH_BYTES => 16 * 1024 * 1024;
+use constant MAX_REDIRECTS   => 5;
 use constant ACCEPT_IMAGE_FORMATS => 'image/jpeg,image/png;q=0.9' . (Image::Scale->gif_version() ? ',image/gif;q=0.1' : '');
 use constant REDIRECT_IMAGE_TO_COMPATIBLE => 'https://api.lms-community.org/img/compatible/';
 
@@ -101,6 +103,85 @@ my $prefs = preferences('server');
 my $cache;
 
 my %queue;
+
+sub _isBlockedIpv4 {
+	my ($ip4) = @_;
+	return 1 unless defined $ip4 && length($ip4) == 4;
+
+	my @b = unpack('C4', $ip4);
+	return 1 if $b[0] == 0;                                    # 0.0.0.0/8 (unspecified)
+	return 1 if $b[0] == 10;                                   # 10.0.0.0/8 (RFC1918)
+	return 1 if $b[0] == 100 && $b[1] >= 64 && $b[1] <= 127;   # 100.64.0.0/10 (CGNAT)
+	return 1 if $b[0] == 127;                                  # 127.0.0.0/8 (loopback)
+	return 1 if $b[0] == 169 && $b[1] == 254;                  # 169.254.0.0/16 (link-local)
+	return 1 if $b[0] == 172 && $b[1] >= 16 && $b[1] <= 31;    # 172.16.0.0/12 (RFC1918)
+	return 1 if $b[0] == 192 && $b[1] == 168;                  # 192.168.0.0/16 (RFC1918)
+	return 1 if $b[0] >= 224;                                  # 224.0.0.0/4 (multicast) & 240.0.0.0/4 (reserved)
+
+	return 0;
+}
+
+sub _isBlockedIpv6 {
+	my ($ip6) = @_;
+	return 1 unless defined $ip6 && length($ip6) == 16;
+
+	return 1 if $ip6 eq ("\x00" x 16);                                       # ::/128 (unspecified)
+	return 1 if $ip6 eq (("\x00" x 15) . "\x01");                            # ::1/128 (loopback)
+	return 1 if substr($ip6, 0, 12) eq (("\x00" x 10) . "\xff\xff");         # ::ffff:0:0/96 (IPv4-mapped)
+	if (substr($ip6, 0, 12) eq ("\x00" x 12)) {                              # ::/96 (IPv4-compatible)
+		return 1 if _isBlockedIpv4(substr($ip6, 12, 4));
+	}
+
+	my $b0 = ord(substr($ip6, 0, 1));
+	my $b1 = ord(substr($ip6, 1, 1));
+	return 1 if ($b0 & 0xfe) == 0xfc;                                        # fc00::/7 (ULA)
+	return 1 if $b0 == 0xfe && ($b1 & 0xc0) == 0x80;                         # fe80::/10 (link-local)
+	return 1 if $b0 == 0xff;                                                 # ff00::/8 (multicast)
+
+	return 0;
+}
+
+sub _validateExternalHttpUrl {
+	my $url = (@_ > 1 && defined $_[0] && $_[0] eq __PACKAGE__) ? $_[1] : $_[0];
+
+	return 0 unless defined $url && !ref($url) && length($url);
+	return 0 if $url =~ /[\r\n\0\x00-\x1f\x7f]/;
+	return 0 unless $url =~ m{^https?://}i;
+
+	my $uri = eval { URI->new($url) };
+	return 0 unless $uri;
+
+	my $scheme = lc($uri->scheme // '');
+	return 0 unless $scheme eq 'http' || $scheme eq 'https';
+
+	my $auth = eval { $uri->authority };
+	return 0 unless defined $auth && length($auth);
+	return 0 if defined($uri->userinfo) || $auth =~ /\@/;
+
+	my $host = eval { $uri->host };
+	return 0 unless defined $host && length($host);
+	$host =~ s/^\[(.*)\]$/$1/;
+	return 0 if $host =~ /^(?:localhost(?:\.localdomain)?|.*\.localhost)\.?$/i;
+
+	my ($err, @res) = getaddrinfo($host, undef, { socktype => SOCK_STREAM });
+	return 0 if $err || !@res;
+
+	for my $r (@res) {
+		if ($r->{family} == AF_INET) {
+			my (undef, $ip4) = unpack_sockaddr_in($r->{addr});
+			return 0 if _isBlockedIpv4($ip4);
+		}
+		elsif ($r->{family} == AF_INET6) {
+			my (undef, $ip6) = unpack_sockaddr_in6($r->{addr});
+			return 0 if _isBlockedIpv6($ip6);
+		}
+		else {
+			return 0;
+		}
+	}
+
+	return 1;
+}
 
 sub init {
 	$cache ||= Slim::Web::ImageProxy::Cache->new();
@@ -114,7 +195,14 @@ sub init {
 sub getImage {
 	my ($class, $client, $path, $params, $callback, $spec, @args) = @_;
 
-	main::DEBUGLOG && $log->debug("Get artwork for URL: $path");
+	main::DEBUGLOG && $log->debug("Get artwork for URL: " . (defined $path ? $path : '<undef>'));
+
+	if ( !defined $path || $path =~ /[\r\n\0]/ ) {
+		main::INFOLOG && $log->info("Artwork ID not found, returning 404");
+
+		_artworkError( $client, $params, $spec, 404, $callback, @args );
+		return;
+	}
 
 	# check the cache for this url
 	$cache ||= Slim::Web::ImageProxy::Cache->new();
@@ -122,8 +210,11 @@ sub getImage {
 	my $path2;
 
 	# some clients require the .png ending, but we don't store it in the cache - try them both
-	if ($path =~ /(.*)\.png$/) {
+	if ($path =~ /(.*)\.png$/i) {
 		$path2 = $1;
+	}
+	elsif ($path !~ /\.(?:jpe?g|gif|bmp)$/i) {
+		$path2 = "$path.png";
 	}
 
 	if ( my $cached = $cache->get($path) || ($path2 && $cache->get($path2)) ) {
@@ -136,9 +227,9 @@ sub getImage {
 		return;
 	}
 
-	my ($url) = $path =~ m|imageproxy/(.*)/[^/]*|;
+	my ($url) = $path =~ m|imageproxy/(.*)/[^/]*|s;
 
-	if ( !$url ) {
+	if ( !$url || $url =~ /[\r\n\0]/ ) {
 		main::INFOLOG && $log->info("Artwork ID not found, returning 404");
 
 		_artworkError( $client, $params, $spec, 404, $callback, @args );
@@ -146,25 +237,27 @@ sub getImage {
 	}
 
 	my $handler = $class->getHandlerFor($url);
-	if (!$handler && ($url =~ /\.svg$/ || ($spec =~ /^\.(?:png|jpe?g)/i && $url =~ /^https?/))) {
-		main::INFOLOG && $log->is_info && $log->info("No resizing requested - redirect to original URI: $url");
+	if (!$handler && $url =~ /\.svg(?:[?#].*)?$/is) {
+		main::INFOLOG && $log->is_info && $log->info("Blocking SVG image proxy request: $url");
 
-		my $response = $args[1];
-		$response->code(RC_MOVED_PERMANENTLY);
-		$response->header('Location' => $url);
-
-		$callback->($client, $params, '', @args);
-
+		_artworkError( $client, $params, $spec, 404, $callback, @args );
 		return;
 	}
 
 	my $handleProxiedUrl = sub {
-		my $url = shift;
+		my ($url, $from_handler) = @_;
 
-		if ( !$url || $url !~ /^(?:file|https?):/i ) {
+		if ( !$url || $url =~ /[\r\n\0]/ || $url !~ /^(?:file|https?):/i ) {
 			main::INFOLOG && $log->info("No artwork found, returning 404");
 
 			_artworkError( $client, $params, $spec, 404, $callback, @args );
+			return;
+		}
+
+		if ( $url =~ /^file:/i && !$from_handler ) {
+			$log->warn("Denied direct file: URI request in ImageProxy: $url");
+
+			_artworkError( $client, $params, $spec, 403, $callback, @args );
 			return;
 		}
 
@@ -176,33 +269,49 @@ sub getImage {
 			'User-Agent' => Slim::Utils::Misc::userAgentString('legacy')
 		);
 
-		# use external image proxy if one is defined
-		if ( $url =~ /^https?:/ && $spec && $spec !~ /^\.(png|jpe?g)/i && (my $imageproxy = $prefs->get('useLocalImageproxy')) ) {
-			if ( my $external = $externalHandlers{$imageproxy} ) {
-				my ($host, $port, $path, $user, $pass) = Slim::Utils::Misc::crackURL($url);
+		if ( $url =~ /^https?:/i ) {
+			if ( !_validateExternalHttpUrl($url) ) {
+				$log->warn("Blocked disallowed ImageProxy URL: $url");
+				_artworkError( $client, $params, $spec, 403, $callback, @args );
+				return;
+			}
 
-				if ( $external->{func} && !($host && (Slim::Utils::Network::ip_is_private($host) || $host =~ /localhost/i)) ) {
-					my ($url2, $header) = $external->{func}->(uri_escape_utf8($url), $spec);
+			# use external image proxy if one is defined
+			if ( $spec && $spec !~ /^\.(png|jpe?g)/i && (my $imageproxy = $prefs->get('useLocalImageproxy')) ) {
+				if ( my $external = $externalHandlers{$imageproxy} ) {
+					if ( $external->{func} ) {
+						my ($url2, $header) = $external->{func}->(uri_escape_utf8($url), $spec);
 
-					if ($url2) {
-						$url = $url2;
+						if ($url2) {
+							if ( !_validateExternalHttpUrl($url2) ) {
+								$log->warn("Blocked disallowed external image proxy URL: $url2");
+								_artworkError( $client, $params, $spec, 403, $callback, @args );
+								return;
+							}
+							$url = $url2;
 
-						# parse header and add it to the request
-						if ($header =~ /(.*?):\s*(.*)/) {
-							$headers{$1} = $2;
+							# parse header and add it to the request
+							if ($header && $header !~ /[\r\n\0]/ && $header =~ /(.*?):\s*(.*)/) {
+								$headers{$1} = $2;
+							}
 						}
-					}
-					$pre_shrunk = 1;
+						$pre_shrunk = 1;
 
-					main::DEBUGLOG && $log->debug("Using custom image proxy: $url");
+						main::DEBUGLOG && $log->debug("Using custom image proxy: $url");
+					}
 				}
 			}
-		}
 
-		if (!$pre_shrunk && $url =~ /^https?:.*\.webp(?:$|\?)/i) {
-			main::DEBUGLOG && $log->debug("Redirect WEBP images to JPEG conversion service");
-			$url = urlToCloudResizer($url);
-			%headers = (%headers, Slim::Utils::Misc::apiHeaders(__PACKAGE__));
+			if (!$pre_shrunk && $url =~ /^https?:.*\.webp(?:$|\?)/i) {
+				main::DEBUGLOG && $log->debug("Redirect WEBP images to JPEG conversion service");
+				$url = urlToCloudResizer($url);
+				%headers = (%headers, Slim::Utils::Misc::apiHeaders(__PACKAGE__));
+				if ( !_validateExternalHttpUrl($url) ) {
+					$log->warn("Blocked disallowed cloud resizer URL: $url");
+					_artworkError( $client, $params, $spec, 403, $callback, @args );
+					return;
+				}
+			}
 		}
 
 		$queue{$url} ||= [];
@@ -219,105 +328,60 @@ sub getImage {
 			pre_shrunk => $pre_shrunk,
 		};
 
-		if ( $url =~ /^file:/ ) {
-			my $path = Slim::Utils::Misc::pathFromFileURL($url);
-			_resizeFromFile($url, $path);
+		if ( $url =~ /^file:/i ) {
+			my $file_path = Slim::Utils::Misc::pathFromFileURL($url);
+			_resizeFromFile($url, $file_path);
 		}
-		elsif ( $url =~ /^https?:/ ) {
+		elsif ( $url =~ /^https?:/i ) {
 			# no need to do the http request if we're already fetching it
 			return if scalar @{ $queue{$url} } > 1;
 
-			Slim::Networking::SimpleAsyncHTTP->new(
-				\&_gotArtwork,
-				\&_gotArtworkError,
-				{
-					timeout => 30,
-					cache   => 1,
-				},
-			)->get( $url, %headers );
+			_fetchExternalUrl($url, $url, undef, 0, \%headers);
 		}
 	};
 
 	# some plugin might have registered to deal with this image URL
 	if ($handler) {
-		$url = $handler->($url, $spec, $handleProxiedUrl);
+		$url = $handler->($url, $spec, sub {
+			$handleProxiedUrl->($_[0], 1);
+		});
 		return unless defined $url;
-	}
-
-	$handleProxiedUrl->($url);
-}
-
-sub _gotArtwork {
-	my $http = shift;
-	my $url  = $http->url;
-	my $params = $http->params || {};
-
-	if (main::DEBUGLOG && $log->is_debug) {
-		$log->debug('Received artwork of type ' . $http->headers->content_type . ' and ' . ($http->headers->content_length || length(${$http->contentRef})) . ' bytes length' );
-	}
-
-	# shortcut if we received an error message back
-	if ($http->headers->content_type =~ /text/) {
-		# Content-Type might be incorrectly set - try to guess from magic bytes
-		require Slim::Utils::GDResizer;
-		my $filetype = Slim::Utils::GDResizer::_content_type($http->contentRef, 1);
-
-		if ($filetype) {
-			main::INFOLOG && $log->is_info && $log->info("File type actually seems to be '$filetype', rather than " . $http->headers->content_type);
-		}
-		else {
-			return _gotArtworkError($http);
-		}
-	}
-	elsif ($http->headers->content_type =~ /webp/) {
-		if ($params->{originalUrl}) {
-			# external image proxy already did the resizing
-			$log->error("WEBP images are not supported, returning 500");
-			return _gotArtworkError($http);
-		}
-
-		main::INFOLOG && $log->is_info && $log->info("WEBP images are not supported, try to convert to JPG");
-		Slim::Networking::SimpleAsyncHTTP->new(
-			\&_gotArtwork,
-			\&_gotArtworkError,
-			{
-				timeout => 30,
-				cache   => 1,
-				originalUrl => $url,
-			},
-		)->get(urlToCloudResizer($url),
-			'Accept' => ACCEPT_IMAGE_FORMATS,
-			Slim::Utils::Misc::apiHeaders(__PACKAGE__)
-		);
-
+		$handleProxiedUrl->($url, 1);
 		return;
 	}
 
-	_resizeFromFile($params->{originalUrl} || $url, $http->contentRef, $http);
+	$handleProxiedUrl->($url, 0);
 }
 
-sub _gotArtworkError {
-	my $http = shift;
-	my $url  = $http->url;
+sub _fetchExternalUrl {
+	my ($fetch_url, $queue_url, $original_url, $redirect_count, $headers_ref) = @_;
 
-	my $error = 404;
-
-	if ($http->headers && $http->headers->content_type =~ /text/) {
-		$error = 500;
-		main::INFOLOG && $log->is_info && $log->info("Server returned error: " . $http->content);
-	}
-	elsif ($http->error && $http->error =~ /(\d{3})/) {
-		$error = $1;
-		main::INFOLOG && $log->is_info && $log->info("Server returned error: " . $http->error);
-	}
-	elsif (main::INFOLOG && $log->is_info) {
-		$log->info("Unexpected failure fetching $url: " . $http->error);
+	if ( !_validateExternalHttpUrl($fetch_url) ) {
+		$log->warn("Blocked disallowed ImageProxy HTTP URL: " . (defined $fetch_url ? $fetch_url : '<undef>'));
+		_drainQueueError($queue_url, 403);
+		return;
 	}
 
-	# File does not exist, return error
-	main::INFOLOG && $log->info("Artwork not found, returning $error: " . $url);
+	my %headers = $headers_ref ? %$headers_ref : ();
+	Slim::Networking::SimpleAsyncHTTP->new(
+		\&_gotArtwork,
+		\&_gotArtworkError,
+		{
+			timeout        => 30,
+			cache          => 1,
+			maxRedirect    => 0,
+			queueUrl       => $queue_url,
+			originalUrl    => $original_url,
+			redirectCount  => $redirect_count || 0,
+			requestHeaders => \%headers,
+		},
+	)->get( $fetch_url, %headers );
+}
 
-	while ( my $item = shift @{ $queue{$url} }) {
+sub _drainQueueError {
+	my ($queue_url, $error) = @_;
+
+	while ( my $item = shift @{ $queue{$queue_url} } ) {
 		my $client   = $item->{client};
 		my $spec     = $item->{spec};
 		my $args     = $item->{args};
@@ -327,13 +391,147 @@ sub _gotArtworkError {
 		_artworkError( $client, $params, $spec, $error, $callback, @$args );
 	}
 
-	delete $queue{$url};
+	delete $queue{$queue_url};
+}
+
+sub _handleRedirect {
+	my ($http, $res, $queue_url) = @_;
+
+	my $params         = $http->params || {};
+	my $redirect_count = $params->{redirectCount} || 0;
+	my $code = ($res && $res->can('code') && $res->code)
+		? $res->code
+		: ($http && $http->can('code') ? $http->code : undef);
+	return 0 unless $code && $code =~ /^30[12378]$/;
+
+	my $location = $res
+		? ($res->can('header')
+			? $res->header('Location')
+			: ($res->can('headers') && $res->headers && $res->headers->can('header')
+				? $res->headers->header('Location')
+				: undef))
+		: undef;
+
+	return 0 unless $location && $redirect_count < MAX_REDIRECTS;
+	return 0 if $location =~ /[\r\n\0]/;
+
+	my $next_url = eval { URI->new_abs($location, $http->url)->as_string };
+	return 0 unless $next_url && _validateExternalHttpUrl($next_url);
+
+	_fetchExternalUrl(
+		$next_url,
+		$queue_url,
+		$params->{originalUrl},
+		$redirect_count + 1,
+		$params->{requestHeaders},
+	);
+	return 1;
+}
+
+sub _gotArtwork {
+	my $http = shift;
+	my $url  = $http->url;
+	my $params = $http->params || {};
+	my $queue_url = $params->{queueUrl} || $params->{originalUrl} || $url;
+
+	my $code = $http->can('code') ? $http->code : undef;
+	if ( $code && $code =~ /^30[12378]$/ ) {
+		return if _handleRedirect($http, $http, $queue_url);
+		_drainQueueError($queue_url, 403);
+		return;
+	}
+
+	my $content_ref = $http->contentRef;
+	if ( ref($content_ref) eq 'SCALAR' && defined($$content_ref) && length($$content_ref) > MAX_FETCH_BYTES ) {
+		$log->warn("ImageProxy payload exceeds MAX_FETCH_BYTES for $url");
+		_drainQueueError($queue_url, 500);
+		return;
+	}
+
+	if (main::DEBUGLOG && $log->is_debug) {
+		$log->debug('Received artwork of type ' . ($http->headers ? $http->headers->content_type : '') . ' and ' . (($http->headers && $http->headers->content_length) || length(${$content_ref})) . ' bytes length' );
+	}
+
+	my $ct_header = ($http->headers && $http->headers->content_type) ? $http->headers->content_type : '';
+	my $is_webp = ($ct_header =~ /webp/i)
+		|| (ref($content_ref) eq 'SCALAR' && defined($$content_ref) && length($$content_ref) >= 12 && substr($$content_ref, 0, 12) =~ /^RIFF.{4}WEBP/s);
+
+	if ( $is_webp ) {
+		if ($params->{originalUrl}) {
+			# external image proxy already did the resizing
+			$log->error("WEBP images are not supported, returning 500");
+			return _gotArtworkError($http);
+		}
+
+		main::INFOLOG && $log->is_info && $log->info("WEBP images are not supported, try to convert to JPG");
+		my $cloud_url = urlToCloudResizer($url);
+		my %cloud_headers = (
+			'Accept' => ACCEPT_IMAGE_FORMATS,
+			Slim::Utils::Misc::apiHeaders(__PACKAGE__),
+		);
+		_fetchExternalUrl($cloud_url, $queue_url, $queue_url, 0, \%cloud_headers);
+		return;
+	}
+
+	# Always sniff magic bytes via GDResizer::_content_type
+	require Slim::Utils::GDResizer;
+	my $filetype = Slim::Utils::GDResizer::_content_type($content_ref, 1);
+	if ( !$filetype ) {
+		main::INFOLOG && $log->is_info && $log->info("Invalid or unsupported image magic bytes from $url (Content-Type: $ct_header)");
+		return _gotArtworkError($http);
+	}
+
+	if ( $ct_header =~ /text/i ) {
+		main::INFOLOG && $log->is_info && $log->info("File type actually seems to be '$filetype', rather than $ct_header");
+	}
+
+	_resizeFromFile($queue_url, $content_ref, $http, $filetype);
+}
+
+sub _gotArtworkError {
+	my ($http, $err_msg, $res) = @_;
+	my $url       = $http->url;
+	my $params    = $http->params || {};
+	my $queue_url = $params->{queueUrl} || $params->{originalUrl} || $url;
+
+	my $code = ($res && $res->can('code') && $res->code)
+		? $res->code
+		: ($http && $http->can('code') ? $http->code : undef);
+	if ( $code && $code =~ /^30[12378]$/ ) {
+		return if _handleRedirect($http, $res || $http, $queue_url);
+		_drainQueueError($queue_url, 403);
+		return;
+	}
+
+	my $error = 404;
+
+	if ($http->headers && ($http->headers->content_type || '') =~ /text/i) {
+		$error = 500;
+		main::INFOLOG && $log->is_info && $log->info("Server returned error: " . $http->content);
+	}
+	elsif ($http->error && $http->error =~ /(\d{3})/) {
+		$error = $1;
+		main::INFOLOG && $log->is_info && $log->info("Server returned error: " . $http->error);
+	}
+	elsif (main::INFOLOG && $log->is_info) {
+		$log->info("Unexpected failure fetching $url: " . ($http->error // ''));
+	}
+
+	# File does not exist, return error
+	main::INFOLOG && $log->info("Artwork not found, returning $error: " . $url);
+
+	_drainQueueError($queue_url, $error);
 }
 
 sub _resizeFromFile {
-	my ($url, $fullpath, $http) = @_;
+	my ($url, $fullpath, $http, $sniffed_type) = @_;
 
 	$cache ||= Slim::Web::ImageProxy::Cache->new();
+
+	if ( !$sniffed_type && ref($fullpath) eq 'SCALAR' ) {
+		require Slim::Utils::GDResizer;
+		$sniffed_type = Slim::Utils::GDResizer::_content_type($fullpath, 1);
+	}
 
 	while ( my $item = shift @{ $queue{$url} }) {
 		my $client   = $item->{client};
@@ -344,11 +542,10 @@ sub _resizeFromFile {
 		my $cachekey = $item->{cachekey};
 
 		# no need to resize data if we've got it from an external image proxy
-		if ( ($spec =~ /^\.(?:png|jpe?g)/i || $item->{pre_shrunk}) && $http && $http->headers->content_type =~ /image\/(png|jpe?g)/ ) {
+		if ( ($spec =~ /^\.(?:png|jpe?g)/i || $item->{pre_shrunk}) && $http && $sniffed_type && $sniffed_type =~ /^(?:png|jpg)$/ ) {
 			main::DEBUGLOG && $log->debug("No resizing required - already resized remotely, or original size requested");
 
-			my $ct = $1;
-			$ct =~ s/jpeg/jpg/;
+			my $ct = $sniffed_type;
 
 			$cache->set( $cachekey, {
 				content_type  => $ct,
@@ -368,7 +565,17 @@ sub _resizeFromFile {
 				# Resized image should now be in cache
 				my $response = $args->[1];
 
-				unlink $fullpath if !ref $fullpath && $fullpath =~ /imgproxy_[a-f0-9]+$/i;
+				if ( !ref $fullpath && $fullpath =~ /(?:^|[\/\\])imgproxy_[a-f0-9]+$/i ) {
+					my $cachedir   = $prefs->get('cachedir');
+					my $real_cache = $cachedir ? Cwd::realpath($cachedir) : undef;
+					my $real_file  = Cwd::realpath($fullpath);
+					if ( $real_cache && $real_file ) {
+						$real_cache =~ s{[\/\\]+$}{};
+						if ( index($real_file, "$real_cache/") == 0 || (main::ISWINDOWS && index(lc($real_file), lc("$real_cache\\")) == 0) ) {
+							unlink $real_file;
+						}
+					}
+				}
 
 				if ( !($body && $format && ref $body eq 'SCALAR') && (my $c = $cache->get($cachekey)) ) {
 					$body = $c->{data_ref};
@@ -381,6 +588,11 @@ sub _resizeFromFile {
 
 					_artworkError( $client, $params, $spec, 500, $callback, @$args );
 					return;
+				}
+
+				if ( $body && ref $body eq 'SCALAR' ) {
+					require Slim::Utils::GDResizer;
+					$format = Slim::Utils::GDResizer::_content_type($body, 1) || $format;
 				}
 
 				if ($body && $format) {
@@ -402,6 +614,7 @@ sub _setHeaders {
 	$ct =~ s/jpg/jpeg/;
 
 	$response->content_type($ct);
+	$response->header( 'X-Content-Type-Options' => 'nosniff' );
 	$response->header( 'Cache-Control' => 'max-age=' . ONE_YEAR );
 	$response->expires( time() + ONE_YEAR );
 }
@@ -412,20 +625,26 @@ sub _artworkError {
 	my $response = $args[1];
 
 	my ($width, $height, $mode, $bgcolor, $ext) = Slim::Web::Graphics->parseSpec($spec);
+	my $skin = ($params && defined $params->{'skinOverride'} && $params->{'skinOverride'} =~ /^[A-Za-z0-9_-]+$/)
+		? $params->{'skinOverride'}
+		: $prefs->get('skin');
 
 	require Slim::Utils::GDResizer;
 	my ($res, $format) = Slim::Utils::GDResizer->resize(
-		file   => Slim::Web::HTTP::fixHttpPath($params->{'skinOverride'} || $prefs->get('skin'), 'html/images/radio.png'),
+		file   => Slim::Web::HTTP::fixHttpPath($skin, 'html/images/radio.png'),
 		width  => $width,
 		height => $height,
 		mode   => $mode,
 	);
 
+	my $sniffed = (ref $res eq 'SCALAR') ? Slim::Utils::GDResizer::_content_type($res, 1) : undef;
+	$format = $sniffed || $format || 'png';
 	my $ct = 'image/' . $format;
 	$ct =~ s/jpg/jpeg/;
 
 	$response->content_type($ct);
-#	$response->code($code);
+	$response->code($code || 404);
+	$response->header( 'X-Content-Type-Options' => 'nosniff' );
 	$response->expires( time() - 1 );
 	$response->header( 'Cache-Control' => 'no-cache' );
 
@@ -444,7 +663,7 @@ sub proxiedImage {
 	my ($url, $force) = @_;
 
 	# only proxy external URLs
-	return $url unless $force || ($url && $url =~ /^https?:/);
+	return $url unless $force || ($url && $url =~ /^https?:/i);
 
 #	main::DEBUGLOG && $log->debug("Use proxied image URL for: $url");
 

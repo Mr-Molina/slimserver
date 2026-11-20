@@ -45,6 +45,7 @@ sub new {
 		) || do {
 
 			logError("Couldn't create listen socket for reader: $!");
+			${*$self}{'pipeline_closed'} = 1;
 			return undef;
 		};
 
@@ -62,6 +63,8 @@ sub new {
 			) || do {
 
 				logError("Couldn't create listen socket for writer: $!");
+				$listenReader->close();
+				${*$self}{'pipeline_closed'} = 1;
 				return undef;
 			};
 
@@ -71,7 +74,25 @@ sub new {
 		$command =~ s/(\\*)"/$1$1\\"/g;
 		$command =~ s/(\\+)$/$1$1/;
 
-		my $newcommand = '"' . Slim::Utils::Misc::findbin('socketwrapper') .  '" ';
+		my $socketwrapper = Slim::Utils::Misc::findbin('socketwrapper');
+		if (!$socketwrapper) {
+			logError("Couldn't find socketwrapper binary");
+			$listenReader->close();
+			$listenWriter->close() if $listenWriter;
+			${*$self}{'pipeline_closed'} = 1;
+			return undef;
+		}
+
+		Slim::bootstrap::tryModuleLoad('Win32::Process');
+		if ($@) {
+			logError("Couldn't load Win32::Process: $@");
+			$listenReader->close();
+			$listenWriter->close() if $listenWriter;
+			${*$self}{'pipeline_closed'} = 1;
+			return undef;
+		}
+
+		my $newcommand = '"' . $socketwrapper . '" ';
 
 		# Bug 15650, Run transcoders with the same priority as the server
 		# XXX this sets the priority of the socketwrapper.exe process but not the actual transcoder process(es).
@@ -100,11 +121,9 @@ sub new {
 
 		my $processObj;
 
-		Slim::bootstrap::tryModuleLoad('Win32::Process');
-
-		if ($@ || !Win32::Process::Create(
+		if (!Win32::Process::Create(
 			$processObj,
-			Slim::Utils::Misc::findbin("socketwrapper"),
+			$socketwrapper,
 			$newcommand,
 			0,
 			$createMode,
@@ -119,6 +138,7 @@ sub new {
 				$listenWriter->close();
 			}
 
+			${*$self}{'pipeline_closed'} = 1;
 			return undef;
 		}
 
@@ -135,23 +155,27 @@ sub new {
 		}
 	}
 	else {
-		$reader = IO::Handle->new();
-		$writer = IO::Handle->new();
+		my ($pids, $pgid);
+		($reader, $writer, $pids, $pgid) = _spawnUnixPipeline($command);
+		if (!defined($reader)) {
+			${*$self}{'pipeline_closed'} = 1;
+			return undef;
+		}
 
-		my @cmd = _splitSimpleCommand($command);
-		my $pid = (@cmd > 1 || (@cmd == 1 && $cmd[0] !~ /[\s"'\\\$`|&;<>(){}*?\[\]~#]/))
-			? open2($reader, $writer, @cmd)
-			: open2($reader, $writer, $command);
-		${*$self}{'pipeline_pid'} = $pid;
+		${*$self}{'pipeline_pids'} = $pids;
+		${*$self}{'pipeline_pgid'} = $pgid;
+		${*$self}{'pipeline_pid'}  = $pids->[-1];
 
 		if (!defined(Slim::Utils::Network::blocking($reader, 0))) {
 
 			logError("Cannot set pipe line reader to nonblocking");
 
-			_reapChild(delete ${*$self}{'pipeline_pid'});
+			_reapChild(delete ${*$self}{'pipeline_pids'}, delete ${*$self}{'pipeline_pgid'});
+			delete ${*$self}{'pipeline_pid'};
 
 			$reader->close();
 			$writer->close();
+			${*$self}{'pipeline_closed'} = 1;
 
 			return undef;
 		}
@@ -160,10 +184,12 @@ sub new {
 
 			logError("Cannot set pipe line writer to nonblocking");
 
-			_reapChild(delete ${*$self}{'pipeline_pid'});
+			_reapChild(delete ${*$self}{'pipeline_pids'}, delete ${*$self}{'pipeline_pgid'});
+			delete ${*$self}{'pipeline_pid'};
 
 			$reader->close();
 			$writer->close();
+			${*$self}{'pipeline_closed'} = 1;
 
 			return undef;
 		}
@@ -187,12 +213,33 @@ sub new {
 	return $self;
 }
 
+sub _closeListener {
+	my ($listener, $pipeline, $key) = @_;
+
+	if (defined $listener) {
+		Slim::Networking::Select::removeRead($listener);
+		Slim::Networking::Select::removeError($listener);
+		${*$listener}{'pipeline'} = undef;
+		$listener->close();
+	}
+
+	if (defined $pipeline && defined $key) {
+		delete ${*$pipeline}{$key};
+	}
+}
+
 sub acceptReader {
 	if (main::ISWINDOWS) {
 		my $listener = shift;
 		my $pipeline = ${*$listener}{'pipeline'};
 
+		if (!defined($pipeline)) {
+			_closeListener($listener);
+			return;
+		}
+
 		my $reader = $listener->accept();
+		_closeListener($listener, $pipeline, 'pipeline_listen_reader');
 
 		if (!defined($reader)) {
 
@@ -207,6 +254,7 @@ sub acceptReader {
 
 			logError("Cannot set pipe line reader to nonblocking");
 
+			$reader->close();
 			${*$pipeline}{'pipeline_error'} = 1;
 
 			return;
@@ -225,7 +273,13 @@ sub acceptWriter {
 		my $listener = shift;
 		my $pipeline = ${*$listener}{'pipeline'};
 
+		if (!defined($pipeline)) {
+			_closeListener($listener);
+			return;
+		}
+
 		my $writer = $listener->accept();
+		_closeListener($listener, $pipeline, 'pipeline_listen_writer');
 
 		if (!defined($writer)) {
 
@@ -240,6 +294,7 @@ sub acceptWriter {
 
 			logError("Cannot set pipe line writer to nonblocking");
 
+			$writer->close();
 			${*$pipeline}{'pipeline_error'} = 1;
 
 			return;
@@ -259,7 +314,20 @@ sub selectError {
 
 	logError("From select on pipeline listeners.");
 
-	${*$pipeline}{'pipeline_error'} = 1;
+	if (defined $pipeline) {
+		my $key;
+		if (defined ${*$pipeline}{'pipeline_listen_reader'} && ${*$pipeline}{'pipeline_listen_reader'} == $listener) {
+			$key = 'pipeline_listen_reader';
+		}
+		elsif (defined ${*$pipeline}{'pipeline_listen_writer'} && ${*$pipeline}{'pipeline_listen_writer'} == $listener) {
+			$key = 'pipeline_listen_writer';
+		}
+		_closeListener($listener, $pipeline, $key);
+		${*$pipeline}{'pipeline_error'} = 1;
+	}
+	else {
+		_closeListener($listener);
+	}
 }
 
 sub sysread {
@@ -270,7 +338,7 @@ sub sysread {
 	my $error = ${*$self}{'pipeline_error'};
 
 	if ($error) {
-		$! = -1;
+		$! = EBADF;
 		return undef;
 	}
 
@@ -345,7 +413,7 @@ sub sysread {
 			${*$self}{'pipeline_pending_size'}   = $pendingSize;
 			${*$self}{'pipeline_pending_offset'} = $pendingOffset;
 
-			if ($! != EWOULDBLOCK) {
+			if ($! != EWOULDBLOCK && $! != EINTR) {
 				return undef;	# reflect error to caller
 			}
 
@@ -380,11 +448,22 @@ sub _splitSimpleCommand {
 
 		my $arg = '';
 		my $in_double = 0;
+		my $in_single = 0;
 
 		while ($i < $len) {
 			$ch = substr($command, $i, 1);
 
-			if ($in_double) {
+			if ($in_single) {
+				if ($ch eq "'") {
+					$in_single = 0;
+					$i++;
+				}
+				else {
+					$arg .= $ch;
+					$i++;
+				}
+			}
+			elsif ($in_double) {
 				if ($ch eq '"') {
 					$in_double = 0;
 					$i++;
@@ -419,7 +498,18 @@ sub _splitSimpleCommand {
 					$in_double = 1;
 					$i++;
 				}
-				elsif ($ch =~ /[\|\&\;\<\>\(\)\{\}\*\?\[\]\~\$\`\'\\\#\r\n]/) {
+				elsif ($ch eq "'") {
+					$in_single = 1;
+					$i++;
+				}
+				elsif ($ch eq '\\') {
+					return () if $i + 1 >= $len;
+					my $next = substr($command, $i + 1, 1);
+					return () if $next eq "\n" || $next eq "\r";
+					$arg .= $next;
+					$i += 2;
+				}
+				elsif ($ch =~ /[\|\&\;\<\>\(\)\{\}\*\?\[\]\~\$\`\#\r\n]/) {
 					return ();
 				}
 				else {
@@ -429,53 +519,281 @@ sub _splitSimpleCommand {
 			}
 		}
 
-		return () if $in_double;
+		return () if $in_double || $in_single;
 		push @args, $arg;
 	}
 
 	return @args;
 }
 
-sub _reapKilledChild {
-	my ($pid, $retries) = @_;
-	return if waitpid($pid, POSIX::WNOHANG()) != 0;
-	return if (${^GLOBAL_PHASE} // '') eq 'DESTRUCT';
-	return if $retries >= 10;
+sub _splitPipelineStages {
+	my $command = shift;
+	return () unless defined $command;
 
-	Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + 0.05, sub {
-		_reapKilledChild($pid, $retries + 1);
+	my @rawStages;
+	my $len = length($command);
+	my $start = 0;
+	my $in_double = 0;
+	my $in_single = 0;
+	my $i = 0;
+
+	while ($i < $len) {
+		my $ch = substr($command, $i, 1);
+
+		if ($in_single) {
+			$in_single = 0 if $ch eq "'";
+			$i++;
+		}
+		elsif ($in_double) {
+			if ($ch eq '\\') {
+				return () if $i + 1 >= $len;
+				$i += 2;
+			}
+			elsif ($ch eq '"') {
+				$in_double = 0;
+				$i++;
+			}
+			else {
+				$i++;
+			}
+		}
+		else {
+			if ($ch eq '\\') {
+				return () if $i + 1 >= $len;
+				$i += 2;
+			}
+			elsif ($ch eq '"') {
+				$in_double = 1;
+				$i++;
+			}
+			elsif ($ch eq "'") {
+				$in_single = 1;
+				$i++;
+			}
+			elsif ($ch eq '|') {
+				my $next = ($i + 1 < $len) ? substr($command, $i + 1, 1) : '';
+				return () if $next eq '|' || $next eq '&';
+				push @rawStages, substr($command, $start, $i - $start);
+				$i++;
+				$start = $i;
+			}
+			else {
+				$i++;
+			}
+		}
+	}
+
+	return () if $in_double || $in_single;
+	push @rawStages, substr($command, $start);
+
+	my @stages;
+	for my $stage (@rawStages) {
+		my @args = _splitSimpleCommand($stage);
+		return () unless @args;
+		push @stages, \@args;
+	}
+
+	return @stages;
+}
+
+sub _spawnUnixPipeline {
+	my $command = shift;
+	return () unless defined $command;
+
+	my $reader_r = IO::Handle->new();
+	my $reader_w = IO::Handle->new();
+	my $writer_r = IO::Handle->new();
+	my $writer_w = IO::Handle->new();
+
+	if (!pipe($reader_r, $reader_w) || !pipe($writer_r, $writer_w)) {
+		logError("Couldn't create pipeline pipes: $!");
+		$reader_r->close() if defined fileno($reader_r);
+		$reader_w->close() if defined fileno($reader_w);
+		$writer_r->close() if defined fileno($writer_r);
+		$writer_w->close() if defined fileno($writer_w);
+		return ();
+	}
+
+	my @stages = _splitPipelineStages($command);
+	my @pids;
+	my $pgid = 0;
+
+	if (@stages) {
+		my $prev_r;
+		for my $idx (0 .. $#stages) {
+			my $stage_in  = ($idx == 0) ? $writer_r : $prev_r;
+			my ($next_r, $next_w);
+
+			if ($idx < $#stages) {
+				$next_r = IO::Handle->new();
+				$next_w = IO::Handle->new();
+				if (!pipe($next_r, $next_w)) {
+					logError("Couldn't create inter-stage pipe: $!");
+					$reader_r->close() if defined fileno($reader_r);
+					$reader_w->close() if defined fileno($reader_w);
+					$writer_r->close() if defined fileno($writer_r);
+					$writer_w->close() if defined fileno($writer_w);
+					$prev_r->close()   if defined $prev_r && defined fileno($prev_r);
+					$next_r->close()   if defined fileno($next_r);
+					$next_w->close()   if defined fileno($next_w);
+					_reapChild(\@pids, $pgid) if @pids;
+					return ();
+				}
+			}
+
+			my $stage_out = ($idx == $#stages) ? $reader_w : $next_w;
+			my $pid = fork();
+
+			if (!defined($pid)) {
+				logError("Couldn't fork pipeline stage: $!");
+				$reader_r->close() if defined fileno($reader_r);
+				$reader_w->close() if defined fileno($reader_w);
+				$writer_r->close() if defined fileno($writer_r);
+				$writer_w->close() if defined fileno($writer_w);
+				$prev_r->close()   if defined $prev_r && defined fileno($prev_r);
+				$next_r->close()   if defined $next_r && defined fileno($next_r);
+				$next_w->close()   if defined $next_w && defined fileno($next_w);
+				_reapChild(\@pids, $pgid) if @pids;
+				return ();
+			}
+
+			if ($pid == 0) {
+				eval { POSIX::setpgid(0, $pgid); };
+				open(STDIN,  '<&', $stage_in)  or POSIX::_exit(127);
+				open(STDOUT, '>&', $stage_out) or POSIX::_exit(127);
+
+				$reader_r->close() if defined fileno($reader_r);
+				$reader_w->close() if defined fileno($reader_w);
+				$writer_r->close() if defined fileno($writer_r);
+				$writer_w->close() if defined fileno($writer_w);
+				$prev_r->close()   if defined $prev_r && defined fileno($prev_r);
+				$next_r->close()   if defined $next_r && defined fileno($next_r);
+				$next_w->close()   if defined $next_w && defined fileno($next_w);
+
+				my @args = @{ $stages[$idx] };
+				{ exec { $args[0] } @args; }
+				POSIX::_exit(127);
+			}
+
+			$pgid ||= $pid;
+			eval { POSIX::setpgid($pid, $pgid); };
+			push @pids, $pid;
+
+			$stage_in->close()  if defined fileno($stage_in);
+			$stage_out->close() if defined fileno($stage_out);
+			$prev_r = $next_r;
+		}
+	}
+	else {
+		my $pid = fork();
+		if (!defined($pid)) {
+			logError("Couldn't fork shell pipeline: $!");
+			$reader_r->close() if defined fileno($reader_r);
+			$reader_w->close() if defined fileno($reader_w);
+			$writer_r->close() if defined fileno($writer_r);
+			$writer_w->close() if defined fileno($writer_w);
+			return ();
+		}
+
+		if ($pid == 0) {
+			eval { POSIX::setpgid(0, 0); };
+			open(STDIN,  '<&', $writer_r) or POSIX::_exit(127);
+			open(STDOUT, '>&', $reader_w) or POSIX::_exit(127);
+
+			$reader_r->close() if defined fileno($reader_r);
+			$reader_w->close() if defined fileno($reader_w);
+			$writer_r->close() if defined fileno($writer_r);
+			$writer_w->close() if defined fileno($writer_w);
+
+			{ exec('/bin/sh', '-c', $command); }
+			POSIX::_exit(127);
+		}
+
+		$pgid = $pid;
+		eval { POSIX::setpgid($pid, $pgid); };
+		@pids = ($pid);
+		$writer_r->close() if defined fileno($writer_r);
+		$reader_w->close() if defined fileno($reader_w);
+	}
+
+	return ($reader_r, $writer_w, \@pids, $pgid);
+}
+
+sub _reapKilledChild {
+	my ($pidsOrPid, $retries, $pgid) = @_;
+	my @pids = ref($pidsOrPid) eq 'ARRAY' ? @$pidsOrPid : (defined $pidsOrPid ? ($pidsOrPid) : ());
+	$retries ||= 0;
+
+	my @remaining = grep { waitpid($_, POSIX::WNOHANG()) == 0 } @pids;
+	return unless @remaining;
+
+	if ((${^GLOBAL_PHASE} // '') eq 'DESTRUCT') {
+		kill('KILL', -$pgid) if defined $pgid && $pgid > 0;
+		kill('KILL', @remaining);
+		waitpid($_, 0) for @remaining;
+		return;
+	}
+
+	# Re-assert SIGKILL periodically if a child lingers beyond 0.5s, never abandon zombies
+	if ($retries >= 10 && ($retries % 5) == 0) {
+		kill('KILL', -$pgid) if defined $pgid && $pgid > 0;
+		kill('KILL', @remaining);
+		@remaining = grep { waitpid($_, POSIX::WNOHANG()) == 0 } @remaining;
+		return unless @remaining;
+	}
+
+	my $delay = $retries < 10 ? 0.05 : ($retries < 20 ? 0.25 : 1.0);
+	Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + $delay, sub {
+		_reapKilledChild(\@remaining, $retries + 1, $pgid);
 	});
 }
 
 sub _reapChild {
-	my $pid = shift;
-	return unless defined $pid;
-	return if waitpid($pid, POSIX::WNOHANG()) != 0;
+	my ($pidsOrPid, $pgid) = @_;
+	my @pids = ref($pidsOrPid) eq 'ARRAY' ? @$pidsOrPid : (defined $pidsOrPid ? ($pidsOrPid) : ());
+	return unless @pids || (defined $pgid && $pgid > 0);
 
-	kill('TERM', $pid);
-	return if waitpid($pid, POSIX::WNOHANG()) != 0;
+	my $pgidAlive = (defined $pgid && $pgid > 0 && kill(0, -$pgid)) ? 1 : 0;
+	my @remaining = grep { waitpid($_, POSIX::WNOHANG()) == 0 } @pids;
+	return unless @remaining || $pgidAlive;
+
+	kill('TERM', -$pgid) if defined $pgid && $pgid > 0;
+	kill('TERM', @remaining) if @remaining;
+
+	@remaining = grep { waitpid($_, POSIX::WNOHANG()) == 0 } @remaining;
+	$pgidAlive = (defined $pgid && $pgid > 0 && kill(0, -$pgid)) ? 1 : 0;
+	return unless @remaining || $pgidAlive;
 
 	if ((${^GLOBAL_PHASE} // '') eq 'DESTRUCT') {
-		kill('KILL', $pid);
-		waitpid($pid, 0);
+		kill('KILL', -$pgid) if defined $pgid && $pgid > 0;
+		kill('KILL', @remaining) if @remaining;
+		waitpid($_, 0) for @remaining;
 		return;
 	}
 
 	Slim::Utils::Timers::setTimer(undef, Time::HiRes::time() + 0.05, sub {
-		return if waitpid($pid, POSIX::WNOHANG()) != 0;
+		@remaining = grep { waitpid($_, POSIX::WNOHANG()) == 0 } @remaining;
+		my $stillGroup = (defined $pgid && $pgid > 0 && kill(0, -$pgid)) ? 1 : 0;
+		return unless @remaining || $stillGroup;
 
-		kill('KILL', $pid);
-		return if waitpid($pid, POSIX::WNOHANG()) != 0;
+		kill('KILL', -$pgid) if defined $pgid && $pgid > 0;
+		kill('KILL', @remaining) if @remaining;
 
-		_reapKilledChild($pid, 0);
+		@remaining = grep { waitpid($_, POSIX::WNOHANG()) == 0 } @remaining;
+		return unless @remaining;
+
+		_reapKilledChild(\@remaining, 0, $pgid);
 	});
 }
 
 sub close {
 	my $self = shift;
+	return if ${*$self}{'pipeline_closed'};
+	${*$self}{'pipeline_closed'} = 1;
+
 	my $inDestruct = (${^GLOBAL_PHASE} // '') eq 'DESTRUCT';
 
-	my $reader = ${*$self}{'pipeline_reader'};
+	my $reader = delete ${*$self}{'pipeline_reader'};
 
 	if (defined($reader)) {
 		if (!$inDestruct) {
@@ -485,7 +803,7 @@ sub close {
 		$reader->close();
 	}
 
-	my $writer = ${*$self}{'pipeline_writer'};
+	my $writer = delete ${*$self}{'pipeline_writer'};
 
 	if (defined($writer)) {
 		if (!$inDestruct) {
@@ -496,7 +814,7 @@ sub close {
 
 	if (main::ISWINDOWS) {
 
-		my $listenReader = ${*$self}{'pipeline_listen_reader'};
+		my $listenReader = delete ${*$self}{'pipeline_listen_reader'};
 
 		if (defined($listenReader)) {
 
@@ -510,7 +828,7 @@ sub close {
 			$listenReader->close();
 		}
 
-		my $listenWriter = ${*$self}{'pipeline_listen_writer'};
+		my $listenWriter = delete ${*$self}{'pipeline_listen_writer'};
 
 		if (defined($listenWriter)) {
 
@@ -525,11 +843,13 @@ sub close {
 		}
 	}
 	else {
-		my $pid = delete ${*$self}{'pipeline_pid'};
-		_reapChild($pid) if defined $pid;
+		my $pids = delete ${*$self}{'pipeline_pids'};
+		my $pgid = delete ${*$self}{'pipeline_pgid'};
+		my $pid  = delete ${*$self}{'pipeline_pid'};
+		_reapChild($pids || $pid, $pgid) if $pids || defined $pid || (defined $pgid && $pgid > 0);
 	}
 
-	my $source = ${*$self}{'pipeline_source'};
+	my $source = delete ${*$self}{'pipeline_source'};
 
 	if (defined($source) && !$inDestruct) {
 		$source->close();
@@ -538,10 +858,14 @@ sub close {
 
 sub DESTROY {
 	my $self = shift;
+	return if ${*$self}{'pipeline_closed'};
 
 	if ((${^GLOBAL_PHASE} // '') eq 'DESTRUCT') {
-		my $pid = delete ${*$self}{'pipeline_pid'};
-		_reapChild($pid) if defined $pid;
+		${*$self}{'pipeline_closed'} = 1;
+		my $pids = delete ${*$self}{'pipeline_pids'};
+		my $pgid = delete ${*$self}{'pipeline_pgid'};
+		my $pid  = delete ${*$self}{'pipeline_pid'};
+		_reapChild($pids || $pid, $pgid) if $pids || defined $pid || (defined $pgid && $pgid > 0);
 		return;
 	}
 

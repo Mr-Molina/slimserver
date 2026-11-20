@@ -37,6 +37,8 @@ tasks should call main::idleStreams() to yield time to animation and audio strea
 use strict;
 
 use EV;
+use Scalar::Util ();
+use Time::HiRes ();
 
 use Slim::Utils::Log;
 use Slim::Utils::Misc;
@@ -47,6 +49,7 @@ use constant EV_KILL          => 0xDEADBEEF;
 my %TIMERS = ();
 my %TIMER_LOCATIONS = ();
 my $CLEANUP;
+my $CLEANUP_TIMER;
 
 my $log = logger('server.timers');
 
@@ -110,18 +113,22 @@ sub killTimers {
 		$objRef = '';
 	}
 
-	if ( exists $TIMERS{$subptr}->{$objRef} ) {
-		for my $timer ( @{ $TIMERS{$subptr}->{$objRef} } ) {
+	if ( exists $TIMERS{$subptr} && exists $TIMERS{$subptr}->{$objRef} ) {
+		my @timers = @{ $TIMERS{$subptr}->{$objRef} };
+		for my $timer ( @timers ) {
 			if ( $timer ) {
 				delete $TIMER_LOCATIONS{"$timer"};
+				$timer->stop;
 				$timer->cb->(EV_KILL);
 			}
 		}
 
-		delete $TIMERS{$subptr}->{$objRef};
+		if ( exists $TIMERS{$subptr} ) {
+			delete $TIMERS{$subptr}->{$objRef};
 
-		if ( !keys %{ $TIMERS{$subptr} } ) {
-			delete $TIMERS{$subptr};
+			if ( !keys %{ $TIMERS{$subptr} } ) {
+				delete $TIMERS{$subptr};
+			}
 		}
 
 		return 1;
@@ -147,7 +154,42 @@ the timer was removed, 0 if the timer could not be found.
 
 =cut
 
-*killOneTimer = \&killTimers;
+sub killOneTimer {
+	my $objRef = shift;
+	my $subptr = shift || return 0;
+
+	if ( !defined $objRef ) {
+		$objRef = '';
+	}
+
+	return 0 unless exists $TIMERS{$subptr} && exists $TIMERS{$subptr}->{$objRef};
+
+	my $timers  = $TIMERS{$subptr}->{$objRef};
+	my $removed = 0;
+
+	for ( my $i = 0; $i < @{$timers}; ) {
+		my $timer = $timers->[$i];
+		if ( !defined $timer ) {
+			splice @{$timers}, $i, 1;
+			next;
+		}
+		delete $TIMER_LOCATIONS{"$timer"};
+		splice @{$timers}, $i, 1;
+		$timer->stop;
+		$timer->cb->(EV_KILL);
+		$removed = 1;
+		last;
+	}
+
+	if ( !@{$timers} ) {
+		delete $TIMERS{$subptr}->{$objRef};
+		if ( !keys %{ $TIMERS{$subptr} } ) {
+			delete $TIMERS{$subptr};
+		}
+	}
+
+	return $removed;
+}
 
 =head2 forgetTimer( $obj )
 
@@ -159,21 +201,29 @@ for a specific $client, for example.
 sub forgetTimer {
 	my $objRef = shift;
 
+	return unless defined $objRef;
+
 	my @subs = keys %TIMERS;
 
 	for my $sub ( @subs ) {
-		if ( exists $TIMERS{$sub}->{$objRef} ) {
-			for my $timer ( @{ $TIMERS{$sub}->{$objRef} } ) {
+		next if $sub eq \&cleanupTimers;
+		if ( exists $TIMERS{$sub} && exists $TIMERS{$sub}->{$objRef} ) {
+			my @timers = @{ $TIMERS{$sub}->{$objRef} };
+			for my $timer ( @timers ) {
 				if ( $timer ) {
+					next if defined $CLEANUP_TIMER && $timer == $CLEANUP_TIMER;
 					delete $TIMER_LOCATIONS{"$timer"};
+					$timer->stop;
 					$timer->cb->(EV_KILL);
 				}
 			}
 
-			delete $TIMERS{$sub}->{$objRef};
+			if ( exists $TIMERS{$sub} ) {
+				delete $TIMERS{$sub}->{$objRef};
 
-			if ( !keys %{ $TIMERS{$sub} } ) {
-				delete $TIMERS{$sub};
+				if ( !keys %{ $TIMERS{$sub} } ) {
+					delete $TIMERS{$sub};
+				}
 			}
 		}
 	}
@@ -197,12 +247,13 @@ sub killSpecific {
 	if ( my $loc = delete $TIMER_LOCATIONS{"$w"} ) {
 		my ( $sub, $objRef ) = @$loc;
 		my $removed = 0;
-		if ( exists $TIMERS{$sub} && (my $timers = $TIMERS{$sub}->{$objRef}) ) {
+		if ( exists $TIMERS{$sub} && exists $TIMERS{$sub}->{$objRef} && (my $timers = $TIMERS{$sub}->{$objRef}) ) {
 			my $i = 0;
 			for my $timer ( @{$timers} ) {
 				if ( defined $timer && $timer == $w ) {
-					$timer->cb->(EV_KILL);
 					splice @{$timers}, $i, 1;
+					$timer->stop;
+					$timer->cb->(EV_KILL);
 					$removed = 1;
 					last;
 				}
@@ -226,9 +277,9 @@ sub killSpecific {
 			for my $timer ( @{ $TIMERS{$sub}->{$objRef} } ) {
 				if ( defined $timer && $timer == $w ) {
 					delete $TIMER_LOCATIONS{"$w"};
-					$timer->cb->(EV_KILL);
-
 					splice @{ $TIMERS{$sub}->{$objRef} }, $i, 1;
+					$timer->stop;
+					$timer->cb->(EV_KILL);
 
 					if ( !@{ $TIMERS{$sub}->{$objRef} } ) {
 						delete $TIMERS{$sub}->{$objRef};
@@ -258,19 +309,42 @@ was run, or undef if the timer does not exist.
 
 sub firePendingTimer {
 	my $objRef = shift;
-	my $subptr = shift;
+	my $subptr = shift || return;
 
 	if ( !defined $objRef ) {
 		$objRef = '';
 	}
 
-	if ( my $timers = $TIMERS{$subptr}->{$objRef} ) {
-		# Run the first timer and remove it
-		for my $t ( @{$timers} ) {
-			if ( defined $t ) {
-				$t->invoke;
-				return 1;
+	return unless exists $TIMERS{$subptr} && exists $TIMERS{$subptr}->{$objRef};
+
+	my $timers = $TIMERS{$subptr}->{$objRef};
+
+	for ( my $i = 0; $i < @{$timers}; ) {
+		my $t = $timers->[$i];
+		if ( !defined $t ) {
+			splice @{$timers}, $i, 1;
+			next;
+		}
+
+		splice @{$timers}, $i, 1;
+		delete $TIMER_LOCATIONS{"$t"};
+
+		if ( !@{$timers} ) {
+			delete $TIMERS{$subptr}->{$objRef};
+			if ( !keys %{ $TIMERS{$subptr} } ) {
+				delete $TIMERS{$subptr};
 			}
+		}
+
+		$t->stop;
+		$t->invoke;
+		return 1;
+	}
+
+	if ( !@{$timers} ) {
+		delete $TIMERS{$subptr}->{$objRef};
+		if ( !keys %{ $TIMERS{$subptr} } ) {
+			delete $TIMERS{$subptr};
 		}
 	}
 
@@ -290,6 +364,27 @@ sub timeChanged {
 	# when they should fire but it is probably not worth it.
 }
 
+sub _removeTimerFromSlot {
+	my ( $subptr, $objRef, $w ) = @_;
+
+	return unless defined $subptr && defined $objRef;
+	return unless exists $TIMERS{$subptr} && exists $TIMERS{$subptr}->{$objRef};
+
+	my $timers = $TIMERS{$subptr}->{$objRef};
+	for ( my $i = $#$timers; $i >= 0; $i-- ) {
+		if ( !defined $timers->[$i] || ( defined $w && $timers->[$i] == $w ) ) {
+			splice @{$timers}, $i, 1;
+		}
+	}
+
+	if ( !@{$timers} ) {
+		delete $TIMERS{$subptr}->{$objRef};
+		if ( !keys %{ $TIMERS{$subptr} } ) {
+			delete $TIMERS{$subptr};
+		}
+	}
+}
+
 sub _makeTimer {
 	my ($objRef, $when, $subptr, @args) = @_;
 
@@ -297,17 +392,23 @@ sub _makeTimer {
 		$objRef = '';
 	}
 
-	my $now = EV::now;
+	EV::now_update;
+	my $now   = Time::HiRes::time();
+	my $delay = $when - $now;
+	$delay    = 0 if $delay < 0;
 
 	# We could use AnyEvent->timer here but paying the overhead
 	# cost of proxying the method is silly
 	my $w;
-	$w = EV::timer( $when - $now, 0, sub {
+	$w = EV::timer( $delay, 0, sub {
 		if ( defined $_[0] && !ref($_[0]) && $_[0] == EV_KILL ) {
 			# Nasty hack to destroy the EV::Timer object properly
-			defined $w && $w->stop;
-			delete $TIMER_LOCATIONS{"$w"} if defined $w;
-			undef $w;
+			if ( defined $w ) {
+				$w->stop;
+				delete $TIMER_LOCATIONS{"$w"};
+				_removeTimerFromSlot( $subptr, $objRef, $w );
+				undef $w;
+			}
 			return;
 		}
 
@@ -323,9 +424,13 @@ sub _makeTimer {
 			logError("Timer $name failed: $@");
 		}
 
-		# Destroy the timer after it's been run
-		delete $TIMER_LOCATIONS{"$w"} if defined $w;
-		undef $w;
+		# Destroy the timer after it's been run and prune its slot immediately
+		if ( defined $w ) {
+			$w->stop;
+			delete $TIMER_LOCATIONS{"$w"};
+			_removeTimerFromSlot( $subptr, $objRef, $w );
+			undef $w;
+		}
 	} );
 
 	_storeTimer( $subptr, $objRef, $w );
@@ -336,7 +441,7 @@ sub _makeTimer {
 		# start periodic cleanup timer
 		$CLEANUP = 1;
 
-		setTimer( undef, $now + CLEANUP_INTERVAL, \&cleanupTimers );
+		$CLEANUP_TIMER = setTimer( undef, $now + CLEANUP_INTERVAL, \&cleanupTimers );
 	}
 
 	return $w;
@@ -366,7 +471,7 @@ sub cleanupTimers {
 		}
 	}
 
-	setTimer( undef, EV::now + CLEANUP_INTERVAL, \&cleanupTimers );
+	$CLEANUP_TIMER = setTimer( undef, Time::HiRes::time() + CLEANUP_INTERVAL, \&cleanupTimers );
 }
 
 sub _storeTimer {

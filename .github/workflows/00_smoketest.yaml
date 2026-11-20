@@ -2,8 +2,10 @@ name: 'Smoketest for Lyrion Music Server'
 on:
   push:
   workflow_dispatch:
-  pull_request_target:
-    types: [assigned, labeled]
+  pull_request:
+
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -22,11 +24,11 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install dependencies
         if: ${{ !env.ACT }}
-        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
           packages: libio-socket-ssl-perl libnet-ssleay-perl netcat-traditional
           version: 1
@@ -56,11 +58,11 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust cross-compiler and Perl test dependencies
         if: ${{ !env.ACT }}
-        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
           packages: gcc-aarch64-linux-gnu libdbi-perl libdbd-sqlite3-perl
           version: 1
@@ -72,13 +74,13 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu libdbi-perl libdbd-sqlite3-perl
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
           targets: aarch64-unknown-linux-gnu
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -86,16 +88,534 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             rust/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ github.ref }}-${{ github.sha }}-${{ hashFiles('rust/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-${{ github.ref }}-
 
-      - name: Install cargo-audit
-        run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked --version 0.23.0
+          command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked --version 0.22.0
 
       - name: Check Rust formatting
         working-directory: rust
         run: cargo fmt --all -- --check
+
+      - name: Run Google Rust style audit
+        working-directory: rust
+        run: |
+          AUDIT_SCRIPT="${GOOGLE_RUST_AUDIT_SCRIPT:-$HOME/.gemini/config/plugins/rust-pro/skills/rust-pro/scripts/google_rust_audit.py}"
+          if command -v google_rust_audit.py >/dev/null 2>&1; then
+            python3 "$(command -v google_rust_audit.py)" crates --strict
+          elif [ -f "../scripts/google_rust_audit.py" ]; then
+            python3 ../scripts/google_rust_audit.py crates --strict
+          elif [ -f "$AUDIT_SCRIPT" ]; then
+            python3 "$AUDIT_SCRIPT" crates --strict
+          else
+            echo "google_rust_audit.py not found; running inline Python 3 style audit"
+            python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          _RAW_STR_START_RE = re.compile(r'^(?:b|c)?r(#*)"')
+          _CHAR_LITERAL_RE = re.compile(
+              r"^'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^'\\\n])'"
+          )
+          _COMBINATOR_RE = re.compile(
+              r"\.\s*(?:map|filter|filter_map|flat_map|and_then|inspect|take_while|skip_while)\s*\("
+          )
+
+          def sanitize_rust_source(source: str) -> str:
+              out = list(source)
+              n = len(source)
+              i = 0
+              while i < n:
+                  ch = source[i]
+                  if ch == "/" and i + 1 < n and source[i + 1] == "/":
+                      j = source.find("\n", i)
+                      if j == -1:
+                          j = n
+                      for k in range(i, j):
+                          out[k] = " "
+                      i = j
+                      continue
+                  if ch == "/" and i + 1 < n and source[i + 1] == "*":
+                      depth = 1
+                      out[i] = " "
+                      out[i + 1] = " "
+                      i += 2
+                      while i < n and depth > 0:
+                          if source[i] == "/" and i + 1 < n and source[i + 1] == "*":
+                              depth += 1
+                              out[i] = " "
+                              out[i + 1] = " "
+                              i += 2
+                          elif source[i] == "*" and i + 1 < n and source[i + 1] == "/":
+                              depth -= 1
+                              out[i] = " "
+                              out[i + 1] = " "
+                              i += 2
+                          else:
+                              if source[i] != "\n":
+                                  out[i] = " "
+                              i += 1
+                      continue
+                  if ch in ("r", "b", "c") and (
+                      i == 0 or not (source[i - 1].isalnum() or source[i - 1] == "_")
+                  ):
+                      m_raw = _RAW_STR_START_RE.match(source[i:])
+                      if m_raw:
+                          hashes = m_raw.group(1)
+                          prefix_len = m_raw.end()
+                          for k in range(i, i + prefix_len):
+                              out[k] = " "
+                          i += prefix_len
+                          closing_seq = '"' + hashes
+                          while i < n:
+                              if source.startswith(closing_seq, i):
+                                  for k in range(i, i + len(closing_seq)):
+                                      out[k] = " "
+                                  i += len(closing_seq)
+                                  break
+                              if source[i] != "\n":
+                                  out[i] = " "
+                              i += 1
+                          continue
+                  if ch == '"':
+                      if (
+                          i > 0
+                          and source[i - 1] in ("b", "c")
+                          and (i < 2 or not (source[i - 2].isalnum() or source[i - 2] == "_"))
+                      ):
+                          out[i - 1] = " "
+                      out[i] = " "
+                      i += 1
+                      while i < n:
+                          if source[i] == "\\":
+                              out[i] = " "
+                              if i + 1 < n:
+                                  if source[i + 1] != "\n":
+                                      out[i + 1] = " "
+                                  i += 2
+                              else:
+                                  i += 1
+                          elif source[i] == '"':
+                              out[i] = " "
+                              i += 1
+                              break
+                          else:
+                              if source[i] != "\n":
+                                  out[i] = " "
+                              i += 1
+                      continue
+                  if ch == "'":
+                      m_char = _CHAR_LITERAL_RE.match(source[i:])
+                      if m_char:
+                          if (
+                              i > 0
+                              and source[i - 1] == "b"
+                              and (i < 2 or not (source[i - 2].isalnum() or source[i - 2] == "_"))
+                          ):
+                              out[i - 1] = " "
+                          span_len = m_char.end()
+                          for k in range(i, i + span_len):
+                              out[k] = " "
+                          i += span_len
+                          continue
+                  i += 1
+              return "".join(out)
+
+          def has_test_cfg_attr(line: str) -> bool:
+              if re.search(r"#\s*\[\s*test\s*\]", line):
+                  return True
+              m = re.search(r"#\s*\[\s*cfg\s*\(", line)
+              if not m:
+                  return False
+              depth = 1
+              i = m.end()
+              start = i
+              while i < len(line) and depth > 0:
+                  if line[i] == "(":
+                      depth += 1
+                  elif line[i] == ")":
+                      depth -= 1
+                  i += 1
+              if depth != 0:
+                  return False
+              inner = line[start : i - 1]
+              if re.search(r"\bnot\s*\(\s*test\s*\)", inner):
+                  return False
+              return bool(re.search(r"\btest\b", inner))
+
+          def compute_line_scopes(masked_lines, raw_lines):
+              num_lines = len(masked_lines)
+              in_test_scope = [False] * num_lines
+              in_inline_mod = [False] * num_lines
+              in_fn_body = [False] * num_lines
+              in_cxx_bridge = [False] * num_lines
+
+              brace_depth = 0
+              test_entry_depth = None
+              inline_mod_entry_depth = None
+              fn_entry_depth = None
+              cxx_bridge_entry_depth = None
+
+              pending_test_attr = False
+              test_attr_depth = 0
+              pending_cxx_bridge_attr = False
+              pending_test_block = False
+              pending_inline_mod = False
+              pending_fn = False
+              pending_cxx_mod = False
+
+              for idx, mline in enumerate(masked_lines):
+                  stripped = mline.strip()
+                  raw_stripped = raw_lines[idx].strip() if idx < len(raw_lines) else ""
+
+                  if has_test_cfg_attr(stripped):
+                      pending_test_attr = True
+                      test_attr_depth = brace_depth
+                  if re.search(r"#\s*\[\s*cxx\s*::\s*bridge", stripped):
+                      pending_cxx_bridge_attr = True
+
+                  mod_match = re.search(
+                      r"\b(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+([A-Za-z_][A-Za-z0-9_]*)",
+                      stripped,
+                  )
+                  if mod_match and ";" not in stripped[mod_match.start() :]:
+                      mod_name = mod_match.group(1)
+                      pending_inline_mod = True
+                      if pending_test_attr or mod_name == "tests":
+                          pending_test_block = True
+                          pending_test_attr = False
+                      if pending_cxx_bridge_attr:
+                          pending_cxx_mod = True
+                          pending_cxx_bridge_attr = False
+
+                  fn_match = re.search(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*", stripped)
+                  if fn_match and not stripped.endswith(";"):
+                      pending_fn = True
+                      if pending_test_attr:
+                          pending_test_block = True
+                          pending_test_attr = False
+
+                  active_test = test_entry_depth is not None or pending_test_block or pending_test_attr
+                  active_inline_mod = inline_mod_entry_depth is not None or pending_inline_mod
+                  active_fn = fn_entry_depth is not None
+                  active_cxx = cxx_bridge_entry_depth is not None or pending_cxx_mod
+
+                  for ch in mline:
+                      if ch == "{":
+                          if (pending_test_block or pending_test_attr) and test_entry_depth is None:
+                              test_entry_depth = brace_depth
+                              pending_test_block = False
+                              pending_test_attr = False
+                              active_test = True
+                          if pending_inline_mod and inline_mod_entry_depth is None:
+                              inline_mod_entry_depth = brace_depth
+                              pending_inline_mod = False
+                              active_inline_mod = True
+                          if pending_cxx_mod and cxx_bridge_entry_depth is None:
+                              cxx_bridge_entry_depth = brace_depth
+                              pending_cxx_mod = False
+                              active_cxx = True
+                          if pending_fn and fn_entry_depth is None:
+                              fn_entry_depth = brace_depth
+                              pending_fn = False
+                              active_fn = True
+                          brace_depth += 1
+                      elif ch == "}":
+                          brace_depth = max(0, brace_depth - 1)
+                          if test_entry_depth is not None and brace_depth <= test_entry_depth:
+                              test_entry_depth = None
+                          if inline_mod_entry_depth is not None and brace_depth <= inline_mod_entry_depth:
+                              inline_mod_entry_depth = None
+                          if cxx_bridge_entry_depth is not None and brace_depth <= cxx_bridge_entry_depth:
+                              cxx_bridge_entry_depth = None
+                          if fn_entry_depth is not None and brace_depth <= fn_entry_depth:
+                              fn_entry_depth = None
+
+                  in_test_scope[idx] = active_test or (test_entry_depth is not None)
+                  in_inline_mod[idx] = active_inline_mod or (inline_mod_entry_depth is not None)
+                  in_fn_body[idx] = active_fn or (fn_entry_depth is not None)
+                  in_cxx_bridge[idx] = active_cxx or (cxx_bridge_entry_depth is not None)
+
+                  if ";" in stripped and not raw_stripped.startswith("#"):
+                      if brace_depth <= test_attr_depth:
+                          pending_test_attr = False
+                      pending_cxx_bridge_attr = False
+                      pending_fn = False
+                      pending_inline_mod = False
+
+              return in_test_scope, in_inline_mod, in_fn_body, in_cxx_bridge
+
+          def line_of_offset(text: str, offset: int) -> int:
+              return 1 + text[:offset].count("\n")
+
+          def has_file_level_justification(raw_lines, masked_lines) -> bool:
+              for idx, raw in enumerate(raw_lines):
+                  stripped_raw = raw.strip()
+                  stripped_masked = masked_lines[idx].strip()
+                  if re.search(r"^//(?:!|/)?\s*JUSTIFICATION:", stripped_raw, re.I):
+                      return True
+                  if stripped_masked and not stripped_masked.startswith("#!"):
+                      break
+              return False
+
+          def audit_rust_source(source: str, file_path: str, has_sibling_modules: bool):
+              violations = []
+              masked_code = sanitize_rust_source(source)
+              raw_lines = source.splitlines()
+              masked_lines = masked_code.splitlines()
+              num_lines = len(masked_lines)
+
+              in_test_scope, in_inline_mod, in_fn_body, in_cxx_bridge = compute_line_scopes(
+                  masked_lines, raw_lines
+              )
+
+              for m in re.finditer(r"\b(?:pub\s*(?:\([^)]*\)\s*)?)?use\s+([^;]+);", masked_code, re.DOTALL):
+                  stmt_body = m.group(1)
+                  if "{" in stmt_body and "}" in stmt_body:
+                      brace_inner = stmt_body[stmt_body.find("{") + 1 : stmt_body.rfind("}")]
+                      cleaned = re.sub(r"::\s*self\b", "", brace_inner)
+                      if "::" in cleaned:
+                          violations.append((
+                              "GRS-001", "ERROR", file_path, line_of_offset(masked_code, m.start()),
+                              "Nested `::` inside `use { ... }` braces violates single-module import granularity.",
+                          ))
+
+              basename = pathlib.Path(file_path.replace("\\", "/")).name
+              has_external_mod_decl = bool(
+                  re.search(r"\b(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;", masked_code)
+              )
+              is_non_leaf = basename == "mod.rs" or (
+                  basename == "lib.rs" and (has_external_mod_decl or has_sibling_modules)
+              )
+
+              for m in re.finditer(r"\b(pub\s*(?:\([^)]*\)\s*)?)?use\s+([A-Za-z0-9_:]+)::\*\s*;", masked_code):
+                  is_pub = bool(m.group(1))
+                  path_prefix = m.group(2)
+                  line_no = line_of_offset(masked_code, m.start())
+                  line_idx = min(line_no - 1, num_lines - 1)
+                  last_segment = path_prefix.split("::")[-1]
+                  is_upper_camel_enum = bool(re.match(r"^[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*$", last_segment))
+                  allowed = (
+                      (path_prefix == "super" and in_inline_mod[line_idx])
+                      or (is_pub and (is_non_leaf or basename in ("lib.rs", "mod.rs")))
+                      or (is_upper_camel_enum and in_fn_body[line_idx])
+                  )
+                  if not allowed:
+                      violations.append((
+                          "GRS-002", "ERROR", file_path, line_no,
+                          f"Disallowed glob import `use {path_prefix}::*;`.",
+                      ))
+
+              if is_non_leaf:
+                  allow_non_leaf_next = False
+                  for idx, mline in enumerate(masked_lines):
+                      raw_line = raw_lines[idx] if idx < len(raw_lines) else ""
+                      if re.search(r"#\s*\[\s*allow\s*\(\s*google_style\s*::\s*non_leaf_impl\s*\)\s*\]", raw_line):
+                          allow_non_leaf_next = True
+                          continue
+                      if in_test_scope[idx] or in_cxx_bridge[idx] or in_inline_mod[idx]:
+                          continue
+                      stripped = mline.strip()
+                      if not stripped:
+                          continue
+                      if re.match(
+                          r"^(?:pub(?:\s*\([^)]*\))?\s+(?:(?:unsafe|async|const|extern)\s+)*(?:fn|struct|enum|trait)\b|(?:unsafe\s+)?impl\b)",
+                          stripped,
+                      ):
+                          if allow_non_leaf_next:
+                              allow_non_leaf_next = False
+                          else:
+                              violations.append((
+                                  "GRS-003", "ERROR", file_path, idx + 1,
+                                  f"Non-leaf module `{basename}` must only declare submodules and `pub use` re-exports.",
+                              ))
+                      elif not stripped.startswith("#"):
+                          allow_non_leaf_next = False
+
+              for idx, mline in enumerate(masked_lines):
+                  if in_test_scope[idx]:
+                      continue
+                  if re.search(r"\bcatch_unwind\s*\(", mline):
+                      window = "\n".join(raw_lines[max(0, idx - 5) : idx + 1])
+                      if not re.search(r"//\s*JUSTIFICATION:.*defense-in-depth", window, re.I):
+                          violations.append((
+                              "GRS-004", "ERROR", file_path, idx + 1,
+                              "`catch_unwind` is prohibited without `// JUSTIFICATION: defense-in-depth`.",
+                          ))
+
+              for idx, mline in enumerate(masked_lines):
+                  raw_line = raw_lines[idx] if idx < len(raw_lines) else ""
+                  has_ctor = bool(
+                      re.search(r"#\s*\[\s*(?:[\w:]+\s*::\s*)?ctor\s*\]", mline)
+                      or re.search(r"\bctor\s*::", mline)
+                  )
+                  has_init_sec = bool(
+                      re.search(r"\blink_section\b", mline)
+                      and re.search(r'"\.(?:init_array|ctors)"', raw_line)
+                  )
+                  if has_ctor or has_init_sec:
+                      violations.append((
+                          "GRS-005", "ERROR", file_path, idx + 1,
+                          "Running code before `main()` (`#[ctor]` / `.init_array`) is prohibited.",
+                      ))
+
+              for idx, mline in enumerate(masked_lines):
+                  if re.search(r"#\s*!\s*\[\s*feature\s*\(", mline):
+                      window = "\n".join(raw_lines[max(0, idx - 5) : idx + 1])
+                      if not re.search(r"//\s*JUSTIFICATION:.*(?:android|embedded)", window, re.I):
+                          violations.append((
+                              "GRS-006", "ERROR", file_path, idx + 1,
+                              "Unstable `#![feature(...)]` requires a preceding `// JUSTIFICATION:` referencing Android or embedded.",
+                          ))
+
+              for m in re.finditer(
+                  r"\b(?:unwrap_or_else\s*\([^;]*?\.into_inner\s*\(\s*\)|PoisonError\s*::\s*into_inner\b|PoisonError[^;]*?\.into_inner\s*\(\s*\))",
+                  masked_code,
+                  re.DOTALL,
+              ):
+                  violations.append((
+                      "GRS-007", "ERROR", file_path, line_of_offset(masked_code, m.start()),
+                      "Recovering a poisoned mutex via `.into_inner()` / `PoisonError::into_inner` is prohibited.",
+                  ))
+
+              file_level_just = has_file_level_justification(raw_lines, masked_lines)
+              for m in re.finditer(r"\bunsafe\s+(?:\{|fn\b|trait\b|impl\b)", masked_code):
+                  line_no = line_of_offset(masked_code, m.start())
+                  collected_comments = []
+                  scan = line_no - 2
+                  while scan >= 0:
+                      s_raw = raw_lines[scan].strip()
+                      if s_raw.startswith("//") or s_raw.startswith("/*") or s_raw.startswith("*"):
+                          collected_comments.append(s_raw)
+                          scan -= 1
+                      elif s_raw.startswith("#["):
+                          scan -= 1
+                      else:
+                          break
+                  has_safety = any(re.search(r"//\s*SAFETY:|///\s*#\s*Safety", c, re.I) for c in collected_comments)
+                  has_local_just = any(re.search(r"//\s*JUSTIFICATION:", c, re.I) for c in collected_comments)
+                  if not (has_safety and (has_local_just or file_level_just)):
+                      violations.append((
+                          "GRS-008", "ERROR", file_path, line_no,
+                          "`unsafe` requires both `// SAFETY:` (or `/// # Safety`) and `// JUSTIFICATION:`.",
+                      ))
+
+              for m in re.finditer(r"\bfor\s+[^;{]+?\bin\s+", masked_code):
+                  for_line = line_of_offset(masked_code, m.start())
+                  paren_depth = 0
+                  pos = m.end()
+                  n_code = len(masked_code)
+                  while pos < n_code:
+                      c = masked_code[pos]
+                      if c == "(":
+                          paren_depth += 1
+                      elif c == ")":
+                          paren_depth = max(0, paren_depth - 1)
+                      elif c in ("{", ";") and paren_depth == 0:
+                          break
+                      pos += 1
+                  if len(_COMBINATOR_RE.findall(masked_code[m.end() : pos])) >= 2:
+                      violations.append((
+                          "GRS-009", "WARN", file_path, for_line,
+                          "Avoid chaining >= 2 iterator combinators directly in a `for` loop header.",
+                      ))
+
+              for m in re.finditer(r"\.\s*for_each\s*\(", masked_code):
+                  violations.append((
+                      "GRS-009", "WARN", file_path, line_of_offset(masked_code, m.start()),
+                      "Prefer a standard `for` loop over `.for_each(...)`.",
+                  ))
+
+              flagged_grs010 = set()
+              for m in re.finditer(
+                  r"\bif\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\.\s*is_(?:some|ok)\s*\(\s*\)\s*\{([^}]*)\}",
+                  masked_code,
+                  re.DOTALL,
+              ):
+                  var_name = m.group(1)
+                  m_unwrap = re.search(rf"\b{re.escape(var_name)}\s*\.\s*unwrap\s*\(\s*\)", m.group(2))
+                  if m_unwrap:
+                      line_no = line_of_offset(masked_code, m.start(2) + m_unwrap.start())
+                      flagged_grs010.add(line_no)
+                      violations.append((
+                          "GRS-010", "WARN", file_path, line_no,
+                          f"Check-then-unwrap on `{var_name}` should use `if let` or pattern matching.",
+                      ))
+
+              for idx, mline in enumerate(masked_lines):
+                  line_no = idx + 1
+                  if in_test_scope[idx] or line_no in flagged_grs010:
+                      continue
+                  if re.search(r"\.\s*unwrap\s*\(\s*\)", mline):
+                      flagged_grs010.add(line_no)
+                      violations.append((
+                          "GRS-010", "WARN", file_path, line_no,
+                          "Prefer `.expect(\"...\")` or `?` over `.unwrap()` in non-test code.",
+                      ))
+
+              for m in re.finditer(
+                  r"\bpub\s+(?:const\s+|async\s+)?fn\s+get_([A-Za-z0-9_]+)\s*\(\s*&\s*(?:mut\s+)?self\b",
+                  masked_code,
+              ):
+                  getter_suffix = m.group(1)
+                  if getter_suffix != "mut":
+                      violations.append((
+                          "GRS-011", "WARN", file_path, line_of_offset(masked_code, m.start()),
+                          f"Getter `get_{getter_suffix}` should omit the `get_` prefix.",
+                      ))
+
+              for idx, mline in enumerate(masked_lines):
+                  if re.search(r"#\s*\[\s*rustfmt\s*::\s*skip\s*\]", mline):
+                      window = "\n".join(raw_lines[max(0, idx - 2) : idx])
+                      if not re.search(r"//.*(?:\balign(?:ed|ment)?\b|\bgenerated\b|\bcodegen\b)", window, re.I):
+                          violations.append((
+                              "GRS-011", "WARN", file_path, idx + 1,
+                              "`#[rustfmt::skip]` requires an adjacent preceding alignment/codegen comment.",
+                          ))
+
+              for idx, raw_line in enumerate(raw_lines):
+                  line_no = idx + 1
+                  lstrip_line = raw_line.lstrip()
+                  has_url = "http://" in raw_line or "https://" in raw_line
+                  if lstrip_line.startswith("//"):
+                      if not has_url and len(lstrip_line) > 80:
+                          violations.append((
+                              "GRS-012", "WARN", file_path, line_no,
+                              f"Standalone comment width ({len(lstrip_line)} chars) exceeds 80-character limit.",
+                          ))
+                  elif not has_url and len(raw_line) > 100:
+                      violations.append((
+                          "GRS-012", "WARN", file_path, line_no,
+                          f"Code line width ({len(raw_line)} chars) exceeds 100-character limit.",
+                      ))
+
+              return violations
+
+          all_violations = []
+          rs_files = [p for p in sorted(pathlib.Path("crates").rglob("*.rs")) if "target" not in p.parts]
+          for rs_path in rs_files:
+              has_siblings = False
+              if rs_path.name == "lib.rs":
+                  parent_rs = [
+                      p for p in rs_path.parent.rglob("*.rs")
+                      if p.resolve() != rs_path.resolve() and p.name not in ("main.rs", "build.rs")
+                  ]
+                  has_siblings = len(parent_rs) > 0
+              src = rs_path.read_text(encoding="utf-8")
+              all_violations.extend(audit_rust_source(src, str(rs_path), has_siblings))
+
+          if all_violations:
+              for rule_id, sev, fpath, lineno, msg in all_violations:
+                  print(f"::error::{fpath}:{lineno}: [{sev}] {rule_id}: {msg}", file=sys.stderr)
+              sys.exit(1)
+          print("Inline Python 3 Rust style audit passed")
+          PY
+          fi
 
       - name: Run Clippy lints
         working-directory: rust
@@ -114,6 +634,31 @@ jobs:
       - name: Run cargo-audit security check
         working-directory: rust
         run: cargo audit
+
+      - name: Run cargo-deny dependency check
+        working-directory: rust
+        run: cargo deny check
+
+      - name: Build Rust workspace in release mode
+        working-directory: rust
+        run: cargo build --release --workspace --locked
+
+      - name: Stage Rust release binaries for integration tests
+        run: |
+          mkdir -p Bin/x86_64-linux
+          cp -f \
+            rust/target/release/gdresized \
+            rust/target/release/lms-audioscan \
+            rust/target/release/lms-mp3cut \
+            rust/target/release/lms-scanner-accel \
+            rust/target/release/lms-transcode \
+            Bin/x86_64-linux/
+          chmod +x \
+            Bin/x86_64-linux/gdresized \
+            Bin/x86_64-linux/lms-audioscan \
+            Bin/x86_64-linux/lms-mp3cut \
+            Bin/x86_64-linux/lms-scanner-accel \
+            Bin/x86_64-linux/lms-transcode
 
       - name: Run Perl-Rust integration test suite
         run: prove -I. -Ilib -ICPAN t/rust_integration.t

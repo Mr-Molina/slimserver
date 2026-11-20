@@ -2,13 +2,19 @@
 
 use lms_audioscan::find_frame_offset;
 use lms_audioscan::scan_file;
+use lms_audioscan::ScanResult;
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
+use std::io::BufWriter;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+
+const MAX_SINGLE_BINARY_B64_BYTES: usize = 24 * 1024 * 1024;
+const MAX_TOTAL_BINARY_B64_BYTES: usize = 32 * 1024 * 1024;
+const MAX_JSON_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 struct CliConfig {
     no_artwork: bool,
@@ -28,10 +34,143 @@ fn env_flag_true(name: &str) -> bool {
     }
 }
 
-fn write_stdout_line(line: &str) -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()
+struct CappedWriter<W> {
+    inner: W,
+    written: usize,
+    limit: usize,
+}
+
+impl<W: Write> Write for CappedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let next = self.written.saturating_add(buf.len());
+        if next > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JSON output exceeds maximum allowed size",
+            ));
+        }
+        let n = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_json_line<T: serde::Serialize>(value: &T) -> Result<(), String> {
+    let stdout = io::stdout().lock();
+    let capped = CappedWriter {
+        inner: stdout,
+        written: 0,
+        limit: MAX_JSON_OUTPUT_BYTES,
+    };
+    let mut writer = BufWriter::new(capped);
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|err| format!("JSON serialization error: {err}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|err| format!("Stdout error: {err}"))?;
+    writer.flush().map_err(|err| format!("Stdout error: {err}"))
+}
+
+fn cap_b64_payload(val: &mut serde_json::Value, remaining_budget: &mut usize) {
+    let Some(s) = val.as_str() else {
+        return;
+    };
+    let len = s.len();
+    if len <= MAX_SINGLE_BINARY_B64_BYTES && len <= *remaining_budget {
+        *remaining_budget -= len;
+    } else {
+        let approx_bytes = (len / 4).saturating_mul(3);
+        *val = serde_json::json!(approx_bytes);
+    }
+}
+
+fn is_standard_base64(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return false;
+    }
+    let body_end = if bytes.ends_with(b"==") {
+        bytes.len() - 2
+    } else if bytes.ends_with(b"=") {
+        bytes.len() - 1
+    } else {
+        bytes.len()
+    };
+    bytes[..body_end]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+fn should_cap_binary_string(s: &str) -> bool {
+    s.len() > MAX_SINGLE_BINARY_B64_BYTES || (s.len() >= 1024 && is_standard_base64(s))
+}
+
+/// Cap a picture object's base64 payload field (`image` or `image_data`).
+fn cap_picture_object(item: &mut serde_json::Value, remaining_budget: &mut usize) {
+    let mut handled = false;
+    for key in ["image", "image_data"] {
+        if let Some(slot) = item.get_mut(key) {
+            cap_b64_payload(slot, remaining_budget);
+            handled = true;
+        }
+    }
+    if !handled && item.as_str().is_some_and(should_cap_binary_string) {
+        cap_b64_payload(item, remaining_budget);
+    }
+}
+
+fn cap_picture_object_list(val: &mut serde_json::Value, remaining_budget: &mut usize) {
+    if let Some(arr) = val.as_array_mut() {
+        for item in arr {
+            cap_picture_object(item, remaining_budget);
+        }
+    } else {
+        cap_picture_object(val, remaining_budget);
+    }
+}
+
+fn cap_scan_result_binaries(result: &mut ScanResult) {
+    let mut remaining_budget = MAX_TOTAL_BINARY_B64_BYTES;
+
+    for (key, val) in &mut result.tags {
+        match key.as_str() {
+            "COVR" | "COVER ART (FRONT)" => {
+                cap_b64_payload(val, &mut remaining_budget);
+            }
+            "APIC" => {
+                if let Some(arr) = val.as_array_mut() {
+                    let is_nested = arr.first().is_some_and(|v| v.is_array());
+                    if is_nested {
+                        for entry in arr {
+                            if let Some(slot) = entry.get_mut(3) {
+                                cap_b64_payload(slot, &mut remaining_budget);
+                            }
+                        }
+                    } else if let Some(slot) = arr.get_mut(3) {
+                        cap_b64_payload(slot, &mut remaining_budget);
+                    }
+                }
+            }
+            "ALLPICTURES" | "WM/Picture" | "WM/PICTURE" => {
+                cap_picture_object_list(val, &mut remaining_budget);
+            }
+            _ => {
+                if let Some(arr) = val.as_array_mut() {
+                    for item in arr {
+                        if item.as_str().is_some_and(should_cap_binary_string) {
+                            cap_b64_payload(item, &mut remaining_budget);
+                        }
+                    }
+                } else if val.as_str().is_some_and(should_cap_binary_string) {
+                    cap_b64_payload(val, &mut remaining_budget);
+                }
+            }
+        }
+    }
 }
 
 fn print_usage() -> io::Result<()> {
@@ -61,14 +200,26 @@ fn print_usage() -> io::Result<()> {
     stdout.flush()
 }
 
-fn is_negative_i64_token(arg: &OsStr) -> bool {
+enum NegativeNumericToken {
+    NotNegativeDigits,
+    ValidI64,
+    Overflow(String),
+}
+
+fn classify_negative_numeric_token(arg: &OsStr) -> NegativeNumericToken {
     let Some(s) = arg.to_str() else {
-        return false;
+        return NegativeNumericToken::NotNegativeDigits;
     };
-    s.starts_with('-')
-        && s.len() > 1
-        && s.as_bytes()[1..].iter().all(|b| b.is_ascii_digit())
-        && s.parse::<i64>().is_ok()
+    if s.starts_with('-') && s.len() > 1 && s.as_bytes()[1..].iter().all(|b| b.is_ascii_digit()) {
+        match s.parse::<i64>() {
+            Ok(_) => NegativeNumericToken::ValidI64,
+            Err(err) => {
+                NegativeNumericToken::Overflow(format!("Invalid numeric argument '{s}': {err}"))
+            }
+        }
+    } else {
+        NegativeNumericToken::NotNegativeDigits
+    }
 }
 
 fn parse_args() -> Result<ParseOutcome, String> {
@@ -100,10 +251,14 @@ fn parse_args() -> Result<ParseOutcome, String> {
                     _ => {}
                 }
             }
-            if !is_negative_i64_token(&arg) {
-                let lossy = arg.to_string_lossy();
-                if lossy.starts_with('-') && arg.len() > 1 {
-                    return Err(format!("Unknown option: {lossy}"));
+            match classify_negative_numeric_token(&arg) {
+                NegativeNumericToken::ValidI64 => {}
+                NegativeNumericToken::Overflow(msg) => return Err(msg),
+                NegativeNumericToken::NotNegativeDigits => {
+                    let lossy = arg.to_string_lossy();
+                    if lossy.starts_with('-') && arg.len() > 1 {
+                        return Err(format!("Unknown option: {lossy}"));
+                    }
                 }
             }
         }
@@ -132,12 +287,12 @@ fn execute(cfg: CliConfig) -> Result<(), String> {
     match subcmd_str {
         "scan" => match rest {
             [path_arg] => {
+                let path = Path::new(path_arg);
                 let include_tags = !cfg.info_only;
-                let res = scan_file(Path::new(path_arg), true, include_tags, cfg.no_artwork)
+                let mut res = scan_file(path, true, include_tags, cfg.no_artwork)
                     .map_err(|err| format!("Scan error: {err}"))?;
-                let json = serde_json::to_string(&res)
-                    .map_err(|err| format!("JSON serialization error: {err}"))?;
-                write_stdout_line(&json).map_err(|err| format!("Stdout error: {err}"))
+                cap_scan_result_binaries(&mut res);
+                write_json_line(&res)
             }
             _ => Err("Usage: lms-audioscan scan [options] <path>".to_string()),
         },
@@ -147,11 +302,11 @@ fn execute(cfg: CliConfig) -> Result<(), String> {
             }
             match rest {
                 [path_arg] => {
-                    let res = scan_file(Path::new(path_arg), false, true, cfg.no_artwork)
+                    let path = Path::new(path_arg);
+                    let mut res = scan_file(path, false, true, cfg.no_artwork)
                         .map_err(|err| format!("Scan error: {err}"))?;
-                    let json = serde_json::to_string(&res)
-                        .map_err(|err| format!("JSON serialization error: {err}"))?;
-                    write_stdout_line(&json).map_err(|err| format!("Stdout error: {err}"))
+                    cap_scan_result_binaries(&mut res);
+                    write_json_line(&res)
                 }
                 _ => Err("Usage: lms-audioscan scan-tags [options] <path>".to_string()),
             }
@@ -171,12 +326,10 @@ fn execute(cfg: CliConfig) -> Result<(), String> {
                     let target_offset = offset_str
                         .parse::<i64>()
                         .map_err(|err| format!("Invalid offset_or_ms '{offset_str}': {err}"))?;
-                    let res =
-                        find_frame_offset(Path::new(path_arg), Some(format_str), target_offset)
-                            .map_err(|err| format!("Find frame error: {err}"))?;
-                    let json = serde_json::to_string(&res)
-                        .map_err(|err| format!("JSON serialization error: {err}"))?;
-                    write_stdout_line(&json).map_err(|err| format!("Stdout error: {err}"))
+                    let path = Path::new(path_arg);
+                    let res = find_frame_offset(path, Some(format_str), target_offset)
+                        .map_err(|err| format!("Find frame error: {err}"))?;
+                    write_json_line(&res)
                 }
                 _ => Err(
                     "Usage: lms-audioscan find-frame <format> <path> <offset_or_ms>".to_string(),
@@ -213,5 +366,73 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cap_scan_result_binaries_enforces_cumulative_budget_for_binary_tags() {
+        let mut tags = serde_json::Map::new();
+        // Two 20 MiB valid base64 binary tags (< 24 MiB single cap, > 32 MiB total).
+        let chunk_len = 20 * 1024 * 1024;
+        tags.insert("GEOB".to_string(), serde_json::json!("A".repeat(chunk_len)));
+        tags.insert("PRIV".to_string(), serde_json::json!("B".repeat(chunk_len)));
+        tags.insert(
+            "WM/Picture".to_string(),
+            serde_json::json!({
+                "mime_type": "image/jpeg",
+                "image_type": 3,
+                "image": "C".repeat(4096),
+            }),
+        );
+        tags.insert("TIT2".to_string(), serde_json::json!("Normal Title"));
+
+        let mut res = ScanResult {
+            info: serde_json::Map::new(),
+            tags,
+        };
+        cap_scan_result_binaries(&mut res);
+
+        // First 20 MiB binary tag fits inside 32 MiB budget.
+        assert!(res.tags["GEOB"].is_string());
+        // Second 20 MiB binary tag exceeds remaining 12 MiB budget -> approx bytes.
+        assert_eq!(res.tags["PRIV"].as_u64(), Some(15 * 1024 * 1024));
+        // WM/Picture image stays within remaining 12 MiB budget.
+        assert!(res.tags["WM/Picture"]["image"].is_string());
+        // Normal text tag is untouched.
+        assert_eq!(res.tags["TIT2"].as_str(), Some("Normal Title"));
+    }
+
+    #[test]
+    fn test_cap_scan_result_binaries_zero_budget_leaves_text_tags_intact() {
+        let mut tags = serde_json::Map::new();
+        tags.insert(
+            "ALLPICTURES".to_string(),
+            serde_json::json!([
+                {"image_data": "A".repeat(16 * 1024 * 1024)},
+                {"image_data": "B".repeat(16 * 1024 * 1024)},
+            ]),
+        );
+        tags.insert(
+            "WM/Picture".to_string(),
+            serde_json::json!([
+                {"image_type": 3, "image": "D".repeat(4096)},
+            ]),
+        );
+        tags.insert("PRIV".to_string(), serde_json::json!("C".repeat(4096)));
+        tags.insert("TIT2".to_string(), serde_json::json!("ABCD"));
+
+        let mut res = ScanResult {
+            info: serde_json::Map::new(),
+            tags,
+        };
+        cap_scan_result_binaries(&mut res);
+
+        assert_eq!(res.tags["WM/Picture"][0]["image"].as_u64(), Some(3072));
+        assert_eq!(res.tags["PRIV"].as_u64(), Some(3072));
+        assert_eq!(res.tags["TIT2"].as_str(), Some("ABCD"));
     }
 }

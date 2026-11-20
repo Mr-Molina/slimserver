@@ -12,16 +12,19 @@ package Slim::Web::JSONRPC;
 
 use strict;
 
-use HTTP::Status qw(RC_OK RC_FORBIDDEN);
+use HTTP::Status qw(RC_OK RC_BAD_REQUEST RC_FORBIDDEN RC_METHOD_NOT_ALLOWED RC_REQUEST_ENTITY_TOO_LARGE RC_UNSUPPORTED_MEDIA_TYPE);
 use JSON::XS qw(decode_json encode_json);
 use Scalar::Util qw(blessed);
-use URI;
-use URI::QueryParam;
 
 use Slim::Web::HTTP;
+use Slim::Web::HTTP::CSRF;
 use Slim::Utils::Compress;
 use Slim::Utils::Log;
+use Slim::Utils::Network;
 use Slim::Utils::Prefs;
+
+use constant MAX_JSONRPC_PAYLOAD_BYTES => 65536;
+use constant MAX_JSONRPC_DEPTH         => 16;
 
 my $log = logger('network.jsonrpc');
 my $prefs = preferences('server');
@@ -66,6 +69,19 @@ sub handleClose {
 }
 
 
+sub _sendErrorAndClose {
+	my ($httpClient, $httpResponse, $code) = @_;
+
+	$httpResponse->code($code);
+	$httpResponse->content_type('application/json');
+	$httpResponse->header('Connection' => 'close');
+	$httpResponse->content('');
+
+	$httpClient->send_response($httpResponse);
+	Slim::Web::HTTP::closeHTTPSocket($httpClient);
+}
+
+
 # handleURI ($httpClient, $httpResponse)
 # This is the callback from the HTTP code if the URI of the request matches the
 # one we've registered. We're passed the HTTP client object and a HTTP response
@@ -77,151 +93,178 @@ sub handleURI {
 	main::DEBUGLOG && $log->debug("handleURI($httpClient)");
 
 	# make sure we're connected
-	if (!$httpClient->connected()) {
-		$log->warn("Aborting, client not connected: $httpClient");
+	if (!$httpClient || !$httpClient->connected()) {
+		$log->warn("Aborting, client not connected: " . ($httpClient // 'undef'));
 		return;
 	}
 
-	# see Slim::Web::CSRF::isRequestCSRFSafe
-	if (!$httpResponse->header('Access-Control-Allow-Origin') && $prefs->get('csrfProtectionLevel') && (my $request = $httpResponse->request)) {
-		my ($host, $origin);
-		eval {
-			$host = $request->header('Host');
-			$origin = $request->header('Origin') || $request->header('Referer');
+	my $request = $httpResponse->request();
+	if (!$request) {
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
+		return;
+	}
+
+	# Require POST + Content-Type application/json (reject GET and form-encoded CSRF mutations)
+	my $httpMethod = uc($request->method() || '');
+	if ($httpMethod ne 'POST') {
+		$log->warn("Rejecting non-POST JSON-RPC request: [$httpMethod]");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_METHOD_NOT_ALLOWED);
+		return;
+	}
+
+	my $contentType = $request->header('Content-Type') // '';
+	if ($contentType !~ m{^\s*application/json(?:\s*;|\s*$)}i) {
+		$log->warn("Rejecting JSON-RPC request with invalid Content-Type: [$contentType]");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_UNSUPPORTED_MEDIA_TYPE);
+		return;
+	}
+
+	# Validate Origin/Referer via CSRF->isRequestCSRFSafe when either is present;
+	# permit non-browser API clients (both Origin and Referer absent) without wildcard CORS.
+	my ($hostHeader, $origin, $referer);
+	my $hdrOk = eval {
+		$hostHeader = $request->header('Host');
+		$origin     = $request->header('Origin');
+		$referer    = $request->header('Referer');
+		1;
+	};
+	if ($@ || !$hdrOk) {
+		$log->warn("Failed reading request headers, failing closed: $@");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_FORBIDDEN);
+		return;
+	}
+
+	if (defined($hostHeader)) {
+		my $hostValid = eval {
+			my ($h, $p) = Slim::Web::HTTP::CSRF::_parseHostPort($hostHeader, 80);
+			defined($h) && Slim::Web::HTTP::CSRF::_isHostInServerAllowlist('http', $h, $p);
 		};
-
-		if ($origin && $host) {
-			my ($h, $p) = Slim::Utils::Misc::crackURL($origin);
-
-			# if the Host request header lists no port, crackURL() reports it as port 80, so we should
-			# pretend the Host header specified port 80 if it did not
-			$host .= ':80' if $host !~ m/:\d{1,}$/ ;
-
-			if ("$h:$p" ne $host) {
-				$log->warn("Not allowed from Origin: [$origin]");
-
-				$httpResponse->code(RC_FORBIDDEN);
-				$httpResponse->content_type('application/json');
-				$httpResponse->header('Connection' => 'close');
-				$httpResponse->content('');
-
-				$httpClient->send_response($httpResponse);
-				Slim::Web::HTTP::closeHTTPSocket($httpClient);
-
-				return;
-			}
+		if ($@ || !$hostValid) {
+			$log->warn("Rejecting JSON-RPC request with invalid Host: [$hostHeader]");
+			_sendErrorAndClose($httpClient, $httpResponse, RC_FORBIDDEN);
+			return;
 		}
 	}
 
-	# cancel any previous subscription on this connection
-	# we must have a context defined and a subscription defined
-	if (defined($contexts{$httpClient}) &&
-		Slim::Control::Request::unregisterAutoExecute($httpClient)) {
-
-		# we want to send a last chunk to close the connection as per HTTP...
-		# a subscription is essentially a never ending response: we're receiving here
-		# a new request (aka pipelining) so we want to be nice and close the previous response
-
-		# we cannot have a subscription if this is not a long lasting, keep-open, chunked connection.
-
-		Slim::Web::HTTP::addHTTPLastChunk($httpClient, 0);
+	if (defined($origin) || defined($referer)) {
+		my $safe = eval {
+			Slim::Web::HTTP::CSRF->isRequestCSRFSafe($request, $httpResponse, {});
+		};
+		if ($@ || !$safe) {
+			$log->warn("Not allowed from Origin/Referer: [" . ($origin // $referer // '') . "]");
+			_sendErrorAndClose($httpClient, $httpResponse, RC_FORBIDDEN);
+			return;
+		}
 	}
 
-	# get the request data (POST for JSON 1.0)
-	my $input = $httpResponse->request()->content();
+	# get the request data (POST body only)
+	my $input = $request->content();
 
-	if (!$input && $httpResponse->request()->method() eq 'GET') {
-		main::INFOLOG && $log->is_info && $log->info("This is GET request - get data from query string");
-		my $uri = new URI($httpResponse->request()->uri());
-		$input = $uri->query_param('request');
-	}
-
-	if (!$input) {
-
-		# No data
-		# JSON 1.0 => close connection
+	if (!defined($input) || !length($input)) {
 		$log->warn("No POST data found => closing connection");
-
-		Slim::Web::HTTP::closeHTTPSocket($httpClient);
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
 		return;
 	}
 
-	main::INFOLOG && $log->info("POST data: [$input]");
+	my $inputBytes = do { use bytes; length($input) };
+	if ($inputBytes > MAX_JSONRPC_PAYLOAD_BYTES) {
+		$log->warn("JSON-RPC payload too large ($inputBytes bytes > " . MAX_JSONRPC_PAYLOAD_BYTES . ")");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_REQUEST_ENTITY_TOO_LARGE);
+		return;
+	}
 
-	# Parse the input
-	# Convert JSON to Perl
-	# FIXME: JSON 1.0 accepts multiple requests ? How do we parse that efficiently?
-	my $procedure = decode_json($input);
+	main::INFOLOG && $log->is_info && $log->info("POST data length: [$inputBytes bytes]");
 
+	# Parse the input safely inside eval with max_depth(16) and HASH root
+	my $procedure = eval {
+		my $decoder = JSON::XS->new->max_depth(MAX_JSONRPC_DEPTH);
+		$decoder->utf8(1) unless utf8::is_utf8($input);
+		$decoder->decode($input);
+	};
 
-	# Validate the procedure
-	# We must get a JSON object, i.e. a hash
-	if (ref($procedure) ne 'HASH') {
-
-		$log->warn("Cannot parse POST data into Perl hash => closing connection");
-
-		Slim::Web::HTTP::closeHTTPSocket($httpClient);
+	if ($@ || ref($procedure) ne 'HASH') {
+		$log->warn("Cannot parse POST data ($inputBytes bytes) into Perl hash => closing connection");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
 		return;
 	}
 
 	if ( main::DEBUGLOG && $log->is_debug ) {
-		$log->debug( "JSON parsed procedure: " . Data::Dump::dump($procedure) );
+		$log->debug( "JSON parsed procedure ($inputBytes bytes)" );
 	}
 
 	# we must have a method
 	my $method = $procedure->{'method'};
 
-	if (!$method) {
-
-		$log->warn("Request has no method => closing connection");
-
-		Slim::Web::HTTP::closeHTTPSocket($httpClient);
+	if (!$method || ref($method)) {
+		$log->warn("Request has no valid method => closing connection");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
 		return;
 	}
-
 
 	# figure out the method wanted
 	my $funcPtr = $methods{$method};
 
 	if (!$funcPtr) {
-
-		# return error, not a known procedure
 		$log->warn("Unknown method $method => closing connection");
-
-		Slim::Web::HTTP::closeHTTPSocket($httpClient);
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
 		return;
-
 	} elsif (ref($funcPtr) ne 'CODE') {
-
-		# return internal server error
 		$log->error("Procedure $method refers to non CODE ??? => closing connection");
-
 		Slim::Web::HTTP::closeHTTPSocket($httpClient);
 		return;
 	}
 
-
-	# parse the parameters
+	# parse and validate the parameters: [$playerScalar, [$cmdScalar, ...]]
 	my $params = $procedure->{'params'};
 
-	if (ref($params) ne 'ARRAY') {
-
-		# error, params is an array or an object
-		$log->warn("Procedure $method has params not ARRAY => closing connection");
-		Slim::Web::HTTP::closeHTTPSocket($httpClient);
+	if (ref($params) ne 'ARRAY' || scalar(@$params) < 2) {
+		$log->warn("Procedure $method has invalid params structure => closing connection");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
 		return;
 	}
 
-	# block access to "pref" & "serverpref" commands if request is coming from external host
-	my $peeraddr = $Slim::Web::HTTP::peeraddr{$httpClient};
-	if ( !Slim::Utils::Network::ip_is_host($peeraddr)
-		&& $prefs->get('protectSettings') && !$prefs->get('authorize')
-		&& $params->[1] && ref($params->[1]) && $params->[1]->[0] && $params->[1]->[0] =~ /^(?:pref|serverpref|stopserver|restartserver)/
-		&& ( Slim::Utils::Network::ip_is_gateway($peeraddr) || Slim::Utils::Network::ip_on_different_network($peeraddr) )
-	) {
-		$log->error("Access to settings is restricted to the local network or localhost: $peeraddr " . $httpResponse->request()->content());
-		Slim::Web::HTTP::closeHTTPSocket($httpClient);
+	if (defined($params->[0]) && ref($params->[0])) {
+		$log->warn("Procedure $method has non-scalar player parameter => closing connection");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
 		return;
+	}
+
+	if (ref($params->[1]) ne 'ARRAY' || !scalar(@{$params->[1]}) || !defined($params->[1]->[0]) || ref($params->[1]->[0])) {
+		$log->warn("Procedure $method has invalid command array parameter => closing connection");
+		_sendErrorAndClose($httpClient, $httpResponse, RC_BAD_REQUEST);
+		return;
+	}
+
+	# block access to "pref" & "serverpref" & server control commands from external or proxied hosts
+	my $peeraddr = $Slim::Web::HTTP::peeraddr{$httpClient};
+	if ( $prefs->get('protectSettings') && !$prefs->get('authorize')
+		&& $params->[1]->[0] =~ /^(?:pref|serverpref|stopserver|restartserver)/i
+	) {
+		my $isProxied = eval {
+			defined($request->header('X-Forwarded-For'))
+			|| defined($request->header('Forwarded'))
+			|| defined($request->header('X-Real-IP'))
+			|| defined($request->header('Via'))
+			? 1 : 0;
+		};
+		$isProxied = 1 if $@;
+
+		my $isExternal = !$peeraddr
+			|| $isProxied
+			|| ( !Slim::Utils::Network::ip_is_host($peeraddr)
+				&& ( Slim::Utils::Network::ip_is_gateway($peeraddr) || Slim::Utils::Network::ip_on_different_network($peeraddr) ) );
+
+		if ($isExternal) {
+			$log->error("Access to settings is restricted to direct local network or localhost: " . ($peeraddr // 'unknown') . " ($inputBytes bytes)");
+			_sendErrorAndClose($httpClient, $httpResponse, RC_FORBIDDEN);
+			return;
+		}
+	}
+
+	# cancel any previous subscription on this connection cleanly
+	my $prevContext = delete $contexts{$httpClient};
+	if (Slim::Control::Request::unregisterAutoExecute($httpClient) && $prevContext && $prevContext->{'x-jive'}) {
+		Slim::Web::HTTP::addHTTPLastChunk($httpClient, 0);
 	}
 
 	# create a hash to store our context
@@ -231,46 +274,53 @@ sub handleURI {
 	$context->{'procedure'} = $procedure;
 
 	# Detect the language the client wants content returned in
-	if ( my $lang = $httpResponse->request->header('Accept-Language') ) {
-		# split locales from from the Accept-Language header, sort by priority (q), pick first value, convert to upper case
+	if ( my $langHeader = $request->header('Accept-Language') ) {
+		# split locales from the Accept-Language header, sort by priority (q), pick first value, convert to upper case
 		# https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Language
-		($lang) = map {
+		my ($lang) = map {
 			uc($_->{l})
-		} grep {
-			$_
 		} sort {
 			$b->{q} <=> $a->{q}
 		} map {
-			s/^\s+|\s+$//g;
-			/([\w-]+)(;q=(\d+(\.\d+)?))?/i;
-			{
-				l => $1,
-				q => $3 // 1
+			my $item = $_;
+			$item =~ s/^\s+|\s+$//g;
+			if ($item =~ /^([\w-]+)(?:;q=(\d+(?:\.\d+)?))?$/i) {
+				{
+					l => $1,
+					q => defined($2) ? $2 : 1,
+				};
+			} else {
+				();
 			}
-		} split(',', $lang);
+		} split(',', $langHeader);
 
-		# transform locale to language code (eg. en_GB to EN_GB), fall back to EN if needed
-		if ($lang =~ s/-/_/) {
-			$lang =~ s/^([A-Z]+)_.*/$1/ if !$allLanguages->{$lang};
+		if (defined($lang) && length($lang)) {
+			# transform locale to language code (eg. en_GB to EN_GB), fall back to EN if needed
+			if ($lang =~ s/-/_/) {
+				$lang =~ s/^([A-Z]+)_.*/$1/ if !$allLanguages->{$lang};
+			}
+
+			$context->{lang} = $lang;
 		}
-
-		$context->{lang} = $lang;
 	}
 
-	if ( my $ua = ( $httpResponse->request->header('X-User-Agent') || $httpResponse->request->header('User-Agent') ) ) {
+	if ( my $ua = ( $request->header('X-User-Agent') || $request->header('User-Agent') ) ) {
 		$context->{ua} = $ua;
 	}
 
 	# Check our operational mode using our X-Jive header
-	# We must be delaing with a 1.1 client because X-Jive uses chunked transfers
+	# We must be dealing with a 1.1 client because X-Jive uses chunked transfers
 	# We must not be closing the connection
-	if (defined(my $xjive = $httpResponse->request()->header('X-Jive')) &&
+	my $respConn = $httpResponse->header('Connection') // '';
+	my $reqConn  = $request->header('Connection') // '';
+	if (defined(my $xjive = $request->header('X-Jive')) &&
 		$httpClient->proto_ge('1.1') &&
-		$httpResponse->header('Connection') !~ /close/i) {
+		$respConn !~ /close/i &&
+		$reqConn !~ /close/i) {
 
 		main::INFOLOG && $log->info("Operating in x-jive mode for procedure $method and client $httpClient");
 		$context->{'x-jive'} = 1;
-		$httpResponse->header('X-Jive' => 'Jive')
+		$httpResponse->header('X-Jive' => 'Jive');
 	}
 
 	# remember we need to send headers. We'll reset this once sent.
@@ -286,8 +336,8 @@ sub handleURI {
 		if ( $log->is_error ) {
 			my $funcName = main::DEBUGLOG ? Slim::Utils::PerlRunTime::realNameForCodeRef($funcPtr) : 'unk';
 			$log->error("While trying to run function coderef [$funcName]: [$@]");
-			main::DEBUGLOG && $log->is_debug && $log->error( "JSON parsed procedure: " . Data::Dump::dump($procedure) );
 		}
+		handleClose($httpClient);
 		Slim::Web::HTTP::closeHTTPSocket($httpClient);
 		return;
 	}
@@ -320,7 +370,7 @@ sub writeResponse {
 	# convert Perl object into JSON
 	my $jsonResponse = encode_json($responseRef);
 
-	main::DEBUGLOG && $isDebug && $log->info("JSON raw response: [$jsonResponse]");
+	main::DEBUGLOG && $isDebug && $log->info("JSON raw response length: [" . do { use bytes; length($jsonResponse) } . " bytes]");
 
 	$httpResponse->code(RC_OK);
 
@@ -422,7 +472,13 @@ sub requestMethod {
 		return;
 	}
 
-	my $playername = scalar ($reqParams->[0]);
+	if (defined($reqParams->[0]) && ref($reqParams->[0])) {
+		$log->error("playername is not a scalar!");
+		Slim::Web::HTTP::closeHTTPSocket($context->{'httpClient'});
+		return;
+	}
+
+	my $playername = $reqParams->[0];
 	my $client     = Slim::Player::Client::getClient($playername);
 	my $clientid = blessed($client) ? $client->id() : undef;
 
@@ -445,73 +501,88 @@ sub requestMethod {
 		my $finish;
 
 		if ( $client ) {
+			my $prevLang         = $client->languageOverride();
+			my $prevControlledBy = $client->controlledBy();
+			my $prevUA           = $client->controllerUA();
+
 			$finish = sub {
-				$client->languageOverride(undef);
-				$client->controlledBy(undef);
-				$client->controllerUA(undef);
+				$client->languageOverride($prevLang);
+				$client->controlledBy($prevControlledBy);
+				$client->controllerUA($prevUA);
 			};
 		}
 
-		if ( $client && $lang ) {
-			# Only override if the currently selected language is not a regional version of the client language
-			if ( ! Slim::Utils::Strings::isLanguageRegionalVersion($lang) ) {
-				$client->languageOverride($lang);
+		my $asyncPending = 0;
+		eval {
+			if ( $client && $lang ) {
+				# Only override if the currently selected language is not a regional version of the client language
+				if ( ! Slim::Utils::Strings::isLanguageRegionalVersion($lang) ) {
+					$client->languageOverride($lang);
+				}
+				$client->controlledBy('squeezeplay');
 			}
-			$client->controlledBy('squeezeplay');
-		}
-		elsif ( $lang ) {
-			$request->setLanguageOverride($lang);
-		}
-
-		if ( $ua && $client ) {
-			$client->controllerUA($ua);
-		}
-
-		# fix the encoding and/or manage charset param
-		$request->fixEncoding();
-
-		# remember we're the source and the $httpClient
-		$request->source('JSONRPC');
-		$request->connectionID($context->{'httpClient'});
-
-		if ($context->{'x-jive'}) {
-			# set this in case the query can be subscribed to
-			$request->autoExecuteCallback(\&requestWrite);
-		}
-
-		main::INFOLOG && $log->info("Dispatching...");
-
-		$request->execute();
-
-		if ($request->isStatusError()) {
-			$finish->() if $finish;
-
-			if ( $log->is_error ) {
-				$log->error("Request failed with error: " . $request->getStatusText);
+			elsif ( $lang ) {
+				$request->setLanguageOverride($lang);
 			}
 
-			Slim::Web::HTTP::closeHTTPSocket($context->{'httpClient'});
-			return;
-
- 		} else {
-
- 			# handle async commands
- 			if ($request->isStatusProcessing()) {
-
- 				main::INFOLOG && $log->info("Request is async: will be back");
-
- 				# add our write routine as a callback
- 				$request->callbackParameters( sub {
-					requestWrite(@_);
-					$finish->() if $finish;
-				} );
- 				return;
+			if ( $ua && $client ) {
+				$client->controllerUA($ua);
 			}
 
-			$finish->() if $finish;
+			# fix the encoding and/or manage charset param
+			$request->fixEncoding();
 
-			# the request was successful and is not async, send results back to caller!
-			requestWrite($request, $context->{'httpClient'}, $context);
+			# remember we're the source and the $httpClient
+			$request->source('JSONRPC');
+			$request->connectionID($context->{'httpClient'});
+
+			if ($context->{'x-jive'}) {
+				# set this in case the query can be subscribed to
+				$request->autoExecuteCallback(\&requestWrite);
+			}
+
+			main::INFOLOG && $log->info("Dispatching...");
+
+			$request->execute();
+
+			if ($request->isStatusError()) {
+				$finish->() if $finish;
+
+				if ( $log->is_error ) {
+					$log->error("Request failed with error: " . $request->getStatusText);
+				}
+
+				Slim::Web::HTTP::closeHTTPSocket($context->{'httpClient'});
+				return;
+
+			} else {
+
+				# handle async commands
+				if ($request->isStatusProcessing()) {
+
+					main::INFOLOG && $log->info("Request is async: will be back");
+
+					# add our write routine as a callback
+					$request->callbackParameters( sub {
+						eval { requestWrite(@_); 1; };
+						my $cbErr = $@;
+						$finish->() if $finish;
+						die $cbErr if $cbErr;
+					} );
+					$asyncPending = 1;
+					return;
+				}
+
+				$finish->() if $finish;
+
+				# the request was successful and is not async, send results back to caller!
+				requestWrite($request, $context->{'httpClient'}, $context);
+			}
+			1;
+		};
+		if (my $err = $@) {
+			$finish->() if $finish && !$asyncPending;
+			die $err;
 		}
 
 	} else {

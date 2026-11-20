@@ -33,7 +33,7 @@ sub initDetails {
 sub getMACAddress {
 	my $class = shift;
 
-	if (!main::SCANNER && !defined $class->{osDetails}->{mac}) {
+	if (!(defined(&main::SCANNER) && main::SCANNER()) && !defined $class->{osDetails}->{mac}) {
 		require Slim::Utils::Network;
 
 		# fall back to empty string to prevent repeated attempts (if needed)
@@ -127,7 +127,8 @@ sub initSearchPath {
 	# add path to Extension installer loaded plugins to @INC, NB this can only be done here as it requires Prefs to be loaded
 	# and the cachedir pref to be set before we can do it.  Prefs requires OSDetect so we can't do it at init time of OSDetect.
 	if ( my $cache = Slim::Utils::Prefs::preferences('server')->get('cachedir') ) {
-		unshift @INC, catdir($cache, 'InstalledPlugins');
+		my $incDir = catdir($cache, 'InstalledPlugins');
+		unshift @INC, $incDir if _isSafeIncDir($incDir);
 	}
 }
 
@@ -234,6 +235,48 @@ sub scanner {
 	return "$Bin/scanner.pl";
 }
 
+sub _useRust {
+	my $val = $ENV{LMS_USE_RUST};
+	return 1 unless defined $val;
+	$val =~ s/^\s+|\s+$//g;
+	return 0 if $val eq '' || $val =~ /^(?:0|false|no|off)$/i;
+	return 1;
+}
+
+sub _isSafeIncDir {
+	my $dir = shift;
+	return 0 unless defined $dir && length($dir);
+	return 0 unless file_name_is_absolute($dir);
+	return 0 if $dir =~ m{(?:^|[\\/])\.\.(?:$|[\\/])};
+	my @lst = lstat($dir);
+	return 0 unless @lst;
+	return 0 if -l _;
+	return 0 unless -d _;
+	if ($^O ne 'MSWin32') {
+		my ($mode, $uid) = @lst[2, 4];
+		return 0 unless $uid == $> || $uid == 0;
+		return 0 if $mode & 0002;
+	}
+	return 1;
+}
+
+sub _isSafeExecutable {
+	my $path = shift;
+	return 0 unless defined $path && length($path);
+	return 0 unless file_name_is_absolute($path);
+	return 0 if $path =~ m{(?:^|[\\/])\.\.(?:$|[\\/])};
+	my @lst = lstat($path);
+	return 0 unless @lst;
+	return 0 if -l _;
+	return 0 unless -f _ && -x _;
+	if ($^O ne 'MSWin32') {
+		my ($mode, $uid) = @lst[2, 4];
+		return 0 unless $uid == $> || $uid == 0;
+		return 0 if $mode & 0002;
+	}
+	return 1;
+}
+
 sub _rustLinuxBinArch {
 	return undef unless $^O eq 'linux';
 	my $archname = $Config::Config{archname} || '';
@@ -243,12 +286,12 @@ sub _rustLinuxBinArch {
 }
 
 sub gdresized {
-	if ( ($ENV{LMS_USE_RUST} // 1) && (my $arch = _rustLinuxBinArch()) ) {
+	if ( _useRust() && (my $arch = _rustLinuxBinArch()) ) {
 		for my $p (
 			"$Bin/Bin/$arch/gdresized",
 			"/usr/share/squeezeboxserver/Bin/$arch/gdresized",
 		) {
-			return $p if -f $p && -x _;
+			return $p if _isSafeExecutable($p);
 		}
 	}
 	return "$Bin/gdresized.pl";

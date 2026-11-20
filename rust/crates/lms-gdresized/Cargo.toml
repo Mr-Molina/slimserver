@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 image = { workspace = true }
+libc = "0.2"
 lms-cache = { path = "../lms-cache" }
 lms-image = { path = "../lms-image" }
 thiserror = { workspace = true }

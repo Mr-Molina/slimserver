@@ -100,8 +100,13 @@ sub loadConversionTables {
 
 				# if profile is duplicated, find the highest index to create a unique instance
 				if ($commandTable{$profile}) {
-					my @index = sort grep { $_ =~ /\Q$profile\E/ } keys %commandTable;
-					$profile .= '-' . (($index[-1] =~ /-(\d+$)/)[0] + 1);
+					my $max = 0;
+					for my $existing (keys %commandTable) {
+						if ($existing =~ /^\Q$profile\E-(\d+)$/ && $1 > $max) {
+							$max = $1;
+						}
+					}
+					$profile .= '-' . ($max + 1);
 				}
 
 				$line = <CONVERT>;
@@ -235,7 +240,7 @@ sub enabledFormat {
 
 	main::DEBUGLOG && $log->debug("Checking to see if $profile is enabled");
 
-	my @disabled = @{ $prefs->get('disabledformats') };
+	my @disabled = @{ $prefs->get('disabledformats') || [] };
 
 	if (!@disabled) {
 		return 1;
@@ -245,11 +250,13 @@ sub enabledFormat {
 		$log->debug("There are " . scalar @disabled . " disabled formats...");
 	}
 
+	my $baseProfile = ($profile =~ /^(.+)-\d+$/) ? $1 : undef;
+
 	for my $format (@disabled) {
 
 		main::DEBUGLOG && $log->debug("Testing $format vs $profile");
 
-		if ($format eq $profile) {
+		if ($format eq $profile || (defined $baseProfile && $format eq $baseProfile)) {
 
 			main::DEBUGLOG && $log->debug("** $profile Disabled **");
 
@@ -292,9 +299,9 @@ sub checkBin {
 			last;
 		}
 
-		my $binary;
+		my $binary = $binaries{$binName};
 
-		if (!exists $binaries{$binName}) {
+		if (!$binary) {
 			$binary = Slim::Utils::Misc::findbin($binName);
 		}
 
@@ -302,13 +309,14 @@ sub checkBin {
 
 			$binaries{$binName} = $binary;
 
-		} elsif (!exists $binaries{$binName}) {
+		} else {
 
 			$command = undef;
 
 			$@ = $binName;
 
 			$log->warn("   couldn't find binary for: $binName");
+			last;
 		}
 	}
 
@@ -454,7 +462,7 @@ sub getConvertCommand2 {
 			samplerateLimit  => $samplerateLimit || $defaultRateLimit,
 			clientid         => $clientid || 'undefined',
 			groupid          => $clientprefs ? ($clientprefs->get('syncgroupid') || 0) : 0,
-			name             => $client ? $client->name : 'undefined',
+			name             => $client ? ($client->name // 'undefined') : 'undefined',
 			player           => $player || 'undefined',
 			channels         => $track->channels() || 2,
 			sampleSize       => $track->samplesize || 16,
@@ -464,7 +472,7 @@ sub getConvertCommand2 {
 			# aif/wav oddity (for '-' rule)
 			# aif - aif: any SB that does not support wav requires aif header stripping
 			# wav/aif - pcm: force header stripping
-			stripHeader      => ($caps->{'E'}->{'NOHEADER'} =~ /$streamMode/) || ($command eq "-" &&
+			stripHeader      => (($caps->{'E'}->{'NOHEADER'} // '') =~ /$streamMode/) || ($command eq "-" &&
 								(($type =~ /(wav|aif)/ && $streamformat eq 'pcm') ||
                                  ($type eq 'aif' && $streamformat eq 'aif' && !grep {$_ eq 'wav'} @supportedformats))),
 		};
@@ -525,6 +533,58 @@ sub getConvertCommand2 {
 #	return $res;
 #}
 
+sub _shellEscape {
+	my ($val, $allowSpaces) = @_;
+
+	return '' unless defined $val;
+
+	if (!main::ISWINDOWS) {
+		if ($allowSpaces) {
+			$val =~ s/[\0\r\n]+/ /g;
+			$val =~ s/\s+/ /g;
+			$val =~ s/([^\w.\/:,=\@+\- ])/\\$1/g;
+		}
+		else {
+			$val =~ s/[\0\r\n]+//g;
+			$val =~ s/([^\w.\/:,=\@+\-])/\\$1/g;
+		}
+		return $val;
+	}
+
+	if ($allowSpaces) {
+		$val =~ s/[\0\r\n]+/ /g;
+		$val =~ s/\s+/ /g;
+		$val =~ s/[&|<>^%"\`;\$]/_/g;
+		return $val;
+	}
+
+	$val =~ s/[\0\r\n]+//g;
+	if ($val =~ /[\s"&|<>^%\`;\$\(\)\*\?\[\]\{\}\~#!]/) {
+		$val =~ s/(\\*)"/$1$1\\"/g;
+		$val =~ s/(\\+)$/$1$1/;
+		$val =~ s/%//g;
+		return '"' . $val . '"';
+	}
+
+	return $val;
+}
+
+sub _resolvePrefPlaceholder {
+	my ($placeholder) = @_;
+
+	my ($file, $pref) = $placeholder =~ /(.*)\.([^\.]+)$/;
+	my $val = '';
+
+	if ($file && $pref) {
+		$val = preferences($file)->get($pref) // '';
+	}
+	else {
+		$log->warn("couldn't find file preferences for: $placeholder");
+	}
+
+	return _shellEscape($val, 1);
+}
+
 sub tokenizeConvertCommand2 {
 	my ($transcoder, $filepath, $fullpath, $noPipe, $quality) = @_;
 
@@ -537,27 +597,31 @@ sub tokenizeConvertCommand2 {
 	# files with [] in their names.
 
 	while ( $command =~ /\[([^\]]+)\]/g ) {
-		$binaries{$1} = Slim::Utils::Misc::findbin($1) unless $binaries{$1};
+		if (!$binaries{$1}) {
+			my $bin = Slim::Utils::Misc::findbin($1);
+			$binaries{$1} = $bin if $bin;
+		}
 	}
-	$command =~ s/\[([^\]]+)\]/'"' . $binaries{$1} . '"'/eg;
+	$command =~ s/\[([^\]]+)\]/'"' . ($binaries{$1} \/\/ '') . '"'/eg;
 
 	my ($start, $end);
 
 	my %subs;
+	my %capSubs;
 	my %vars;
 
 	# Special case for cuesheets. We pass the start and end
 	# of the track within the file.
-	if ($fullpath =~ /#(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/) {
+	if (defined $fullpath && $fullpath =~ /#(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/) {
 		 ($start, $end) = ($1, $2);
 	}
 
 	if ($transcoder->{'start'}) {
-		$start += $transcoder->{'start'};
+		$start = ($start || 0) + $transcoder->{'start'};
 	}
 
 	# there should be no start when using stdin (cue or not)
-	if ($start && $transcoder->{'extensions'}->{'NOSTART'} !~ /$transcoder->{'streamMode'}/) {
+	if ($start && ($transcoder->{'extensions'}->{'NOSTART'} // '') !~ /$transcoder->{'streamMode'}/) {
 		push @{$transcoder->{'usedCapabilities'}}, 'T';
 	}
 
@@ -572,15 +636,21 @@ sub tokenizeConvertCommand2 {
 
 	# Find what substitutions we need to make
 	foreach my $cap ($transcoder->{'streamMode'}, @{$transcoder->{'usedCapabilities'}}) {
-		my ($arg, $value) = $capabilities->{$cap} =~ /(\w+)=(.+)/;
+		my $capSpec = $capabilities->{$cap};
+		next unless defined $capSpec;
+		my ($arg, $value) = $capSpec =~ /(\w+)=(.+)/;
 		next unless defined $value;
-		$subs{$arg} = $value;
+		$capSubs{$arg} = $value;
 
 		# and find what variables they contain
 		foreach ($value =~ m/%(.)/g) {
 			$vars{$_} = 1;
 		}
 	}
+
+	$filepath //= '';
+	$fullpath //= '';
+	$quality  //= '';
 
 	# escape \, $, ", and ` in file names and URLs on Unix.
 	# On Windows, escape quotes and any backslashes preceding quotes/end of string.
@@ -597,6 +667,11 @@ sub tokenizeConvertCommand2 {
 		$fullpath =~ s/(\\+)$/$1$1/;
 	}
 
+	my $clientId    = $transcoder->{'clientid'} // 'undefined';
+	my $playerModel = $transcoder->{'player'} // 'undefined';
+	my $playerName  = $transcoder->{'name'} // $transcoder->{'clientname'} // 'undefined';
+	my $groupId     = $transcoder->{'groupid'} // 0;
+
 	# Check to see if we need to flip the endianess on output
 	$subs{'-x'}        = (unpack('n', pack('s', 1)) == 1) ? "" : "-x";
 
@@ -607,76 +682,68 @@ sub tokenizeConvertCommand2 {
 	$subs{'SAMPLESIZE'} = $transcoder->{'sampleSize'};
 	$subs{'SAMPLERATE'} = $transcoder->{'sampleRate'};
 	$subs{'OCHANNELS'}  = $transcoder->{'outputChannels'};
-	$subs{'CLIENTID'}   = do { (my $tmp = $transcoder->{'clientid'}) =~ tr/.:/-/;  $tmp };
-	$subs{'PLAYER'}     = do { (my $tmp = $transcoder->{'player'}  ) =~ tr/\" /_/; $tmp };
-	$subs{'NAME'}       = do { (my $tmp = $transcoder->{'name'}    ) =~ tr/\" /_/; $tmp };
-	$subs{'GROUPID'}    = $transcoder->{'groupid'} eq 0 ? $subs{'CLIENTID'} : do { (my $tmp = sprintf ( "g%011x", $transcoder->{'groupid'}) ) =~ s/..\K(?=.)/-/g; $tmp};
+	$subs{'CLIENTID'}   = _shellEscape(do { (my $tmp = $clientId)    =~ tr/.:/-/;  $tmp });
+	$subs{'PLAYER'}     = _shellEscape(do { (my $tmp = $playerModel) =~ tr/\" /_/; $tmp });
+	$subs{'NAME'}       = _shellEscape(do { (my $tmp = $playerName)  =~ tr/\" /_/; $tmp });
+	$subs{'GROUPID'}    = (!$groupId || $groupId eq '0') ? $subs{'CLIENTID'} : _shellEscape(do { (my $tmp = sprintf ( "g%011x", $groupId) ) =~ s/..\K(?=.)/-/g; $tmp});
+
+	my %varValues;
+	my $s = $start // 0;
+	my $e = $end   // 0;
 
 	foreach my $v (keys %vars) {
 		my $value;
 
-		if ($v eq 's') {$value = "$start";}
-		elsif ($v eq 'u') {$value = "$end";}
-		elsif ($v eq 't') {$value = Slim::Utils::DateTime::fracSecToMinSec($start);}
-		elsif ($v eq 'v') {$value = Slim::Utils::DateTime::fracSecToMinSec($end);}
-		elsif ($v eq 'w') {$value = $end - $start;}
+		if ($v eq 's') {$value = "$s";}
+		elsif ($v eq 'u') {$value = "$e";}
+		elsif ($v eq 't') {$value = Slim::Utils::DateTime::fracSecToMinSec($s);}
+		elsif ($v eq 'v') {$value = Slim::Utils::DateTime::fracSecToMinSec($e);}
+		elsif ($v eq 'w') {$value = $e - $s;}
 
-		elsif ($v eq 'b') {$value = $transcoder->{'rateLimit'} * 1000;}
+		elsif ($v eq 'b') {$value = ($transcoder->{'rateLimit'} || 0) * 1000;}
 		elsif ($v eq 'B') {$value = $transcoder->{'rateLimit'};}
 
 		elsif ($v eq 'd') {$value = $transcoder->{'samplerateLimit'};}
-		elsif ($v eq 'D') {$value = $transcoder->{'samplerateLimit'} / 1000;}
+		elsif ($v eq 'D') {$value = ($transcoder->{'samplerateLimit'} || 0) / 1000;}
 
 		elsif ($v eq 'f') {$value = $subs{'FILE'};}
-		elsif ($v eq 'F') {$value = '"' . $fullpath . '"';}
+		elsif ($v eq 'F') {$value = $subs{'URL'};}
 
-		elsif ($v eq 'i') {$value = $transcoder->{'clientid'};}
+		elsif ($v eq 'i') {$value = _shellEscape($clientId);}
 		elsif ($v eq 'I') {$value = $subs{'CLIENTID'};}
-		elsif ($v eq 'p') {$value = $transcoder->{'player'};}
+		elsif ($v eq 'p') {$value = _shellEscape($playerModel);}
 		elsif ($v eq 'P') {$value = $subs{'PLAYER'};}
-		elsif ($v eq 'n') {$value = $transcoder->{'clientname'};}
+		elsif ($v eq 'n') {$value = _shellEscape($playerName);}
 		elsif ($v eq 'N') {$value = $subs{'NAME'};}
 		elsif ($v eq 'C') {$value = $transcoder->{'channels'};}
 		elsif ($v eq 'c') {$value = $transcoder->{'outputChannels'};}
 		elsif ($v eq 'q') {$value = $quality;}
 		elsif ($v eq 'Q') {$value = ($quality eq '0' ? '01' : $quality . '0');}
-		elsif ($v eq 'g') {$value = $transcoder->{'groupid'};}
+		elsif ($v eq 'g') {$value = _shellEscape($groupId);}
 		elsif ($v eq 'G') {$value = $subs{'GROUPID'};}
 
-		foreach (values %subs) {
-			s/%$v/$value/ge;
+		$varValues{$v} = $value;
+	}
+
+	# Single-pass %v expansion ONLY over capability templates (never inside $FILE$, $URL$, etc.)
+	for my $arg (keys %capSubs) {
+		$capSubs{$arg} =~ s/%([sutvwbBdDfFiIpPnNCcqQgG])/exists $varValues{$1} && defined $varValues{$1} ? $varValues{$1} : "%$1"/ge;
+		$subs{$arg} = $capSubs{$arg};
+	}
+
+	# Single-pass substitution for $KEY$, ${PREF}$, and cleanup of unset $KEY$ placeholders
+	$command =~ s!(?:(\s+)\$(-x|\w+)\$|\$\{([^}]+)\}\$|\$(-x|\w+)\$)!
+		if (defined $3) {
+			_resolvePrefPlaceholder($3);
 		}
-	}
-
-	# replace subs
-	foreach (keys %subs) {
-		$command =~ s/\$$_\$/$subs{$_}/g;
-	}
-
-	# Try to read parameters from file referenced in the command's placeholder '${PREF-FILE.KEY}$'
-	while ($command && $command =~ /\$\{(.*?)\}\$/g) {
-		my $placeholder = $1;
-		my $transcoder  = $binaries{$placeholder} || '';
-
-		if (!exists $binaries{$placeholder}) {
-			my ($file, $pref) = $placeholder =~ /(.*)\.([^\.]+)$/;
-
-			if ($file && $pref) {
-				$transcoder = preferences($file)->get($pref) || '';
-				$transcoder =~ s/\s+/ /;
-			}
-			else {
-				$log->warn("couldn't find file preferences for: $placeholder");
-			}
-
-			$binaries{$placeholder} = $transcoder;
+		else {
+			my $ws  = defined $1 ? $1 : '';
+			my $key = defined $2 ? $2 : $4;
+			exists $subs{$key}
+				? ($ws . (defined $subs{$key} ? $subs{$key} : ''))
+				: '';
 		}
-
-		$command =~ s/\${$placeholder}\$/$transcoder/g;
-	}
-
-	# clean all remaining '$*$'
-	$command =~ s/\s+\$\w+\$//g;
+	!ge;
 
 	if (!defined($noPipe)) {
 		$command .= (main::ISWINDOWS) ? '' : ' &';

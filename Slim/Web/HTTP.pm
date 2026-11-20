@@ -18,6 +18,11 @@ use File::Spec::Functions qw(:ALL);
 use FindBin qw($Bin);
 use HTTP::Date qw(time2str);
 use HTTP::Daemon ();
+{
+	# SEC-072: Suppress libwww-perl-daemon/<version> Server header on HTTP::Daemon::ClientConn::send_response
+	no warnings 'redefine';
+	*HTTP::Daemon::product_tokens = sub { 'Lyrion Music Server' };
+}
 use HTTP::Headers::ETag;
 use HTTP::Status qw(
     RC_FORBIDDEN
@@ -66,14 +71,78 @@ use constant MAXCHUNKSIZE     => 32768;
 # might get caught by this but I have not been able to think of any - Alan.
 use constant RETRY_TIME       => 0.40; # normal retry time
 
-use constant MAXKEEPALIVES    => -1;   # unlimited keepalive requests
-use constant KEEPALIVETIMEOUT => 75;
+use constant MAXKEEPALIVES         => 100;  # bounded keepalive requests per connection
+use constant KEEPALIVETIMEOUT      => 75;
+use constant MAX_HEADER_COUNT      => 100;
+use constant MAX_REQUEST_BODY_SIZE => 16 * 1024 * 1024;
+use constant MAX_PARAM_COUNT       => 500;
+use constant AUTH_FAIL_WINDOW => 60;
+use constant AUTH_FAIL_LIMIT  => 10;
+use constant AUTH_BLOCK_SECS  => 60;
+use constant AUTH_CACHE_MAX   => 1000;
 
 # Package variables
 
 my $openedport = undef;
 my $http_server_socket;
 my $connected = 0;
+my %openSockets = ();
+my %authFailures = ();
+
+my %RESERVED_PARAMS = map { $_ => 1 } qw(
+	cookies Content-Type userAgent url_query content contentAsFh
+	myClientState playermodel params pageAntiCSRFToken skinOverride
+	webroot path host serverResizesArt revision nosetup noserver
+);
+
+my $SCANNER_AUTH_TOKEN = _generateEphemeralToken();
+
+sub _generateEphemeralToken {
+	my $raw = '';
+	if (open my $urandom, '<:raw', '/dev/urandom') {
+		read($urandom, $raw, 32);
+		close $urandom;
+	}
+	if (length($raw) == 32) {
+		return unpack('H*', $raw);
+	}
+	return Digest::SHA1::sha1_hex($$ . ':' . Time::HiRes::time() . ':' . rand() . ':' . {});
+}
+
+sub scannerAuthToken {
+	return $SCANNER_AUTH_TOKEN;
+}
+
+sub _constantTimeEq {
+	my ($a, $b) = @_;
+	return 0 unless defined $a && defined $b;
+	use bytes;
+	my $lenA   = length($a);
+	my $lenB   = length($b);
+	my $maxLen = $lenA > $lenB ? $lenA : $lenB;
+	my $diff   = $lenA ^ $lenB;
+	for (my $i = 0; $i < $maxLen; $i++) {
+		my $ca = $i < $lenA ? ord(substr($a, $i, 1)) : 0;
+		my $cb = $i < $lenB ? ord(substr($b, $i, 1)) : 0;
+		$diff |= ($ca ^ $cb);
+	}
+	return $diff == 0 ? 1 : 0;
+}
+
+sub _htmlEscape {
+	my ($str) = @_;
+	return '' unless defined $str;
+	$str =~ tr/\r\n\0//d;
+	$str =~ s/&/&amp;/g;
+	$str =~ s/</&lt;/g;
+	$str =~ s/>/&gt;/g;
+	$str =~ s/"/&quot;/g;
+	$str =~ s/'/&#39;/g;
+	return $str;
+}
+
+sub _isExternalSettingsPeer;
+sub _closeErroredSocket;
 
 my $IMAGE_RESIZE_REGEX = qr/\/[\w-]+_(X|\d+)x(X|\d+)
 	(?:_([mpsSfFco]))?    # resizeMode, given by a single character
@@ -109,6 +178,128 @@ our @closeHandlers = ();
 my $log = logger('network.http');
 
 my $prefs = preferences('server');
+
+sub _isExternalSettingsPeer {
+	my ($httpClient) = @_;
+	my $peer = $peeraddr{$httpClient};
+	return 0 unless $peer;
+	return 0 if Slim::Utils::Network::ip_is_host($peer);
+	return 0 unless $prefs->get('protectSettings') && !$prefs->get('authorize');
+	return ( Slim::Utils::Network::ip_is_gateway($peer) || Slim::Utils::Network::ip_on_different_network($peer) ) ? 1 : 0;
+}
+
+sub _closeErroredSocket {
+	my ($httpClient) = @_;
+	return unless $httpClient;
+	delete $keepAlives{$httpClient};
+	closeStreamingSocket($httpClient, 1);
+}
+
+sub _applySecurityHeaders {
+	my ($response) = @_;
+	return unless $response;
+	$response->header('X-Content-Type-Options' => 'nosniff')
+		unless defined $response->header('X-Content-Type-Options');
+	$response->header('X-Frame-Options' => 'SAMEORIGIN')
+		unless defined $response->header('X-Frame-Options');
+	$response->header('Referrer-Policy' => 'same-origin')
+		unless defined $response->header('Referrer-Policy');
+	$response->header('Content-Security-Policy' =>
+		"default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; media-src 'self' http: https:; font-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'")
+		unless defined $response->header('Content-Security-Policy');
+}
+
+sub _redactedRequestString {
+	my ($request) = @_;
+	return '' unless $request;
+	my $str = $request->as_string();
+	$str =~ s/^((?:Authorization|Proxy-Authorization|Cookie|X-Scanner(?:-Token)?|X-Slim-CSRF)\s*:\s*).*$/$1\[REDACTED\]/mig;
+	return $str;
+}
+
+sub _renderErrorPage {
+	my ($code, $templatePath, $fallbackTitle, $params) = @_;
+	my $body = (main::WEBUI && $templatePath) ? filltemplatefile($templatePath, $params) : undef;
+	if (!defined($body) || ref($body) ne 'SCALAR' || !defined($$body) || $$body eq '') {
+		my $msg  = _htmlEscape($fallbackTitle || "HTTP $code");
+		my $html = "<h1>$code $msg</h1>";
+		$body    = \$html;
+	}
+	return $body;
+}
+
+sub _sanitizeDispositionFilename {
+	my ($name) = @_;
+	$name = '' unless defined $name;
+	$name = Slim::Utils::Misc::unescape($name);
+	$name =~ tr/\000-\037\177//d;
+	$name =~ s{^.*[/\\]}{}s;
+	$name =~ tr/"\/\\;//d;
+	$name = 'download' if $name eq '' || $name =~ /^\.+$/;
+	return $name;
+}
+
+sub _formatSetCookie {
+	my (%args) = @_;
+	my $cookie = CGI::Cookie->new(%args);
+	my $str = $cookie->as_string();
+	$str .= '; SameSite=Lax' unless $str =~ /(?:^|;\s*)SameSite=/i;
+	return $str;
+}
+
+sub _isAuthRateLimited {
+	my ($peer) = @_;
+	return 0 unless defined $peer && $peer ne '';
+	my $entry = $authFailures{$peer} || return 0;
+	my $now   = time();
+	if ($entry->{blockedUntil} && $entry->{blockedUntil} > $now) {
+		return int($entry->{blockedUntil} - $now) || 1;
+	}
+	return 0;
+}
+
+sub _recordAuthFailure {
+	my ($peer) = @_;
+	return unless defined $peer && $peer ne '';
+	my $now = time();
+	if (scalar(keys %authFailures) >= AUTH_CACHE_MAX) {
+		for my $k (keys %authFailures) {
+			my $e = $authFailures{$k};
+			if ((!$e->{blockedUntil} || $e->{blockedUntil} <= $now) && ($now - $e->{windowStart} > AUTH_FAIL_WINDOW)) {
+				delete $authFailures{$k};
+			}
+		}
+	}
+	my $entry = $authFailures{$peer};
+	if (!$entry || ($now - $entry->{windowStart} > AUTH_FAIL_WINDOW)) {
+		$entry = { count => 0, windowStart => $now, blockedUntil => 0 };
+		$authFailures{$peer} = $entry;
+	}
+	$entry->{count}++;
+	if ($entry->{count} >= AUTH_FAIL_LIMIT) {
+		$entry->{blockedUntil} = $now + AUTH_BLOCK_SECS;
+	}
+}
+
+sub _clearAuthFailure {
+	my ($peer) = @_;
+	delete $authFailures{$peer} if defined $peer && $peer ne '';
+}
+
+sub _sendImmediateError {
+	my ($httpClient, $response, $code, $templatePath, $fallbackTitle, $params, $reason) = @_;
+	if (Scalar::Util::reftype($httpClient) && Scalar::Util::reftype($httpClient) eq 'GLOB' && !defined ${*$httpClient}{'httpd_client_proto'}) {
+		${*$httpClient}{'httpd_client_proto'} = 1001;
+	}
+	_applySecurityHeaders($response);
+	$response->code($code);
+	$response->content_type('text/html');
+	$response->header('Connection' => 'close');
+	$response->content_ref(_renderErrorPage($code, $templatePath, $fallbackTitle, $params));
+	$response->protocol('HTTP/1.1') unless defined $response->protocol();
+	$httpClient->send_response($response);
+	closeHTTPSocket($httpClient, 0, $reason);
+}
 
 # initialize the http server
 sub init {
@@ -257,7 +448,11 @@ sub acceptHTTP {
 		return;
 	};
 
-	defined(Slim::Utils::Network::blocking($httpClient,0)) || $log->logdie("Cannot set port nonblocking");
+	if (!defined(Slim::Utils::Network::blocking($httpClient, 0))) {
+		$log->warn("Cannot set accepted HTTP socket nonblocking: $!");
+		$httpClient->close();
+		return;
+	}
 
 	binmode($httpClient);
 
@@ -274,14 +469,23 @@ sub acceptHTTP {
 			# Timeout for reads from the client.  HTTP::Daemon in get_request
 			# will call select(,,,10) but should not block long
 			# as we already know the socket is ready for reading
-			$httpClient->timeout(10);
+			$httpClient->timeout(5);
 
-			$peeraddr{$httpClient} = $peer;
+			$peeraddr{$httpClient}    = $peer;
+			$openSockets{$httpClient} = 1;
 
 			Slim::Networking::Select::addRead($httpClient, \&processHTTP);
-			Slim::Networking::Select::addError($httpClient, \&closeStreamingSocket);
+			Slim::Networking::Select::addError($httpClient, \&_closeErroredSocket);
 
 			$connected++;
+
+			Slim::Utils::Timers::setTimer(
+				$httpClient,
+				time() + KEEPALIVETIMEOUT,
+				\&closeHTTPSocket,
+				0,
+				'idle timeout',
+			);
 
 			if ( main::INFOLOG && $log->is_info ) {
 				$log->info("Accepted connection $connected from $peeraddr{$httpClient}:" . $httpClient->peerport);
@@ -298,6 +502,8 @@ sub acceptHTTP {
 	} else {
 
 		$log->warn("Did not accept connection, couldn't get peer addr");
+		$httpClient->close();
+		undef($httpClient);
 	}
 }
 
@@ -351,7 +557,35 @@ sub processHTTP {
 
 	main::DEBUGLOG && $isDebug && $log->info("Reading request...");
 
-	my $request    = $httpClient->get_request(); # XXX this will hang on the rare case a client does not send a full HTTP request
+	# SEC-076: Pre-check raw headers before HTTP::Daemon::get_request() can deduplicate Content-Length lines
+	my $rawPreview = $httpClient->can('read_buffer') ? $httpClient->read_buffer() : '';
+	$rawPreview = '' unless defined $rawPreview;
+	$rawPreview =~ s/^(?:\r?\n)+//;
+	if ($rawPreview !~ /\r?\n\r?\n/) {
+		my $peek = '';
+		my $recvRes;
+		while (1) {
+			$recvRes = recv($httpClient, $peek, 16384, Socket::MSG_PEEK);
+			last if defined($recvRes) || $! != EINTR;
+		}
+		if (defined($recvRes) && defined($peek) && length($peek)) {
+			$rawPreview .= $peek;
+			$rawPreview =~ s/^(?:\r?\n)+//;
+		}
+	}
+	if ($rawPreview =~ /\A(.*?)\r?\n\r?\n/s) {
+		my $rawHdrs = $1;
+		my @clMatches = ($rawHdrs =~ m{^Content-Length[ \t]*:}mig);
+		if (@clMatches > 1) {
+			$log->warn("Rejected duplicate Content-Length header from " . ($peeraddr{$httpClient} || 'unknown'));
+			my $errResp = HTTP::Response->new();
+			$errResp->protocol('HTTP/1.1');
+			_sendImmediateError($httpClient, $errResp, 400, undef, 'Bad Request', {}, 'duplicate Content-Length header');
+			return;
+		}
+	}
+
+	my $request    = $httpClient->get_request(1); # PERF-002: Parse headers only before reading body
 	# socket half-closed from client
 	if (!defined $request) {
 
@@ -373,8 +607,21 @@ sub processHTTP {
 		);
 	}
 
+	my $headerCount = 0;
+	$request->headers->scan(sub { $headerCount++ });
+	if ($headerCount > MAX_HEADER_COUNT) {
+		$log->warn("Too many request headers ($headerCount) from " . ($peeraddr{$httpClient} || 'unknown'));
+		my $resp = HTTP::Response->new(431);
+		$resp->protocol('HTTP/1.1');
+		_applySecurityHeaders($resp);
+		$resp->header('Connection' => 'close');
+		$httpClient->send_response($resp);
+		closeHTTPSocket($httpClient, 0, 'too many headers');
+		return;
+	}
+
 	if ( main::DEBUGLOG && $isDebug ) {
-		$log->debug("Raw request headers: [\n" . $request->as_string() . "]");
+		$log->debug("Raw request headers: [\n" . _redactedRequestString($request) . "]");
 	}
 
 	# this will hold our context and is used to fill templates
@@ -386,29 +633,158 @@ sub processHTTP {
 
 	$response->protocol('HTTP/1.1');
 	$response->request($request);
+	_applySecurityHeaders($response);
+
+	# Reject ambiguous Content-Length / Transfer-Encoding headers (CL/TE smuggling)
+	my @teHeaders = $request->header('Transfer-Encoding');
+	my @clHeaders = $request->header('Content-Length');
+	my $clInvalid = 0;
+	if (@teHeaders) {
+		$clInvalid = 1;
+	} elsif (@clHeaders > 1) {
+		$clInvalid = 1;
+	} elsif (@clHeaders == 1) {
+		my $clVal = $clHeaders[0];
+		$clInvalid = 1 if !defined($clVal) || $clVal !~ /^\s*\d+\s*$/;
+	}
+	if ($clInvalid) {
+		$log->warn("Rejected ambiguous Content-Length/Transfer-Encoding from " . ($peeraddr{$httpClient} || 'unknown'));
+		_sendImmediateError($httpClient, $response, 400, undef, 'Bad Request', $params, 'invalid CL/TE headers');
+		return;
+	}
+
+	# PERF-002: Enforce bounded request body size before reading body or dispatching handlers
+	my $clBytes = (@clHeaders == 1 && defined($clHeaders[0]) && $clHeaders[0] =~ /^\s*(\d+)\s*$/)
+		? ($1 + 0)
+		: 0;
+	if ($clBytes > MAX_REQUEST_BODY_SIZE) {
+		$log->warn("Rejected oversized request body (CL=$clBytes) from " . ($peeraddr{$httpClient} || 'unknown'));
+		_sendImmediateError($httpClient, $response, 413, undef, 'Payload Too Large', $params, 'payload too large');
+		return;
+	}
+
+	for my $e ($request->header('Expect')) {
+		if (lc($e) =~ /^\s*100-continue\s*$/) {
+			if ($httpClient->can('send_status_line') && $httpClient->can('send_crlf')) {
+				$httpClient->send_status_line(100);
+				$httpClient->send_crlf;
+			}
+		} else {
+			_sendImmediateError($httpClient, $response, 417, undef, 'Expectation Failed', $params, 'unsupported Expect header');
+			return;
+		}
+	}
+
+	if ($clBytes > 0) {
+		use bytes;
+		my $buf = '';
+		if ($httpClient->can('read_buffer')) {
+			my $rbuf = $httpClient->read_buffer('');
+			if (defined($rbuf) && length($rbuf)) {
+				if (length($rbuf) > $clBytes) {
+					$buf = substr($rbuf, 0, $clBytes);
+					$httpClient->read_buffer(substr($rbuf, $clBytes));
+				} else {
+					$buf = $rbuf;
+				}
+			}
+		}
+
+		my $readTimeout = ($httpClient->can('timeout') && $httpClient->timeout()) || 5;
+		while (length($buf) < $clBytes) {
+			my $remaining = $clBytes - length($buf);
+			my $chunkSize = $remaining > 65536 ? 65536 : $remaining;
+			my $n = sysread($httpClient, $buf, $chunkSize, length($buf));
+			if (!defined $n) {
+				next if $! == EINTR;
+				if ($! == EWOULDBLOCK || $!{EAGAIN}) {
+					my $fd = fileno($httpClient);
+					if (!defined $fd) {
+						$log->warn("Aborted request body read on invalid descriptor from " . ($peeraddr{$httpClient} || 'unknown'));
+						closeHTTPSocket($httpClient, 0, 'invalid body socket');
+						return;
+					}
+					my $rin = '';
+					vec($rin, $fd, 1) = 1;
+					my $ready;
+					while (1) {
+						$ready = select($rin, undef, undef, $readTimeout);
+						last if defined($ready) || $! != EINTR;
+						$rin = '';
+						vec($rin, $fd, 1) = 1;
+					}
+					if (!$ready) {
+						my $reason = defined($ready) ? 'request body timeout' : "request body select error: $!";
+						$log->warn("Aborted request body read ($reason) from " . ($peeraddr{$httpClient} || 'unknown'));
+						closeHTTPSocket($httpClient, 0, $reason);
+						return;
+					}
+					next;
+				}
+				my $err = "$!";
+				$log->warn("Aborted request body sysread error ($err) from " . ($peeraddr{$httpClient} || 'unknown'));
+				closeHTTPSocket($httpClient, 0, "body read error: $err");
+				return;
+			}
+			if ($n == 0) {
+				$log->warn("Aborted request body read on premature EOF (got " . length($buf) . " of $clBytes bytes) from " . ($peeraddr{$httpClient} || 'unknown'));
+				closeHTTPSocket($httpClient, 0, 'premature EOF reading body');
+				return;
+			}
+		}
+
+		$request->content($buf);
+	}
+
+	my $bodyBytes = defined($request->content)
+		? do { use bytes; length($request->content) }
+		: 0;
+	if ($bodyBytes > MAX_REQUEST_BODY_SIZE) {
+		$log->warn("Rejected oversized request body (CL=$clBytes, body=$bodyBytes) from " . ($peeraddr{$httpClient} || 'unknown'));
+		_sendImmediateError($httpClient, $response, 413, undef, 'Payload Too Large', $params, 'payload too large');
+		return;
+	}
 
 	# handle stuff we know about or abort
 	if ($request->method() eq 'GET' || $request->method() eq 'HEAD' || $request->method() eq 'POST'
 		|| $request->method() eq 'PUT' || $request->method() eq 'DELETE') {
 
-		# Manage authorization
+		# Manage authorization with failure rate limiting
+		my $peer       = $peeraddr{$httpClient} || 'unknown';
 		my $authorized = !$prefs->get('authorize');
 
-		if (my ($user, $pass) = $request->authorization_basic()) {
-			$authorized = checkAuthorization($user, $pass, $request);
+		if ( !$authorized ) {
+			if ( my $retryAfter = _isAuthRateLimited($peer) ) {
+				$log->warn("Rate-limiting HTTP auth attempts from $peer");
+				$response->header('Retry-After' => $retryAfter);
+				_sendImmediateError($httpClient, $response, 429, undef, 'Too Many Requests', $params, 'auth rate limited');
+				return;
+			}
+
+			my $hasCreds = 0;
+			if (my ($user, $pass) = $request->authorization_basic()) {
+				$hasCreds   = 1;
+				$authorized = checkAuthorization($user, $pass, $request);
+			}
+			elsif ( $request->header('X-Scanner-Token') || $request->header('X-Scanner') ) {
+				$hasCreds   = 1;
+				$authorized = checkAuthorization('', '', $request);
+			}
+			elsif ( defined $request->header('Authorization') ) {
+				$hasCreds = 1;
+			}
+
+			if ($authorized) {
+				_clearAuthFailure($peer) if $hasCreds;
+			} elsif ($hasCreds) {
+				_recordAuthFailure($peer);
+			}
 		}
 
 		# no Valid authorization supplied!
 		if (!$authorized) {
-
-			$response->code(RC_UNAUTHORIZED);
-			$response->header('Connection' => 'close');
-			$response->content_type('text/html');
-			$response->content_ref(filltemplatefile('html/errors/401.html', $params));
 			$response->www_authenticate(sprintf('Basic realm="%s"', string('SQUEEZEBOX_SERVER')));
-
-			$httpClient->send_response($response);
-			closeHTTPSocket($httpClient);
+			_sendImmediateError($httpClient, $response, RC_UNAUTHORIZED, 'html/errors/401.html', 'Unauthorized', $params, 'unauthorized');
 			return;
 		}
 
@@ -416,62 +792,96 @@ sub processHTTP {
 		# HTTP/1.1 Persistent connections or HTTP 1.0 Keep-Alives
 		# XXX - MAXKEEPALIVES should be a preference
 		# This always add a Connection: close header if we want the connection to be closed.
+		my $connHdr = $request->header('Connection');
+		$connHdr =~ tr/\r\n\0//d if defined $connHdr;
+		my $hasClose     = defined($connHdr) && $connHdr =~ /(?:^|[,\s])close(?:$|[,\s])/i;
+		my $hasKeepAlive = defined($connHdr) && $connHdr =~ /(?:^|[,\s])keep-alive(?:$|[,\s])/i;
+
 		if (MAXKEEPALIVES > 0 && defined $keepAlives{$httpClient} && $keepAlives{$httpClient} >= MAXKEEPALIVES) {
 
 			# This will close the client socket & remove the
 			# counter in sendResponse()
+			delete $keepAlives{$httpClient};
 			$response->header('Connection' => 'close');
 
 			main::DEBUGLOG && $isDebug && $log->info("Hit MAXKEEPALIVES, will close connection.");
 
 		} else {
 
-			# If the client requests a close or a keep-alive,
-			# set the initial response to the same.
-			$response->header('Connection' => $request->header('Connection'));
-
 			if ($httpClient->proto_ge('1.1')) {
 
-				# 1.1 defaults to persistent
-				if (!$request->header('Connection') || $request->header('Connection') ne 'close') {
+				# 1.1 defaults to persistent unless Connection: close
+				if ($hasClose) {
+					delete $keepAlives{$httpClient};
+					$response->header('Connection' => 'close');
+				} else {
 					$keepAlives{$httpClient}++;
+					$response->header('Connection' => 'keep-alive') if $hasKeepAlive;
 				}
 
 			} else {
 
-				# otherwise, it's 1.0, and only if it's not
-				# 'close', be persistent
-				if ($request->header('Connection') && $request->header('Connection') ne 'close') {
+				# HTTP/1.0 is persistent ONLY if Connection: keep-alive is requested without close
+				if ($hasKeepAlive && !$hasClose) {
 					$keepAlives{$httpClient}++;
-				}
-
-				# Put in an explicit close even if there wasn't
-				# one passed in. This ensures that the response
-				# logic will close the socket.
-				else {
+					$response->header('Connection' => 'keep-alive');
+				} else {
+					delete $keepAlives{$httpClient};
 					$response->header('Connection' => 'close');
-
 				}
-			}
-
-			if ( $keepAlives{$httpClient} ) {
-				# set the keep-alive timeout
-				Slim::Utils::Timers::setTimer(
-					$httpClient,
-					time() + KEEPALIVETIMEOUT,
-					\&closeHTTPSocket,
-					0,
-					'keep-alive timeout',
-				);
 			}
 		}
+
+		# Set the request time - for If-Modified-Since
+		$request->client_date(time());
 
 		# extract the URI and raw path
 		# the path is modified below for skins and stuff
 		my $uri   = $request->uri();
 		my $path  = $uri->path();
 
+		my $csrfProtectionLevel = main::WEBUI && $prefs->get('csrfProtectionLevel');
+
+		if ( main::WEBUI && $csrfProtectionLevel ) {
+			# remove our special X-Slim-CSRF header if present
+			$request->remove_header("X-Slim-CSRF");
+
+			# store CSRF auth code in fake request header if present
+			if ( defined($uri) && ($uri =~ m|^(.*)\;cauth\=([0-9]+:[0-9a-f]{64})$| ) ) {
+
+				my $plainURI = $1;
+				my $csrfAuth = $2;
+
+				if ( main::DEBUGLOG && $isDebug ) {
+					$log->debug("Found CSRF auth token in URI, resetting request URI to \"$plainURI\"");
+				}
+
+				# change the URI so later code doesn't "see" the cauth part
+				$request->uri($plainURI);
+
+				# store the cauth code in the request object (headers are handy!)
+				$request->push_header("X-Slim-CSRF",$csrfAuth);
+
+				# immediately refresh $uri and $path after stripping ;cauth=
+				$uri  = $request->uri();
+				$path = $uri->path();
+			}
+		}
+
 		main::DEBUGLOG && $isDebug && $log->debug("Raw path is [$path]");
+
+		# Route validation and single-pass unescape before rawFunc / protectSettings / skin routing
+		my $rawUriPath = defined($uri) ? $uri->path() : '';
+		my $unescapedPath = defined($path) ? Slim::Utils::Misc::unescape($path) : '';
+		if ( $rawUriPath =~ /(?:%00|%2e|\.\.)/i
+			|| $path =~ /[\0\r\n\\]/
+			|| $unescapedPath =~ /[\0\r\n\\]|(?:^|\/)\.\.(?:$|\/)/
+		) {
+			$log->warn("Rejected unsafe request path from " . ($peeraddr{$httpClient} || 'unknown') . ": [$rawUriPath]");
+			_sendImmediateError($httpClient, $response, 400, undef, 'Bad Request', $params, 'invalid path');
+			return;
+		}
+		$path = $unescapedPath;
 
 		checkCORS($request, $response);
 
@@ -480,6 +890,25 @@ sub processHTTP {
 		# we took care above of basic HTTP stuff and authorization
 		# $rawFunc shall call addHTTPResponse
 		if (my $rawFunc = Slim::Web::Pages->getRawFunction($path)) {
+
+			# Enforce protectSettings before rawFunc
+			my $normRawPath = $path;
+			$normRawPath =~ s|^/+||;
+			my $rawPageFunc = Slim::Web::Pages->getPageFunction($normRawPath) if $normRawPath !~ m{^imageproxy/};
+			if ( main::WEBUI && _isExternalSettingsPeer($httpClient)
+				&& ($normRawPath =~ m{^settings(?:/|$)}i || ($rawPageFunc && !ref($rawPageFunc) && $rawPageFunc->isa('Slim::Web::Settings')))
+			) {
+				my $hostIP = Slim::Utils::IPDetect::IP();
+				$log->error("Access to settings pages is restricted to the local network or localhost: $peeraddr{$httpClient} -> $hostIP ($path)");
+				_sendImmediateError($httpClient, $response, RC_FORBIDDEN, 'html/errors/403.html', 'Forbidden', $params, 'settings protected');
+				return;
+			}
+
+			# Enforce non-HEAD gate before rawFunc
+			if ( $request->method() eq 'HEAD' ) {
+				_sendImmediateError($httpClient, $response, RC_METHOD_NOT_ALLOWED, 'html/errors/405.html', 'Method Not Allowed', $params, 'HEAD on raw function');
+				return;
+			}
 
 			main::DEBUGLOG && $isDebug && $log->info("Handling [$path] using raw function");
 
@@ -496,41 +925,8 @@ sub processHTTP {
 
 			$log->is_warn && $log->warn("Bad Request: [" . join(' ', ($request->method, $request->uri)) . "]");
 
-			$response->code(RC_METHOD_NOT_ALLOWED);
-			$response->content_type('text/html');
-			$response->header('Connection' => 'close');
-			$response->content_ref(filltemplatefile('html/errors/405.html', $params));
-
-			$httpClient->send_response($response);
-			closeHTTPSocket($httpClient);
+			_sendImmediateError($httpClient, $response, RC_METHOD_NOT_ALLOWED, 'html/errors/405.html', 'Method Not Allowed', $params, 'method not allowed');
 			return;
-		}
-
-		# Set the request time - for If-Modified-Since
-		$request->client_date(time());
-
-		my $csrfProtectionLevel = main::WEBUI && $prefs->get('csrfProtectionLevel');
-
-		if ( main::WEBUI && $csrfProtectionLevel ) {
-			# remove our special X-Slim-CSRF header if present
-			$request->remove_header("X-Slim-CSRF");
-
-			# store CSRF auth code in fake request header if present
-			if ( defined($uri) && ($uri =~ m|^(.*)\;cauth\=([0-9a-f]{32})$| ) ) {
-
-				my $plainURI = $1;
-				my $csrfAuth = $2;
-
-				if ( main::DEBUGLOG && $isDebug ) {
-					$log->debug("Found CSRF auth token \"$csrfAuth\" in URI \"" . $uri . "\", so resetting request URI to \"$plainURI\"");
-				}
-
-				# change the URI so later code doesn't "see" the cauth part
-				$request->uri($plainURI);
-
-				# store the cauth code in the request object (headers are handy!)
-				$request->push_header("X-Slim-CSRF",$csrfAuth);
-			}
 		}
 
 		# Dont' process cookies for graphics, stylesheets etc.
@@ -539,13 +935,23 @@ sub processHTTP {
 				$params->{'cookies'} = { CGI::Cookie->parse($cookie) };
 
 				# define the precacheHiDPIArtwork pref if we're dealing with a high DPI monitor
-				if ( $params->{'cookies'}->{'Squeezebox-enableHiDPI'} && $params->{'cookies'}->{'Squeezebox-enableHiDPI'}->value > 1 && !defined $prefs->get('precacheHiDPIArtwork') ) {
-					$prefs->set('precacheHiDPIArtwork', 1);
+				if ( $params->{'cookies'}->{'Squeezebox-enableHiDPI'} ) {
+					my $hidpi = $params->{'cookies'}->{'Squeezebox-enableHiDPI'}->value;
+					if ( defined($hidpi) && $hidpi =~ /^\d+(?:\.\d+)?$/ && $hidpi > 1 && !defined $prefs->get('precacheHiDPIArtwork') ) {
+						$prefs->set('precacheHiDPIArtwork', 1);
+					}
 				}
 
 				foreach (@{PERSIST_COOKIES()}) {
-					if ( $params->{'cookies'}->{$_} && ($params->{'cookies'}->{$_}->value . '') ne ($prefs->get($_) . '') ) {
-						$prefs->set($_, $params->{'cookies'}->{$_}->value);
+					if ( $params->{'cookies'}->{$_} ) {
+						my $cookieVal = $params->{'cookies'}->{$_}->value;
+						if ( defined($cookieVal) && length($cookieVal) <= 64 && $cookieVal =~ /^[A-Za-z0-9_.:-]*$/ ) {
+							my $curVal = $prefs->get($_);
+							$curVal = '' unless defined $curVal;
+							if ($cookieVal ne $curVal) {
+								$prefs->set($_, $cookieVal);
+							}
+						}
 					}
 				}
 			}
@@ -575,7 +981,15 @@ sub processHTTP {
 		# to parse out like this.
 		if ($query) {
 
+			my $paramCount = 0;
+
 			foreach my $param (split /\&/, $query) {
+
+				if (++$paramCount > MAX_PARAM_COUNT) {
+					$log->warn("Too many request parameters ($paramCount) from " . ($peeraddr{$httpClient} || 'unknown'));
+					_sendImmediateError($httpClient, $response, 400, undef, 'Bad Request', $params, 'too many parameters');
+					return;
+				}
 
 				if ($param =~ /([^=]+)=(.*)/) {
 
@@ -588,6 +1002,13 @@ sub processHTTP {
 					# string with the appropriate magic set.
 					if ($value ne '*') {
 						$value = Slim::Utils::Unicode::utf8decode($value);
+					}
+
+					if ( $RESERVED_PARAMS{$name} ) {
+						if ( $name eq 'pageAntiCSRFToken' && !defined $providedPageAntiCSRFToken ) {
+							$providedPageAntiCSRFToken = $value;
+						}
+						next;
 					}
 
 					# Ick. It sure would be nice to use
@@ -620,6 +1041,8 @@ sub processHTTP {
 
 					my $name = Slim::Utils::Misc::unescape($param, 1);
 
+					next if $RESERVED_PARAMS{$name};
+
 					$params->{$name} = 1;
 
 					main::DEBUGLOG && $isDebug && $log->info("HTTP parameter $name = 1");
@@ -640,8 +1063,6 @@ sub processHTTP {
 			# equally well, only looking at the data that we would act on
 			($queryWithArgs, $queryToTest) = Slim::Web::HTTP::CSRF->getQueries($request, \%csrfReqParams);
 
-			# Stash CSRF token in $params for use in TT templates
-			$providedPageAntiCSRFToken = $params->{pageAntiCSRFToken};
 			# pageAntiCSRFToken is a bare token
 			$params->{pageAntiCSRFToken} = Slim::Web::HTTP::CSRF->makePageToken($request);
 		}
@@ -658,10 +1079,15 @@ sub processHTTP {
 
 			} elsif ($path =~ m|^([a-zA-Z0-9]+)$| && $skinMgr->isaSkin($1)) {
 
-				main::DEBUGLOG && $isDebug && $log->info("Alternate skin $1 requested, redirecting to $uri/ append a slash.");
+				my $location = '/' . $1 . '/';
+				my $rawQuery = defined($uri) ? $uri->query() : undef;
+				$location .= '?' . $rawQuery if defined($rawQuery) && $rawQuery ne '';
+
+				main::DEBUGLOG && $isDebug && $log->info("Alternate skin $1 requested, redirecting to $location.");
 
 				$response->code(RC_MOVED_PERMANENTLY);
-				$response->header('Location' => $uri . '/');
+				$response->header('Location' => $location);
+				$response->header('Connection' => 'close');
 
 				$httpClient->send_response($response);
 
@@ -690,31 +1116,21 @@ sub processHTTP {
 
 				} else {
 
-					# we can either throw a 404 here or just ignore the requested skin
-
-					# ignore: commented out
-					# $path =~ s{^/.+?/}{/};
-
 					# throw 404
-					$params->{'suggestion'} = qq(There is no "$desiredskin")
+					my $safeSkin = _htmlEscape($desiredskin);
+					$params->{'suggestion'} = qq(There is no "$safeSkin")
 						. qq( skin, try ) . Slim::Utils::Network::serverURL() . qq( instead.);
 
 					if ( $log->is_warn ) {
 						$log->warn("Invalid skin requested: [" . join(' ', ($request->method, $request->uri)) . "]");
 					}
 
-					$response->code(RC_NOT_FOUND);
-					$response->content_type('text/html');
-					$response->header('Connection' => 'close');
-					$response->content_ref(filltemplatefile('html/errors/404.html', $params));
-
-					$httpClient->send_response($response);
-					closeHTTPSocket($httpClient);
+					_sendImmediateError($httpClient, $response, RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', $params, 'invalid skin');
 					return;
 				}
 			}
 
-			$params->{"path"} = Slim::Utils::Misc::unescape($path);
+			$params->{"path"} = $path;
 			$params->{"host"} = $request->header('Host');
 		}
 
@@ -726,7 +1142,7 @@ sub processHTTP {
 		}
 
 		if ( main::DEBUGLOG && $isDebug ) {
-			$log->debug("Processed request headers: [\n" . $request->as_string() . "]");
+			$log->debug("Processed request headers: [\n" . _redactedRequestString($request) . "]");
 		}
 
 		# process the command
@@ -747,7 +1163,7 @@ sub processHTTP {
 
 			$response->code(RC_METHOD_NOT_ALLOWED);
 			$response->content_type('text/html');
-			$response->content_ref(filltemplatefile('html/errors/405.html', $params));
+			$response->content_ref(_renderErrorPage(RC_METHOD_NOT_ALLOWED, 'html/errors/405.html', 'Method Not Allowed', $params));
 		}
 
 		$httpClient->send_response($response);
@@ -791,9 +1207,10 @@ sub processURL {
 
 	for (my $i = 0; $i <= scalar keys %{$params}; $i++) {
 		last unless defined $params->{"p$i"};
-		$p[$i] = (!main::ISWINDOWS && Slim::Utils::Unicode::looks_like_utf8($_))
-			? Slim::Utils::Unicode::utf8on($params->{"p$i"})
-			: Slim::Utils::Unicode::utf8encode_locale($params->{"p$i"});
+		my $pval = $params->{"p$i"};
+		$p[$i] = (!main::ISWINDOWS && Slim::Utils::Unicode::looks_like_utf8($pval))
+			? Slim::Utils::Unicode::utf8on($pval)
+			: Slim::Utils::Unicode::utf8encode_locale($pval);
 	}
 
 	# This is trumped by query parameters 'command' and 'subcommand'.
@@ -802,7 +1219,10 @@ sub processURL {
 	if (defined $params->{'command'} && $path !~ /^memoryusage/) {
 		$p[0] = $params->{'command'};
 		$p[1] = $params->{'subcommand'};
-		$p[2] = join '&', map $_ . '=' . $params->{$_},  keys %{$params};
+		$p[2] = join '&',
+			map  { $_ . '=' . $params->{$_} }
+			grep { !$RESERVED_PARAMS{$_} && $_ ne 'command' && $_ ne 'subcommand' && defined $params->{$_} && !ref($params->{$_}) }
+			sort keys %{$params};
 	}
 
 	if ( main::INFOLOG && $log->is_info ) {
@@ -831,6 +1251,12 @@ sub processURL {
 		# Bug 14825, allow multiple stream.mp3 clients from the same address with a player param
 		my $address = $params->{player} || $peeraddr{$httpClient};
 
+		if (!defined($address) || $address eq '') {
+			$log->warn("Failed to create HTTP client for unknown address");
+			closeHTTPSocket($httpClient, 0, 'client init failed');
+			return;
+		}
+
 		main::INFOLOG && $log->is_info && $log->info("processURL found HTTP client at address=$address");
 
 		$client = Slim::Player::Client::getClient($address);
@@ -842,7 +1268,17 @@ sub processURL {
 			main::INFOLOG && $log->is_info && $log->info("New http client at $address");
 
 			if ($paddr) {
-				$client = Slim::Player::HTTP->new($address, $paddr, $httpClient);
+				my $err;
+				{
+					local $@;
+					$client = eval { Slim::Player::HTTP->new($address, $paddr, $httpClient) };
+					$err = $@;
+				}
+				if ($err || !blessed($client)) {
+					$log->warn("Failed to create HTTP client for " . (defined $address ? $address : 'unknown') . ($err ? ": $err" : ''));
+					closeHTTPSocket($httpClient, 0, 'client init failed');
+					return;
+				}
 				$client->init();
 
 				# Give the streaming player a descriptive name such as "Winamp from x.x.x.x"
@@ -870,23 +1306,25 @@ sub processURL {
 			}
 		}
 
-		if (defined($params->{'bitrate'})) {
-			# must validate 32 40 48 56 64 80 96 112 128 160 192 224 256 320 CBR
-			# set to the closest lower value of its not a match
-			my $temprate = $params->{'bitrate'};
+		if (blessed($client)) {
+			if (defined($params->{'bitrate'})) {
+				# must validate 32 40 48 56 64 80 96 112 128 160 192 224 256 320 CBR
+				# set to the closest lower value of its not a match
+				my $temprate = $params->{'bitrate'};
 
-			foreach my $i (qw(320 256 224 192 160 128 112 96 80 64 56 48 40 32)) {
-				$temprate = $i;
-				last if ($i <= $params->{'bitrate'});
+				foreach my $i (qw(320 256 224 192 160 128 112 96 80 64 56 48 40 32)) {
+					$temprate = $i;
+					last if ($i <= $params->{'bitrate'});
+				}
+
+				$prefs->client($client)->set('transcodeBitrate',$temprate);
+
+				main::INFOLOG && $log->is_info && $log->info("Setting transcode bitrate to $temprate");
+
+			} else {
+
+				$prefs->client($client)->set('transcodeBitrate',undef);
 			}
-
-			$prefs->client($client)->set('transcodeBitrate',$temprate);
-
-			main::INFOLOG && $log->is_info && $log->info("Setting transcode bitrate to $temprate");
-
-		} else {
-
-			$prefs->client($client)->set('transcodeBitrate',undef);
 		}
 	}
 
@@ -918,20 +1356,77 @@ sub processURL {
 
 	my @callbackargs = ($client, $httpClient, $response, $params);
 
-	# only execute a command if we have a command.
+	my $normPath = defined($path) ? $path : '';
+	$normPath =~ s|^/+||;
+	my $classOrCode = ($normPath ne '' && $normPath !~ m{^imageproxy/})
+		? Slim::Web::Pages->getPageFunction($normPath)
+		: undef;
+
+	# Enforce protectSettings BEFORE executeRequest and player=* broadcast
+	if ( _isExternalSettingsPeer($httpClient)
+		&& ( $normPath =~ m{^settings(?:/|$)}i
+			|| ($classOrCode && !ref($classOrCode) && $classOrCode->isa('Slim::Web::Settings'))
+			|| (defined($p[0]) && $p[0] =~ /^(?:pref|serverpref|stopserver|restartserver)$/i) )
+	) {
+		my $hostIP = Slim::Utils::IPDetect::IP() || 'unknown';
+		$log->error("Access to settings pages/commands is restricted to the local network or localhost: " . ($peeraddr{$httpClient} || 'unknown') . " -> $hostIP ($normPath)");
+
+		delete $keepAlives{$httpClient};
+		$response->code(RC_FORBIDDEN);
+		$response->content_type('text/html');
+		$response->header('Connection' => 'close');
+
+		my $body = _renderErrorPage(RC_FORBIDDEN, 'html/errors/403.html', 'Forbidden', $params);
+		prepareResponseForSending($client, $params, $body, $httpClient, $response);
+		return;
+	}
+
+	# Enforce non-HEAD command gate and route validation BEFORE executeRequest and player=* broadcast
 	if (defined($p[0])) {
 
-		if (defined($params->{"player"}) && $params->{"player"} eq "*") {
+		if ($response->request() && $response->request()->method() eq 'HEAD') {
+			delete $keepAlives{$httpClient};
+			$response->code(RC_METHOD_NOT_ALLOWED);
+			$response->content_type('text/html');
+			$response->header('Connection' => 'close');
 
-			for my $client2 (Slim::Player::Client::clients()) {
-
-				next if $client eq $client2;
-
-				$client2->execute(\@p);
-			}
+			my $body = _renderErrorPage(RC_METHOD_NOT_ALLOWED, 'html/errors/405.html', 'Method Not Allowed', $params);
+			prepareResponseForSending($client, $params, $body, $httpClient, $response);
+			return;
 		}
 
-		Slim::Control::Request::executeRequest($client, \@p, \&generateHTTPResponse, \@callbackargs);
+		my $validCmdRoute = main::WEBUI && ($classOrCode || (defined($path) && ($path =~ /status\.m3u/ || $path =~ /anyurl/)));
+		if ($validCmdRoute) {
+
+			if (defined($params->{"player"}) && $params->{"player"} eq "*") {
+
+				for my $client2 (Slim::Player::Client::clients()) {
+
+					next if $client eq $client2;
+
+					$client2->execute(\@p);
+				}
+			}
+
+			my $responded = 0;
+			my $ctrlReq = Slim::Control::Request::executeRequest(
+				$client,
+				\@p,
+				sub {
+					$responded = 1;
+					generateHTTPResponse(@_);
+				},
+				\@callbackargs,
+			);
+
+			if ( !$responded && (!$ctrlReq || (!$ctrlReq->isStatusDispatchable() && !$ctrlReq->isStatusProcessing())) ) {
+				generateHTTPResponse(@callbackargs);
+			}
+
+		} else {
+
+			generateHTTPResponse(@callbackargs);
+		}
 
 	} else {
 
@@ -991,40 +1486,43 @@ sub generateHTTPResponse {
 	# some browsers delete cookies aggressively - restore them from prefs
 	if (shouldHandleCookies($response->request->uri->path)) {
 		foreach (@{PERSIST_COOKIES()}) {
-			if (!$params->{'cookies'}->{$_}) {
-				my $cookie = CGI::Cookie->new(
-					-name    => $_,
-					-value   => $prefs->get($_),
-				);
-				$response->headers->push_header( 'Set-Cookie' => $cookie );
+			my $prefVal = $prefs->get($_);
+			if (!$params->{'cookies'}->{$_} && defined($prefVal) && length($prefVal) <= 64 && $prefVal =~ /^[A-Za-z0-9_.:-]*$/) {
+				$response->headers->push_header( 'Set-Cookie' => _formatSetCookie(
+					-name     => $_,
+					-value    => $prefVal,
+					-path     => '/',
+					-samesite => 'Lax',
+				) );
 			}
 		}
 	}
 
-	# lots of people need this
-	my $contentType = $params->{'Content-Type'} ||= $Slim::Music::Info::types{$type};
+	# lots of people need this - always derive from %Slim::Music::Info::types
+	my $contentType = $Slim::Music::Info::types{$type};
 
 	if ( Slim::Web::Pages->isRawDownload($path) ) {
 		$contentType = 'application/octet-stream';
 	}
 
-	if ( $path =~ /music\/[0-9a-f]+\/(?:download|cover)/ || /contributor\/[0-9a-f]+\/image/ || $path =~ /^imageproxy\// ) {
+	if ( $path =~ m{music/[0-9a-f]+/(?:download|cover)} || $path =~ m{contributor/[0-9a-f]+/image} || $path =~ m{^imageproxy/} ) {
 		# Avoid generating templates for download URLs
 		$contentType = 'application/octet-stream';
 	}
 
+	$contentType =~ tr/\r\n\0//d if defined $contentType;
+
 	# setup our defaults
-	$response->content_type($contentType);
+	$response->content_type($contentType) if defined $contentType;
 	#$response->expires(0);
 
 	# short-circuit if we don't have a content type to respond to.
 	unless (defined($contentType)) {
 
-		return 0 if $path =~ /status/i;
-
 		$response->code(RC_NOT_FOUND);
+		$response->content_type('text/html');
 
-		$body = filltemplatefile('html/errors/404.html', $params);
+		$body = _renderErrorPage(RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', $params);
 
 		return prepareResponseForSending(
 			$client,
@@ -1035,21 +1533,24 @@ sub generateHTTPResponse {
 		);
 	}
 
-	my $classOrCode = Slim::Web::Pages->getPageFunction($path) if $path !~ m{^imageproxy/};
+	my $classOrCode;
+	$classOrCode = Slim::Web::Pages->getPageFunction($path) if defined($path) && $path !~ m{^imageproxy/};
 
 	# protect access to settings pages: only allow from local network
-	if ( main::WEBUI
+	if ( defined($peeraddr{$httpClient})
 		&& !Slim::Utils::Network::ip_is_host($peeraddr{$httpClient})
 		&& $prefs->get('protectSettings') && !$prefs->get('authorize')
-		&& $classOrCode && !ref $classOrCode && $classOrCode->isa('Slim::Web::Settings')
+		&& ( (defined($path) && $path =~ m{^/?settings(?:/|$)}i)
+			|| ($classOrCode && !ref $classOrCode && $classOrCode->isa('Slim::Web::Settings')) )
 		&& ( Slim::Utils::Network::ip_is_gateway($peeraddr{$httpClient}) || Slim::Utils::Network::ip_on_different_network($peeraddr{$httpClient}) )
 	) {
 		my $hostIP = Slim::Utils::IPDetect::IP();
 		$log->error("Access to settings pages is restricted to the local network or localhost: $peeraddr{$httpClient} -> $hostIP ($path)");
 
 		$response->code(RC_FORBIDDEN);
+		$response->content_type('text/html');
 
-		$body = filltemplatefile('html/errors/403.html', $params);
+		$body = _renderErrorPage(RC_FORBIDDEN, 'html/errors/403.html', 'Forbidden', $params);
 
 		return prepareResponseForSending(
 			$client,
@@ -1068,22 +1569,23 @@ sub generateHTTPResponse {
 
 		if ( $path !~ m{(?:^progress\.|settings/)} ) {
 			# save the player id in a cookie
-			my $cookie = CGI::Cookie->new(
-				-name    => 'Squeezebox-player',
-				-value   => $params->{'player'},
-				-expires => '+1y',
-			);
-			$response->headers->push_header( 'Set-Cookie' => $cookie );
+			$response->headers->push_header( 'Set-Cookie' => _formatSetCookie(
+				-name     => 'Squeezebox-player',
+				-value    => $params->{'player'},
+				-expires  => '+1y',
+				-path     => '/',
+				-samesite => 'Lax',
+			) );
 		}
 	}
 
 	# this might do well to break up into methods
-	if ($contentType =~ /(?:image|javascript|css)/ || $path =~ /html\//) {
+	if ($contentType =~ /(?:image|javascript|css)/ || $path =~ m{^html/}) {
 
 		my $max = 60 * 60;
 
 		# increase expiry to a week for static content, but not cover art
-		unless ($contentType =~ /image/ && $path !~ /html\//) {
+		unless ($contentType =~ /image/ && $path !~ m{^html/}) {
 			$max = $max * 24 * 7;
 		}
 
@@ -1109,14 +1611,14 @@ sub generateHTTPResponse {
 
 	# Static files handled here, stream them out to the browser to avoid wasting memory
 	my $isStatic = 0;
-	if ( $path =~ /favicon\.ico/ ) {
+	if ( $path =~ m{(?:^|/)favicon\.ico$}i ) {
 		$path = 'html/mypage.ico';
 		$isStatic = 1;
 	}
-	elsif ( $path =~ /\.css|\.js(?!on)|robots\.txt/ ) {
+	elsif ( $path =~ m{(?:\.(?:css|js)|(?:^|/)robots\.txt)$}i ) {
 		$isStatic = 1;
 	}
-	elsif ( $path =~ m{html/} && $path !~ $IMAGE_RESIZE_REGEX ) {
+	elsif ( $path =~ m{^html/} && $path !~ $IMAGE_RESIZE_REGEX ) {
 		if ( $contentType ne 'text/html' && $contentType ne 'text/xml' && $contentType ne 'application/x-java-jnlp-file' ) {
 			$isStatic = 1;
 		}
@@ -1127,7 +1629,8 @@ sub generateHTTPResponse {
 
 		if ( !($mtime || $inode || $size || $body) ) {
 			$response->code(RC_NOT_FOUND);
-			$body = filltemplatefile('html/errors/404.html', $params);
+			$response->content_type('text/html');
+			$body = _renderErrorPage(RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', $params);
 		}
 		elsif (contentHasBeenModified($response, $mtime, $inode, $size)) {
 
@@ -1135,6 +1638,7 @@ sub generateHTTPResponse {
 
 			# $body contains a filehandle for static content
 			$body = getStaticContent($path, $params);
+			$body = \undef unless defined $body;
 		}
 	}
 	else {
@@ -1164,6 +1668,14 @@ sub generateHTTPResponse {
 				if (exists $params->{'playerid'} && $classOrCode->needsClient) {
 
 					$client = Slim::Player::Client::getClient($params->{'playerid'});
+					if (blessed($client)) {
+						$params->{'player'}        = $client->id();
+						$params->{'myClientState'} = $client;
+						$peerclient{$httpClient}   = $client->id();
+					} else {
+						$params->{'player'} = '';
+						delete $params->{'myClientState'};
+					}
 				}
 
 				$body = $classOrCode->handler(
@@ -1179,10 +1691,13 @@ sub generateHTTPResponse {
 
 		} elsif ($path =~ /^(?:stream\.mp3|stream)$/o) {
 			# Bug 15380, return correct content-type depending on what we're streaming
-			if ( my $sc = $client->controller()->songStreamController() ) {
-				if ( my $song = $sc->song() ) {
-					my $type = $song->streamformat();
-					$response->content_type( $Slim::Music::Info::types{$type} );
+			if ( blessed($client) && $client->can('controller') && $client->controller() ) {
+				if ( my $sc = $client->controller()->songStreamController() ) {
+					if ( my $song = $sc->song() ) {
+						my $type = $song->streamformat();
+						my $ct   = defined($type) ? $Slim::Music::Info::types{$type} : undef;
+						$response->content_type($ct) if defined $ct;
+					}
 				}
 			}
 
@@ -1250,11 +1765,15 @@ sub generateHTTPResponse {
 		} elsif ( !main::WEBUI && (
 			   $path =~ /status\.m3u/
 			|| $path =~ /(server|scanner|perfmon|log)\.(?:log|txt)/
+			|| $path =~ /^html\//
+			|| $path =~ /^\/?settings(?:\/|$)/i
+			|| $path =~ /anyurl/
 		) ) {
 			$response->content_type('text/html');
 			$response->code(RC_NOT_FOUND);
 
-			$$body = "<h1>404 Not Found: $path</h1><p>Lyrion Music Server web UI is not available in --noweb mode.</p>";
+			my $msg = "<h1>404 Not Found: " . _htmlEscape($path) . "</h1><p>Lyrion Music Server web UI is not available in --noweb mode.</p>";
+			$body = \$msg;
 
 			return prepareResponseForSending(
 				$client,
@@ -1293,7 +1812,7 @@ sub generateHTTPResponse {
 			$response->content_type('text/html');
 			$response->code(RC_NOT_FOUND);
 
-			$body = filltemplatefile('html/errors/404.html', $params);
+			$body = _renderErrorPage(RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', $params);
 
 			return prepareResponseForSending(
 				$client,
@@ -1340,17 +1859,18 @@ sub generateHTTPResponse {
 				}
 				else {
 					# when the full file is requested, then all the streaming is handled in the logFile call. Nothing is returned.
-					return 0 unless $contentType;
+					return 0;
 				}
 			}
 
 		} elsif ($path =~ /status\.m3u/) {
 
 			if ( main::WEBUI ) {
-				$$body = Slim::Web::Pages::Common->statusM3u($client);
+				my $m3u = Slim::Web::Pages::Common->statusM3u($client);
+				$body = defined($m3u) ? \$m3u : \undef;
 			}
 
-		} elsif ($path =~ /html\//) {
+		} elsif ($path =~ m{^html/}) {
 
 			# content is in the "html" subdirectory within the template directory.
 			# if it's HTML then use the template mechanism
@@ -1359,6 +1879,7 @@ sub generateHTTPResponse {
 				# if the path ends with a slash, then server up the index.html file
 				$path .= 'index.html' if $path =~ m|/$|;
 				$body  = filltemplatefile($path, $params);
+				$body  = \undef unless defined $body;
 
 			}
 
@@ -1407,7 +1928,7 @@ sub generateHTTPResponse {
 				$response->content_type('text/html');
 				$response->code(RC_NOT_FOUND);
 
-				$body = filltemplatefile('html/errors/404.html', $params);
+				$body = _renderErrorPage(RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', $params);
 
 				return prepareResponseForSending(
 					$client,
@@ -1421,10 +1942,11 @@ sub generateHTTPResponse {
 		} elsif ( $path =~ /anyurl/ ) {
 			main::DEBUGLOG && $log->is_debug && $log->debug('anyurl - parameters processed, redirect to status page if needed');
 			$body = filltemplatefile('xmlbrowser_redirect.html', $params);
+			$body = \undef unless defined $body;
 
 		} else {
 			# who knows why we're here, we just know that something ain't right
-			$$body = undef;
+			$body = \undef;
 		}
 	}
 
@@ -1434,7 +1956,8 @@ sub generateHTTPResponse {
 		if (defined $body && ref $body eq 'SCALAR' && !defined $$body) {
 
 			$response->code(RC_NOT_FOUND);
-			$body = filltemplatefile('html/errors/404.html', $params);
+			$contentType = 'text/html';
+			$body = _renderErrorPage(RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', $params);
 		}
 
 		return 0 unless $body;
@@ -1442,7 +1965,7 @@ sub generateHTTPResponse {
 	} else {
 
 		# Set the body to nothing, so the length() check won't fail.
-		$$body = "";
+		$body = \'';
 	}
 
 	# Create an ETag based on the mtime, file size and inode of the
@@ -1481,7 +2004,8 @@ sub generateHTTPResponse {
 		$contentType = 'application/x-javascript';
 	}
 
-	$response->content_type($contentType);
+	$contentType =~ tr/\r\n\0//d if defined $contentType;
+	$response->content_type($contentType) if defined $contentType;
 
 	#if (defined $params->{'refresh'}) {
 	#	$response->header('Refresh', $params->{'refresh'});
@@ -1513,20 +2037,67 @@ sub generateHTTPResponse {
 	return prepareResponseForSending($client, $params, $body, $httpClient, $response);
 }
 
+sub _sendStreamingError {
+	my ($httpClient, $response, $code, $size) = @_;
+	$response->protocol('HTTP/1.1') unless $response->protocol();
+	_applySecurityHeaders($response);
+	$response->code($code);
+	$response->headers->remove_content_headers;
+	$response->remove_header('Content-Disposition');
+	$response->header('Content-Range' => 'bytes *' . chr(47) . (defined $size ? $size : 0))
+		if $code == 416;
+	$response->content_length(0);
+	$response->header('Date' => time2str(time)) unless defined $response->header('Date');
+	$response->header('Connection' => 'close');
+	my $reftype = Scalar::Util::reftype($httpClient);
+	if ($reftype && $reftype eq 'GLOB') {
+		if (defined ${*$httpClient}{'httpd_daemon'}) {
+			${*$httpClient}{'httpd_client_proto'} = 1001 unless defined ${*$httpClient}{'httpd_client_proto'};
+			$httpClient->send_response($response);
+		} else {
+			use bytes;
+			my $raw = _stringifyHeaders($response) . $CRLF;
+			my $off = 0;
+			my $len = length($raw);
+			while ($off < $len) {
+				my $w = syswrite($httpClient, $raw, $len - $off, $off);
+				last unless defined $w || $! == EINTR;
+				$off += $w if defined $w;
+			}
+		}
+	} else {
+		$httpClient->send_response($response);
+	}
+	closeHTTPSocket($httpClient);
+}
+
 sub sendStreamingFile {
 	my ( $httpClient, $response, $contentType, $file, $objOrHash, $showInBrowser ) = @_;
+
+	use bytes;
 
 	# Send the file down - and hint to the browser
 	# the correct filename to save it as.
 	my $size = -s $file;
 
+	$contentType = 'application/octet-stream' unless defined $contentType && $contentType ne '';
+	$contentType =~ tr/\r\n\0//d;
+	my $safeFilename = _sanitizeDispositionFilename(basename($file));
+
+	my $fh = FileHandle->new($file, '<');
+	if (!$fh) {
+		$log->error("Couldn't open streaming file '$file': $!");
+		$response->headers->remove_content_headers;
+		_sendImmediateError($httpClient, $response, RC_NOT_FOUND, 'html/errors/404.html', 'Not Found', {}, 'file open failed');
+		return;
+	}
+	binmode($fh);
+
 	$response->content_type( $contentType );
 	$response->content_length( $size );
 	$response->header('Content-Disposition',
-		sprintf('attachment; filename="%s"', Slim::Utils::Misc::unescape(basename($file)))
+		sprintf('attachment; filename="%s"', $safeFilename)
 	) unless $showInBrowser;
-
-	my $fh = FileHandle->new($file);
 
 	# Range/TimeSeekRange
 	my $range   = $response->request->header('Range');
@@ -1607,10 +2178,8 @@ sub sendStreamingFile {
 
 		if ( !$valid ) {
 			$log->warn("Invalid TimeSeekRange.dlna.org request: $tsrange");
-			$response->code(406) unless $response->code >= 400;
-			$response->headers->remove_content_headers;
-			$httpClient->send_response($response);
-			closeHTTPSocket($httpClient);
+			my $errCode = ($response->code && $response->code >= 400) ? $response->code : 406;
+			_sendStreamingError($httpClient, $response, $errCode, $size);
 			return;
 		}
 	}
@@ -1619,30 +2188,25 @@ sub sendStreamingFile {
 	if ( $range ) {
 		# Only support a single range request, and no support for suffix requests
 		if ( $range =~ m/^bytes=(\d+)-(\d+)?$/ ) {
-			my $first = $1 || 0;
-			my $last  = $2 || $size - 1;
-			my $total = $last - $first + 1;
+			my $first = $1 + 0;
+			my $last  = defined($2) ? ($2 + 0) : ($size - 1);
 
-			if ( $first > $size ) {
+			if ( !$size || $first >= $size ) {
 				# invalid (past end of file)
-				$response->code(416);
-				$response->headers->remove_content_headers;
-				$httpClient->send_response($response);
-				closeHTTPSocket($httpClient);
-				return;
-			}
-
-			if ( $total < 1 ) {
-				# invalid (first > last)
-				$response->code(400);
-				$response->headers->remove_content_headers;
-				$httpClient->send_response($response);
-				closeHTTPSocket($httpClient);
+				_sendStreamingError($httpClient, $response, 416, $size);
 				return;
 			}
 
 			if ( $last >= $size ) {
 				$last = $size - 1;
+			}
+
+			my $total = $last - $first + 1;
+
+			if ( $total < 1 ) {
+				# invalid (first > last)
+				_sendStreamingError($httpClient, $response, 400, $size);
+				return;
 			}
 
 			main::DEBUGLOG && $log->is_debug && $log->debug("Handling Range request: $first-$last");
@@ -1713,10 +2277,11 @@ sub contentHasBeenModified {
 
 	my $ifModified  = $request->if_modified_since();
 	my $requestTime = $request->client_date();
+	my $isGetOrHead = ($method eq 'GET' || $method eq 'HEAD') ? 1 : 0;
 
 	if ($ifMatch) {
 
-		if ($ifMatch ne '*' && (!$etag || $etag eq 'W' || $etag ne $ifMatch)) {
+		if ($ifMatch ne '*' && (!$etag || $etag =~ m{^W/}i || $ifMatch =~ m{^W/}i || $etag ne $ifMatch)) {
 
 			main::DEBUGLOG && $log->is_debug && $log->debug("\tifMatch - RC_PRECONDITION_FAILED");
 			$response->code(RC_PRECONDITION_FAILED);
@@ -1730,7 +2295,7 @@ sub contentHasBeenModified {
 		#     respond with a status of 412 (Precondition Failed).
 		my $ifUnmodified = $request->if_unmodified_since();
 
-		if ($ifUnmodified && time() > $ifUnmodified) {
+		if ($ifUnmodified && $mtime && $mtime > $ifUnmodified) {
 
 			 main::DEBUGLOG && $log->is_debug && $log->debug("\tifUnmodified - RC_PRECONDITION_FAILED");
 
@@ -1741,6 +2306,7 @@ sub contentHasBeenModified {
 	# return early.
 	if ($response->code() eq RC_PRECONDITION_FAILED) {
 
+		$response->remove_header('Content-Length');
 		return 1;
 	}
 
@@ -1758,30 +2324,37 @@ sub contentHasBeenModified {
 	my $ifNoneMatch = $request->if_none_match();
 
 	if ($ifNoneMatch) {
+		my $matched = 0;
 
 		if ($ifNoneMatch eq '*') {
-
-			main::DEBUGLOG && $log->is_debug && $log->debug("\tifNoneMatch - * - returning 304");
-			$response->code(RC_NOT_MODIFIED);
-
+			$matched = 1;
 		} elsif ($etag) {
-
-			if ($request->if_range()) {
-
-				if ($etag ne 'W' && $ifNoneMatch eq $etag) {
-
-					main::DEBUGLOG && $log->is_debug && $log->debug("\tETag is not weak and ifNoneMatch eq ETag - returning 304");
-					$response->code(RC_NOT_MODIFIED);
+			if ($request->if_range() || !$isGetOrHead) {
+				if ($etag !~ m{^W/}i && $ifNoneMatch !~ m{^W/}i && $ifNoneMatch eq $etag) {
+					$matched = 1;
 				}
-
-			} elsif ($ifNoneMatch eq $etag) {
-
-				main::DEBUGLOG && $log->is_debug && $log->debug("\tifNoneMatch eq ETag - returning 304");
-				$response->code(RC_NOT_MODIFIED);
+			} else {
+				(my $weakEtag = $etag) =~ s{^W/}{}i;
+				(my $weakIfnm = $ifNoneMatch) =~ s{^W/}{}i;
+				if ($weakIfnm eq $weakEtag) {
+					$matched = 1;
+				}
 			}
 		}
 
-	} else {
+		if ($matched) {
+			if ($isGetOrHead) {
+				main::DEBUGLOG && $log->is_debug && $log->debug("\tifNoneMatch matched - returning 304");
+				$response->code(RC_NOT_MODIFIED);
+			} else {
+				main::DEBUGLOG && $log->is_debug && $log->debug("\tifNoneMatch matched on $method - returning 412");
+				$response->code(RC_PRECONDITION_FAILED);
+				$response->remove_header('Content-Length');
+				return 1;
+			}
+		}
+
+	} elsif ($isGetOrHead) {
 
 		# Else if a valid If-Modified-Since request-header field was given
 		# AND it is a GET or HEAD request
@@ -1789,9 +2362,6 @@ sub contentHasBeenModified {
 		# specified in this field, then the server MUST
 		#    respond with a status of 304 (Not Modified).
 		# A date later than the server's current request time is invalid.
-
-		my $ifModified  = $request->if_modified_since();
-		my $requestTime = $request->client_date();
 
 		if ($ifModified && $requestTime && $mtime) {
 
@@ -1832,21 +2402,31 @@ sub prepareResponseForSending {
 	# bug 7498: add charset to content type if needed
 	# If we're perl 5.8 or above, always send back utf-8
 	# Otherwise, send back the charset from the current locale
-	my $contentType = $response->content_type;
+	my $contentType = $response->header('Content-Type');
 
-	if ($contentType =~ m!^text/(?:html|xml)!) {
+	if (defined $contentType && $contentType ne '') {
+		$contentType =~ tr/\r\n\0//d;
 
-		$contentType .= '; charset=utf-8';
+		if ($contentType =~ m!^text/(?:html|xml)!i && $contentType !~ /;\s*charset\s*=/i) {
+
+			$contentType .= '; charset=utf-8';
+		}
+
+		$response->content_type($contentType);
 	}
 
-	$response->content_type($contentType);
-
+	_applySecurityHeaders($response);
 	$response->header( Date => time2str(time) );
 
-	# If we're already a 304 - that means we've already checked before the static content fetch.
-	if ($response->code() ne RC_NOT_MODIFIED) {
+	# Only evaluate conditional validators (If-None-Match / If-Modified-Since) on 200 OK responses
+	# so 4xx/5xx error responses (403, 404, 405, etc.) cannot be converted to 304 Not Modified.
+	if (defined($response->code()) && $response->code() == RC_OK) {
 
 		contentHasBeenModified($response);
+	}
+
+	if ($response->code() eq RC_NOT_MODIFIED || $response->code() eq RC_PRECONDITION_FAILED) {
+		$response->remove_header('Content-Length');
 	}
 
 	# buffer our response, including headers, and we have no more data
@@ -1859,12 +2439,14 @@ sub prepareResponseForSending {
 sub _stringifyHeaders {
 	my $response = shift;
 
+	_applySecurityHeaders($response);
+
 	my $code = $response->code();
 	my $data = '';
 
-	$data .= sprintf("%s %s %s%s", $response->protocol(), $code, HTTP::Status::status_message($code) || "", $CRLF);
+	$data .= sprintf("%s %s %s%s", ($response->protocol() || 'HTTP/1.1'), $code, HTTP::Status::status_message($code) || "", $CRLF);
 
-	$data .= sprintf("Server: Lyrion Music Server (%s - %s)%s", $::VERSION, $::REVISION, $CRLF);
+	$data .= "Server: Lyrion Music Server$CRLF";
 
 	$data .= $response->headers_as_string($CRLF);
 
@@ -1926,13 +2508,16 @@ sub addHTTPResponse {
 	use bytes;
 
 	# Collect all our output into one chunk, to reduce TCP packets
-	my $outbuf;
+	my $outbuf = '';
 
 	# First add the headers, if requested
 	if (!defined($sendheaders) || $sendheaders == 1) {
 
 		# Add a header displaying the time it took us to serve this request
-		$response->header( 'X-Time-To-Serve' => ( Time::HiRes::time() - $httpClient->start_time ) );
+		my $startTime = (blessed($httpClient) && $httpClient->can('start_time')) ? $httpClient->start_time : undef;
+		if (defined $startTime) {
+			$response->header( 'X-Time-To-Serve' => ( Time::HiRes::time() - $startTime ) );
+		}
 
 		$outbuf .= _stringifyHeaders($response) . $CRLF;
 	}
@@ -1946,8 +2531,10 @@ sub addHTTPResponse {
 		# use chunks if we have a transfer-encoding that says so
 		if ($chunked) {
 
-			# add chunk...
-			$outbuf .= sprintf("%X", length($$body)) . $CRLF . $$body . $CRLF;
+			# add non-empty chunk...
+			if (length($$body)) {
+				$outbuf .= sprintf("%X", length($$body)) . $CRLF . $$body . $CRLF;
+			}
 
 			# add a last empty chunk if we're closing the connection or if there's nothing more
 			if ($close || !$more) {
@@ -2027,8 +2614,8 @@ sub sendResponse {
 		$sentbytes = syswrite($httpClient, ${$segment->{'data'}}, $segment->{'length'}, $segment->{'offset'});
 	}
 
-	if (!defined $sentbytes && $! == EWOULDBLOCK) {
-		main::INFOLOG && $log->is_info && $log->info("Would block while sending. Resetting sentbytes for: $peeraddr{$httpClient}:$port");
+	if (!defined $sentbytes && ($! == EWOULDBLOCK || $! == EINTR)) {
+		main::INFOLOG && $log->is_info && $log->info("Would block or interrupted while sending. Resetting sentbytes for: $peeraddr{$httpClient}:$port");
 		$sentbytes = 0;
 	}
 
@@ -2083,20 +2670,22 @@ sub sendResponse {
 				}
 			}
 
+			# Post-send keep-alive timer once response queue is drained
+			Slim::Utils::Timers::killTimers( $httpClient, \&closeHTTPSocket );
+			if ( $keepAlives{$httpClient} ) {
+				Slim::Utils::Timers::setTimer(
+					$httpClient,
+					time() + KEEPALIVETIMEOUT,
+					\&closeHTTPSocket,
+					0,
+					'keep-alive timeout',
+				);
+			}
+
 		} else {
 
 			main::INFOLOG && $log->is_info && $log->info("More segments to send to $peeraddr{$httpClient}:$port");
 		}
-
-		# Reset keep-alive timer
-		Slim::Utils::Timers::killTimers( $httpClient, \&closeHTTPSocket );
-		Slim::Utils::Timers::setTimer(
-			$httpClient,
-			time() + KEEPALIVETIMEOUT,
-			\&closeHTTPSocket,
-			0,
-			'keep-alive timeout',
-		);
 	}
 }
 
@@ -2109,6 +2698,8 @@ sub sendResponse {
 sub addStreamingResponse {
 	my $httpClient = shift;
 	my $message    = shift;
+
+	use bytes;
 
 	my %segment = (
 		'data'   => \$message,
@@ -2145,8 +2736,13 @@ sub addStreamingResponse {
 
 sub clearOutputBuffer {
 	my $client = shift;
+	return unless defined $client;
 
-	delete $outbuf{$client->id};
+	my $key = (blessed($client) && $client->can('streamingsocket'))
+		? $client->streamingsocket()
+		: $client;
+
+	delete $outbuf{$key} if defined $key;
 }
 
 sub sendStreamingResponse {
@@ -2224,13 +2820,19 @@ sub sendStreamingResponse {
 				$silence = getStaticContent("html/lbrsilence.mp3");
 			}
 
-			my %segment = (
-				'data'   => $silence,
-				'offset' => 0,
-				'length' => length($$silence)
-			);
+			if (ref($silence) eq 'SCALAR' && defined $$silence && length($$silence)) {
+				my %segment = (
+					'data'   => $silence,
+					'offset' => 0,
+					'length' => length($$silence)
+				);
 
-			unshift @$outbuf, \%segment;
+				unshift @$outbuf, \%segment;
+			} else {
+				$log->warn("Unable to load silence MP3 for streaming client");
+				closeStreamingSocket($httpClient);
+				return 0;
+			}
 
 		} else {
 			my $chunkRef;
@@ -2247,7 +2849,20 @@ sub sendStreamingResponse {
 				}
 
 				if ( $len ) {
-					$streamingFile->sysread( $chunk, $len );
+					my $n;
+					my $retries = 0;
+					do {
+						$n = $streamingFile->sysread( $chunk, $len );
+					} while (!defined($n) && $! == EINTR && ++$retries < 5);
+
+					if (!defined($n)) {
+						if ($! == EWOULDBLOCK) {
+							return 0;
+						}
+						$log->warn("Error reading streaming file: $!");
+						closeStreamingSocket($httpClient, 1);
+						return undef;
+					}
 				}
 
 				if (defined($chunk) && length($chunk)) {
@@ -2323,19 +2938,25 @@ sub sendStreamingResponse {
 
 			unshift @$outbuf, $segment;
 
+			use bytes;
+
 			my $songIndex = Slim::Player::Source::streamingSongIndex($client);
 			my $url = Slim::Player::Playlist::url($client, $songIndex);
 
 			my $title = $url ? Slim::Music::Info::getCurrentTitle($client, $url) : string('WELCOME_TO_SQUEEZEBOX_SERVER');
-			$title =~ tr/'/ /;
+			$title = '' unless defined $title;
+			utf8::encode($title) if utf8::is_utf8($title);
+			$title =~ tr/'\r\n\0/ /d;
+			if (length($title) > 4065) {
+				$title = substr($title, 0, 4065);
+			}
 
 			my $metastring = "StreamTitle='" . $title . "';";
-			my $length = length($metastring);
+			my $pad        = (16 - (length($metastring) % 16)) % 16;
+			$metastring   .= chr(0) x $pad;
+			my $length     = length($metastring) / 16;
 
-			$metastring .= chr(0) x (16 - ($length % 16));
-			$length = length($metastring) / 16;
-
-			my $message = chr($length) . $metastring;
+			my $message = pack('C', $length) . $metastring;
 
 			my %segment = (
 				'data'   => \$message,
@@ -2384,7 +3005,7 @@ sub sendStreamingResponse {
 		my $prebytes = $segment->{'length'};
 		$sentbytes   = syswrite($httpClient, ${$segment->{'data'}}, $segment->{'length'}, $segment->{'offset'});
 
-		if (!defined $sentbytes && $! == EWOULDBLOCK) {
+		if (!defined $sentbytes && ($! == EWOULDBLOCK || $! == EINTR)) {
 			$sentbytes = 0;
 		}
 
@@ -2467,15 +3088,25 @@ sub forgetClient {
 sub closeHTTPSocket {
 	my ( $httpClient, $streaming, $reason ) = @_;
 
+	return unless $httpClient;
+
 	$reason ||= 'closed normally';
 
-	main::INFOLOG && $log->is_info && $log->info("Closing HTTP socket $httpClient with $peeraddr{$httpClient}:" . ($httpClient->peerport || 0). " ($reason)");
+	main::INFOLOG && $log->is_info && $log->info("Closing HTTP socket $httpClient with " . ($peeraddr{$httpClient} || 'unknown') . ":" . ($httpClient->peerport || 0). " ($reason)");
 
 	Slim::Utils::Timers::killTimers( $httpClient, \&closeHTTPSocket );
 
 	Slim::Networking::Select::removeRead($httpClient);
 	Slim::Networking::Select::removeWrite($httpClient);
 	Slim::Networking::Select::removeError($httpClient);
+
+	if (defined $streamingFiles{$httpClient}) {
+		main::INFOLOG && $log->is_info && $log->info("Closing streaming file.");
+		close  $streamingFiles{$httpClient};
+		delete $streamingFiles{$httpClient};
+	}
+
+	my $wasOpen = delete $openSockets{$httpClient};
 
 	# clean up the various caches
 	delete($outbuf{$httpClient});
@@ -2485,33 +3116,40 @@ sub closeHTTPSocket {
 	delete($keepAlives{$httpClient});
 	delete($peerclient{$httpClient});
 
-	# heads up to handlers, if any
-	for my $func (@closeHandlers) {
-		if (ref($func) eq 'CODE') {
+	if ($wasOpen) {
+		# heads up to handlers, if any
+		for my $func (@closeHandlers) {
+			if (ref($func) eq 'CODE') {
 
-			# XXX: should this use eval?
-			&{$func}($httpClient);
+				# XXX: should this use eval?
+				&{$func}($httpClient);
+			}
 		}
+
+		# Fix for bug 1289. A close on its own wasn't always actually
+		# sending a FIN or RST packet until significantly later for
+		# streaming connections. The call to shutdown seems to be a
+		# little more assertive about closing the socket. Windows-only
+		# for now, but could be considered for other platforms and
+		# non-streaming connections.
+		if (main::ISWINDOWS) {
+			$httpClient->shutdown(2);
+		}
+
+		$httpClient->close();
+		$connected-- if $connected > 0;
+	}
+	elsif ($httpClient->opened()) {
+		$httpClient->close();
 	}
 
-
-	# Fix for bug 1289. A close on its own wasn't always actually
-	# sending a FIN or RST packet until significantly later for
-	# streaming connections. The call to shutdown seems to be a
-	# little more assertive about closing the socket. Windows-only
-	# for now, but could be considered for other platforms and
-	# non-streaming connections.
-	if (main::ISWINDOWS) {
-		$httpClient->shutdown(2);
-	}
-
-	$httpClient->close();
 	undef($httpClient);
-	$connected--;
 }
 
 sub closeStreamingSocket {
-	my $httpClient = shift;
+	my ($httpClient, $force) = @_;
+
+	return unless $httpClient;
 
 	if (defined $streamingFiles{$httpClient}) {
 
@@ -2528,15 +3166,31 @@ sub closeStreamingSocket {
 		}
 	}
 
-	# Close socket unless it's keep-alive
-	if ( $keepAlives{$httpClient} ) {
+	# Close socket unless it's a healthy keep-alive connection
+	if ( !$force && $keepAlives{$httpClient} && $httpClient->connected() ) {
 		main::INFOLOG && $log->is_info && $log->info('Keep-alive on streaming socket');
+
+		delete($outbuf{$httpClient});
+		delete($sendMetaData{$httpClient});
+		delete($metaDataBytes{$httpClient});
+		delete($peerclient{$httpClient});
+
 		Slim::Networking::Select::addRead($httpClient, \&processHTTP);
 		Slim::Networking::Select::removeWrite($httpClient);
+
+		Slim::Utils::Timers::killTimers( $httpClient, \&closeHTTPSocket );
+		Slim::Utils::Timers::setTimer(
+			$httpClient,
+			time() + KEEPALIVETIMEOUT,
+			\&closeHTTPSocket,
+			0,
+			'keep-alive timeout',
+		);
 	}
 	else {
 		main::INFOLOG && $log->is_info && $log->info('Closing streaming socket');
-		closeHTTPSocket($httpClient, 1);
+		delete $keepAlives{$httpClient};
+		closeHTTPSocket($httpClient, 1, $force ? 'socket error' : 'stream closed');
 	}
 
 	return;
@@ -2551,49 +3205,47 @@ sub shouldHandleCookies {
 sub checkAuthorization {
 	my $username = shift;
 	my $password = shift;
-	my $request = shift;
-
-	my $ok = 0;
+	my $request  = shift;
 
 	# No authorization needed
 	if (!$prefs->get('authorize')) {
-
-		$ok = 1;
-		return $ok;
+		return 1;
 	}
 
-	if ($username eq $prefs->get('username')) {
-
-		my $pwd  = $prefs->get('password');
-
-		if ($pwd eq $password && $pwd eq '') {
-
-			$ok = 1;
-
-		} else {
-
-			$ok = (sha1_base64( $password ) eq $pwd);
-
-			# bug 11003 - try crypt if sha1 fails, keep backwards compatibility
-			# this should be removed some releases after 7.4
-			if (!$ok) {
-				my $salt = substr($pwd, 0, 2);
-				$ok = (crypt($password, $salt) eq $pwd);
-			}
+	# Check ephemeral server token for internal scanner requests (no pass-the-hash)
+	if ( $request && defined $SCANNER_AUTH_TOKEN && $SCANNER_AUTH_TOKEN ne '' ) {
+		my $hdrToken = $request->header('X-Scanner-Token');
+		$hdrToken = $request->header('X-Scanner') unless defined $hdrToken && $hdrToken ne '';
+		if ( defined($hdrToken) && $hdrToken ne '' && _constantTimeEq($hdrToken, $SCANNER_AUTH_TOKEN) ) {
+			return 1;
 		}
+	}
 
-		# Check for scanner progress request
-		if ( !$ok && $pwd eq $password ) {
-			if ( $request->header('X-Scanner') ) {
-				$ok = 1;
-			}
+	# Require defined non-empty password
+	return 0 unless defined($password) && $password ne '';
+
+	my $ok       = 0;
+	my $prefUser = $prefs->get('username');
+	my $pwd      = $prefs->get('password');
+
+	if ( defined($username) && $username ne ''
+		&& defined($prefUser) && $prefUser ne ''
+		&& _constantTimeEq($username, $prefUser)
+	) {
+		return 0 unless defined($pwd) && $pwd ne '';
+
+		$ok = _constantTimeEq(sha1_base64($password), $pwd);
+
+		# bug 11003 - try crypt if sha1 fails, keep backwards compatibility
+		# this should be removed some releases after 7.4
+		if (!$ok && length($pwd) >= 2) {
+			my $salt = substr($pwd, 0, 2);
+			$ok = _constantTimeEq(crypt($password, $salt), $pwd);
 		}
-
 	} else {
-
 		foreach my $client (Slim::Player::Client::clients()) {
-
-			if (defined($client->password()) && $client->password() eq $password) {
+			my $clientPwd = $client->password();
+			if (defined($clientPwd) && $clientPwd ne '' && _constantTimeEq($clientPwd, $password)) {
 				$ok = 1;
 				last;
 			}
@@ -2607,36 +3259,58 @@ sub checkCORS {
 	my ($request, $response) = @_;
 
 	if ( my $allowedHosts = $prefs->get('corsAllowedHosts') ) {
-		my ($host, $origin);
+		$response->header('Vary' => 'Origin') unless defined $response->header('Vary');
 
-		eval {
-			$host = $request->header('Host');
-			$origin = $request->header('Origin') || $request->header('Referer');
-		};
+		my $host   = $request->header('Host');
+		my $origin = $request->header('Origin');
 
-		if ($origin && $host) {
-			my ($h, $p) = Slim::Utils::Misc::crackURL($origin);
+		return $response->header('Access-Control-Allow-Origin')
+			unless defined($origin) && $origin ne '' && defined($host) && $host ne '';
 
-			# if the Host request header lists no port, crackURL() reports it as port 80, so we should
-			# pretend the Host header specified port 80 if it did not
-			$host .= ':80' if $host !~ m/:\d{1,}$/;
-			my $originHost = "$h:$p";
+		return undef if $origin =~ /[\r\n\0\s]/;
 
-			if ("$h:$p" ne $host) {
-				my $uri = URI->new($origin)->as_string;
-				$uri =~ s/(:\/\/.*?)\//$1/;
+		my $origUri = eval { URI->new($origin) };
+		return undef unless $origUri && $origUri->scheme && $origUri->scheme =~ /^https?$/i;
+		return undef if defined($origUri->userinfo) || defined($origUri->query) || defined($origUri->fragment);
 
-				my ($match) = grep {
-					$_ =~ s/(:\/\/.*?)\//$1/;
-					$_ eq $uri;
-				} split /[,\s]+/, $allowedHosts;
+		my $origPath = $origUri->path();
+		return undef if defined($origPath) && $origPath ne '' && $origPath ne '/';
 
-				if ($match) {
+		my $origHost = eval { $origUri->host() };
+		my $origPort = eval { $origUri->port() };
+		return undef unless defined($origHost) && $origHost ne '' && defined($origPort);
+
+		my $normOrigin = lc($origUri->scheme) . '://' . lc($origHost) . ':' . $origPort;
+
+		$host =~ tr/\r\n\0//d;
+		my $reqHostPort = $host =~ m/:\d+$/ ? lc($host) : lc($host) . ':80';
+
+		if ( lc("$origHost:$origPort") ne $reqHostPort ) {
+			my $matched = 0;
+
+			for my $entry (split /[,\s]+/, $allowedHosts) {
+				next unless defined($entry) && $entry ne '';
+				if ($entry eq '*') {
+					$response->header('Access-Control-Allow-Origin' => '*');
+					$matched = 1;
+					last;
+				}
+				my $entryUri = eval { URI->new($entry) };
+				next unless $entryUri && $entryUri->scheme && $entryUri->scheme =~ /^https?$/i && $entryUri->host;
+				next if defined($entryUri->userinfo) || defined($entryUri->query) || defined($entryUri->fragment);
+				my $entryPath = $entryUri->path();
+				next if defined($entryPath) && $entryPath ne '' && $entryPath ne '/';
+
+				my $normEntry = lc($entryUri->scheme) . '://' . lc($entryUri->host) . ':' . $entryUri->port;
+				if ($normEntry eq $normOrigin) {
 					$response->header('Access-Control-Allow-Origin' => $origin);
+					$matched = 1;
+					last;
 				}
-				elsif (main::INFOLOG && $log->is_info) {
-					$log->info("CORS is not enabled for $origin");
-				}
+			}
+
+			if (!$matched && main::INFOLOG && $log->is_info) {
+				$log->info("CORS is not enabled for $origin");
 			}
 		}
 	}
@@ -2676,7 +3350,8 @@ sub getFileInfoForStaticContent {
 }
 
 sub getStaticContentForTemplate {
-	return ${$skinMgr->_generateContentFromFile('get', @_)};
+	my $ref = $skinMgr->_generateContentFromFile('get', @_);
+	return (ref($ref) eq 'SCALAR' && defined $$ref) ? $$ref : '';
 }
 
 
@@ -2739,10 +3414,7 @@ sub downloadMusicFile {
 		$response->header( 'transferMode.dlna.org' => $tm );
 	}
 	else {
-		$response->code(406);
-		$response->headers->remove_content_headers;
-		$httpClient->send_response($response);
-		closeHTTPSocket($httpClient);
+		_sendStreamingError($httpClient, $response, 406, 0);
 		return;
 	}
 
@@ -2765,7 +3437,7 @@ sub downloadMusicFile {
 					# Also support LAME bitrate/quality
 					my ($bitrate) = $uri =~ m{bitrate=(\d+)};
 					my ($quality) = $uri =~ m{quality=(\d)};
-					$quality = 9 unless $quality =~ /^[0-9]$/;
+					$quality = 9 unless defined($quality) && $quality =~ m{^[0-9]$};
 
 					# Use aif because DLNA specifies big-endian format
 					$outFormat = 'aif' if $outFormat =~ /^(?:aiff?|wav)$/;
@@ -2804,6 +3476,7 @@ sub downloadMusicFile {
 
 					my $in;
 					my $out;
+					my $w;
 					my $done = 0;
 
 					if ( !$isHead ) {
@@ -2813,12 +3486,24 @@ sub downloadMusicFile {
 						# On windows ensure a child window is not opened if $command includes transcode processes
 						if (main::ISWINDOWS) {
 							Win32::SetChildShowWindow(0);
-						 	$in = FileHandle->new;
+							$in = FileHandle->new;
 							my $pid = $in->open($command);
-
+							if (!$pid) {
+								$in->close;
+								undef $in;
+							}
 							Win32::SetChildShowWindow();
 						} else {
 							$in = FileHandle->new($command);
+						}
+
+						if ( !$in ) {
+							$log->error("Couldn't open transcoder pipeline for " . $obj->url . ": $!");
+
+							$response->code(500);
+							$response->headers->remove_content_headers;
+							addHTTPResponse($httpClient, $response, \'', 1, 0);
+							return 1;
 						}
 
 						Slim::Utils::Network::blocking($in, 0);
@@ -2829,16 +3514,19 @@ sub downloadMusicFile {
 						$response->content_type( 'audio/L16;rate=' . $obj->samplerate . ';channels=' . $obj->channels );
 					}
 					else {
-						$response->content_type( $Slim::Music::Info::types{$outFormat} );
+						$response->content_type( $Slim::Music::Info::types{$outFormat} || 'application/octet-stream' );
 					}
 
 					# Tell client range requests are not supported
 					$response->header( 'Accept-Ranges' => 'none' );
 
-					my $filename = Slim::Utils::Misc::pathFromFileURL($obj->url);
-					$filename =~ s/\..+$/\.$outFormat/;
+					my $filename = basename(Slim::Utils::Misc::pathFromFileURL($obj->url));
+					if ($filename !~ s/\.[^.\/\\]+$/\.$outFormat/) {
+						$filename .= ".$outFormat";
+					}
+					my $safeName = _sanitizeDispositionFilename($filename);
 					$response->header('Content-Disposition',
-						sprintf('attachment; filename="%s"', basename($filename))
+						sprintf('attachment; filename="%s"', $safeName)
 					);
 
 					my $is11 = $response->request->protocol eq 'HTTP/1.1';
@@ -2862,20 +3550,29 @@ sub downloadMusicFile {
 
 					my $headers = _stringifyHeaders($response) . $CRLF;
 
+					# Remove Select watchers before handing $httpClient to AnyEvent::Handle
+					Slim::Networking::Select::removeRead($httpClient);
+					Slim::Networking::Select::removeWrite($httpClient);
+					Slim::Networking::Select::removeError($httpClient);
+
 					# non-blocking stream $pipeline to $httpClient
 					my $writer; $writer = sub {
-						if ($headers) {
-							syswrite $httpClient, $headers;
+						if (defined $headers) {
+							my $hdr = $headers;
 							undef $headers;
+							$out->push_write($hdr);
 
 							if ($isHead) {
 								$done = 1;
+								return;
 							}
 						}
 
 						if ($done) {
+							undef $w;
 							$out && $out->destroy;
 							$in && $in->close;
+							undef $writer;
 
 							if ( $httpClient->opened() ) {
 								closeHTTPSocket($httpClient);
@@ -2887,13 +3584,26 @@ sub downloadMusicFile {
 							# Try to read some data from the pipeline
 							my $len = sysread $in, my $buf, 32 * 1024;
 							if ( !defined $len ) {
-								my $w; $w = AnyEvent->io( fh => $in, poll => 'r', cb => sub {
+								if ($! == EWOULDBLOCK) {
+									$w = AnyEvent->io( fh => $in, poll => 'r', cb => sub {
+										undef $w;
+										$in && !$done && $writer && $writer->();
+									} );
+								}
+								else {
+									$done = 1;
 									undef $w;
-									$in && $writer->();
-								} );
+									if ($is11) {
+										$out->push_write( '0' . $CRLF . $CRLF );
+									}
+									else {
+										$writer->();
+									}
+								}
 							}
 							elsif ( $len == 0 ) {
 								$done = 1;
+								undef $w;
 
 								if ($is11) {
 									# Add last empty chunk
@@ -2920,14 +3630,16 @@ sub downloadMusicFile {
 						timeout    => 300,
 						on_timeout => sub {
 							main::INFOLOG && $log->is_info && $log->info("Timing out transcoded download for $httpClient");
+							undef $w;
 							$done = 1;
-							$writer->();
+							$writer && $writer->();
 						},
 						on_error   => sub {
 							my ($hdl, $fatal, $msg) = @_;
 							main::INFOLOG && $log->is_info && $log->info("Transcoded download error: $msg");
+							undef $w;
 							$done = 1;
-							$writer->();
+							$writer && $writer->();
 						},
 					);
 
@@ -2951,7 +3663,7 @@ sub downloadMusicFile {
 
 		main::INFOLOG && $log->is_info && $log->info("Opening $obj for download...");
 
-		my $ct = $Slim::Music::Info::types{$obj->content_type()};
+		my $ct = $Slim::Music::Info::types{$obj->content_type()} || 'application/octet-stream';
 
 		# Add DLNA HTTP header
 		if ( my $pn = $obj->dlna_profile ) {

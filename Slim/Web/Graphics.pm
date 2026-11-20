@@ -8,9 +8,12 @@ package Slim::Web::Graphics;
 
 use strict;
 
+use Cwd ();
 use Scalar::Util qw(blessed);
 use File::Basename;
 use File::Slurp ();
+use URI ();
+use URI::Escape ();
 
 use Slim::Player::ProtocolHandlers;
 use Slim::Utils::Log;
@@ -20,8 +23,11 @@ use Slim::Utils::Prefs;
 use Slim::Utils::ImageResizer;
 use Slim::Web::ImageProxy;
 
-use constant ONE_DAY  => 86400;
-use constant ONE_YEAR => ONE_DAY * 365;
+use constant ONE_DAY         => 86400;
+use constant ONE_YEAR        => ONE_DAY * 365;
+use constant MAX_DIMENSION   => 4096;
+use constant MAX_FETCH_BYTES => 16 * 1024 * 1024;
+use constant MAX_REDIRECTS   => 5;
 
 my $prefs = preferences('server');
 my $log   = logger('artwork');
@@ -85,12 +91,103 @@ sub _cached {
 	return;
 }
 
+sub _sanitizeSkinOverride {
+	my ($params) = @_;
+	return unless $params && defined $params->{skinOverride};
+	return $params->{skinOverride} =~ /^[A-Za-z0-9_-]+$/ ? $params->{skinOverride} : undef;
+}
+
+sub _confinePluginsCachePath {
+	my ($candidate, $real_cachedir) = @_;
+	return unless defined $candidate && defined $real_cachedir;
+
+	my $real_path = Cwd::realpath($candidate);
+	return unless defined $real_path;
+
+	$real_cachedir =~ s{[\/\\]+$}{};
+	return $real_path if index($real_path, "$real_cachedir/") == 0;
+	return $real_path if main::ISWINDOWS && index(lc($real_path), lc("$real_cachedir\\")) == 0;
+	return;
+}
+
+sub _fetchExternalArtwork {
+	my ($fetch_url, $orig_url, $redirect_count, $on_success, $on_error) = @_;
+
+	if ( !Slim::Web::ImageProxy::_validateExternalHttpUrl($fetch_url) ) {
+		$on_error->();
+		return;
+	}
+
+	Slim::Networking::SimpleAsyncHTTP->new(
+		sub {
+			my $http = shift;
+			if ( $http->code && $http->code =~ /^30[12378]$/ ) {
+				my $loc = $http->headers ? $http->headers->header('Location') : undef;
+				if ( $loc && $loc !~ /[\r\n\0]/ && ($redirect_count || 0) < MAX_REDIRECTS ) {
+					my $next_url = eval { URI->new_abs($loc, $fetch_url)->as_string };
+					if ( $next_url && Slim::Web::ImageProxy::_validateExternalHttpUrl($next_url) ) {
+						_fetchExternalArtwork($next_url, $orig_url, ($redirect_count || 0) + 1, $on_success, $on_error);
+						return;
+					}
+				}
+				$on_error->();
+				return;
+			}
+			my $content_ref = $http->contentRef;
+			if ( !$content_ref || ref($content_ref) ne 'SCALAR' || !defined($$content_ref) || length($$content_ref) > MAX_FETCH_BYTES ) {
+				$on_error->();
+				return;
+			}
+			$on_success->($http);
+		},
+		sub {
+			my ($http, $err, $res) = @_;
+			if ( $res && $res->code && $res->code =~ /^30[12378]$/ ) {
+				my $loc = $res->header('Location');
+				if ( $loc && $loc !~ /[\r\n\0]/ && ($redirect_count || 0) < MAX_REDIRECTS ) {
+					my $next_url = eval { URI->new_abs($loc, $fetch_url)->as_string };
+					if ( $next_url && Slim::Web::ImageProxy::_validateExternalHttpUrl($next_url) ) {
+						_fetchExternalArtwork($next_url, $orig_url, ($redirect_count || 0) + 1, $on_success, $on_error);
+						return;
+					}
+				}
+			}
+			$on_error->();
+		},
+		{
+			timeout     => 15,
+			maxRedirect => 0,
+		}
+	)->get($fetch_url);
+}
+
 sub artworkRequest {
 	my ( $client, $path, $params, $callback, @args ) = @_;
 
 	my $isInfo = main::INFOLOG && $log->is_info;
 
-	main::INFOLOG && $isInfo && $log->info("Artwork request: $path");
+	main::INFOLOG && $isInfo && $log->info("Artwork request: " . (defined $path ? $path : '<undef>'));
+
+	# Reject unsafe path constructs up front (SEC-005 / SEC-031)
+	if ( !defined $path
+		|| !length($path)
+		|| $path =~ /[\r\n\0]/
+		|| $path =~ m{^[/\\]}
+		|| $path =~ m{^https?:}i
+		|| $path =~ m{^[A-Za-z]:}
+		|| $path =~ m{\\\\}
+		|| $path =~ m{^//}
+		|| $path =~ m{(?:^|[/\\])\.\.(?:[/\\]|$)}
+	) {
+		send404($client, $params, $callback, @args);
+		return;
+	}
+
+	my $skin_override = _sanitizeSkinOverride($params);
+	my $skin          = $skin_override || $prefs->get('skin');
+	my $cache_key     = ($skin_override && $path !~ m{^(?:music|contributor|plugins/cache)/})
+		? "$skin_override:$path"
+		: $path;
 
 	# We need the HTTP::Response object to control caching
 	my $response = $args[1];
@@ -106,13 +203,16 @@ sub artworkRequest {
 	# XXX remote URLs (from protocol handler icon)
 
 	# Check cache for this path
-	if ( $path !~ m{^imageproxy/} && (my $c = _cached($path)) ) {
-		my $ct = 'image/' . $c->{content_type};
+	if ( $path !~ m{^imageproxy/} && (my $c = _cached($cache_key)) ) {
+		require Slim::Utils::GDResizer;
+		my $sniffed = (ref $c->{data_ref} eq 'SCALAR') ? Slim::Utils::GDResizer::_content_type($c->{data_ref}, 1) : undef;
+		my $ct = 'image/' . ($sniffed || $c->{content_type});
 		$ct =~ s/jpg/jpeg/;
 		$response->content_type($ct);
+		$response->header( 'X-Content-Type-Options' => 'nosniff' );
 
-		# Cache music URLs for 1 year, others for 1 day
-		my $exptime = $path =~ /^music|^contributor/ ? ONE_YEAR : ONE_DAY;
+		# Cache music and contributor URLs for 1 year, others for 1 day
+		my $exptime = $path =~ m{^(?:music|contributor)/} ? ONE_YEAR : ONE_DAY;
 
 		$response->header( 'Cache-Control' => 'max-age=' . $exptime );
 		$response->expires( time() + $exptime );
@@ -124,11 +224,22 @@ sub artworkRequest {
 
 	my $fullpath;
 	my $no_cache;
+	my $is_plugins_cache = 0;
 
 	# Parse out spec from path
 	# WxH[_m][_bg][.ext]
 	# 'X' can be used instead of either W or H to determine automatically
 	my ($spec) = File::Basename::basename($path) =~ /_?((?:[0-9X]+x[0-9X]+)?(?:_\w)?(?:_[\da-fA-F]+)?(?:\.\w+)?)$/;
+	$spec //= '';
+
+	if ( $spec ne '' ) {
+		my ($sw, $sh, $sm, $sbg, $sext) = __PACKAGE__->parseSpec($spec);
+		if ( !defined($sw) && !defined($sh) && !defined($sm) && !defined($sbg) && !defined($sext) ) {
+			main::INFOLOG && $isInfo && $log->info("  Invalid resize specification: $spec");
+			send404($client, $params, $callback, @args);
+			return;
+		}
+	}
 
 	main::INFOLOG && $isInfo && $log->info("  Resize specification: $spec");
 
@@ -142,6 +253,8 @@ sub artworkRequest {
 		if ( $path !~ /\./ ) {
 			$path .= '.png';
 		}
+
+		$cache_key = $skin_override ? "$skin_override:$path" : $path;
 
 		main::INFOLOG && $isInfo && $log->info("  Special path translated to $path");
 	}
@@ -179,7 +292,7 @@ sub artworkRequest {
 								$cover = URI::Escape::uri_unescape($cover);
 							}
 
-							if ($cover =~ /^http/) {
+							if ($cover =~ /^https?:/i) {
 								$id = 'imageproxy/' . $cover;
 								$path=~ s/music\/current/$id/;
 
@@ -198,6 +311,7 @@ sub artworkRequest {
 					$path =~ s/current/$id/;
 				}
 
+				$cache_key = $path;
 				main::INFOLOG && $isInfo && $log->info("  Special path translated to $path");
 			}
 		}
@@ -231,11 +345,18 @@ sub artworkRequest {
 					width    => $width,
 					height   => $height,
 					mode     => $mode,
+					bgcolor  => $bgcolor,
+					format   => $ext,
 				);
 
+				my $sniffed = (ref $res eq 'SCALAR') ? Slim::Utils::GDResizer::_content_type($res, 1) : undef;
+				$format = $sniffed || $format || 'png';
 				my $ct = 'image/' . $format;
 				$ct =~ s/jpg/jpeg/;
 				$response->content_type($ct);
+				$response->header( 'X-Content-Type-Options' => 'nosniff' );
+				$response->header( 'Cache-Control' => 'max-age=' . ONE_YEAR );
+				$response->expires( time() + ONE_YEAR );
 
 				$callback->( $client, $params, $res, @args );
 				return;
@@ -286,17 +407,22 @@ sub artworkRequest {
 			# our default artwork are PNG files
 			$spec =~ s/\.\w+$/.png/;
 
+			$cache_key = $skin_override ? "$skin_override:$path" : $path;
+
 			# Don't allow browsers to cache this error image
 			$no_cache = 1;
 
 			main::INFOLOG && $isInfo && $log->info("  No cover found, translated to $path");
 
 			# Check cache for this image
-			if ( my $c = _cached($path) ) {
+			if ( my $c = _cached($cache_key) ) {
 				# Don't allow browsers to cache this error image
-				my $ct = 'image/' . $c->{content_type};
+				require Slim::Utils::GDResizer;
+				my $sniffed = (ref $c->{data_ref} eq 'SCALAR') ? Slim::Utils::GDResizer::_content_type($c->{data_ref}, 1) : undef;
+				my $ct = 'image/' . ($sniffed || $c->{content_type});
 				$ct =~ s/jpg/jpeg/;
 				$response->content_type($ct);
+				$response->header( 'X-Content-Type-Options' => 'nosniff' );
 				$response->header( 'Cache-Control' => 'no-cache' );
 				$response->expires( time() - 1 );
 
@@ -304,7 +430,6 @@ sub artworkRequest {
 				return;
 			}
 
-			my $skin = $params->{skinOverride} || $prefs->get('skin');
 			$fullpath = $skinMgr->fixHttpPath($skin, $path);
 		}
 		else {
@@ -337,9 +462,9 @@ sub artworkRequest {
 			$fullpath = Slim::Utils::Unicode::utf8on($fullpath) if $fullpath;
 		}
 		else {
-			my $path = 'html/images/artists.png';
-			my $skin = $params->{skinOverride} || $prefs->get('skin');
-			$fullpath = $skinMgr->fixHttpPath($skin, $path);
+			my $fallback_path = 'html/images/artists.png';
+			$fullpath = $skinMgr->fixHttpPath($skin, $fallback_path);
+			$cache_key = $skin_override ? "$skin_override:$path" : $path;
 		}
 
 		main::INFOLOG && $log->is_info && $log->info("  Found contributor portrait at $fullpath");
@@ -347,29 +472,44 @@ sub artworkRequest {
 
 	# If path begins with "plugins/cache" it is a special path
 	# meaning we need to lookup the actual path in our cache directory
-	elsif ( $path =~ m{^plugins/cache} ) {
+	elsif ( $path =~ m{^plugins/cache(?:/(.+))?$} ) {
+		my $rel = $1;
 		my $cachedir = $prefs->get('cachedir');
+		if ( !$rel || !$cachedir ) {
+			send404($client, $params, $callback, @args);
+			return;
+		}
 		$cachedir =~ s{/$}{};
-		$path =~ s{^plugins/cache}{$cachedir};
+		$fullpath = "$cachedir/$rel";
+		$is_plugins_cache = 1;
 	}
 
 	if ( !$fullpath ) {
 		$fullpath = $path;
 	}
 
-	if ( $spec ) {
+	if ( $spec ne '' ) {
 		# Strip spec off fullpath if necessary, keeping the file extension
 		my ($ext) = $spec =~ /(\.\w+)$/;
 		$ext ||= '';
-		$fullpath =~ s/_${spec}/$ext/;
+		my $qspec = quotemeta($spec);
+		$fullpath =~ s/_${qspec}/$ext/;
 	}
 
 	# Resolve full path if it's not already a full path (checks Unix and Windows path prefixes)
 	# Bug 16814: We also need to check for UNC prefix
-	if ( $fullpath !~ m{^/|^https?} && $fullpath !~ /^[a-z]:[\\\/]/i && $fullpath !~ /^\\\\/i ) {
-		my $skin = $params->{skinOverride} || $prefs->get('skin');
+	if ( $fullpath !~ m{^/|^https?:}i && $fullpath !~ /^[a-z]:[\\\/]/i && $fullpath !~ /^\\\\/i ) {
 		main::INFOLOG && $isInfo && $log->info("  Looking for: $fullpath in skin $skin");
 		$fullpath = $skinMgr->fixHttpPath($skin, $fullpath);
+	}
+
+	my $real_cachedir;
+	if ( $is_plugins_cache ) {
+		$real_cachedir = Cwd::realpath($prefs->get('cachedir'));
+		if ( !$real_cachedir ) {
+			send404($client, $params, $callback, @args);
+			return;
+		}
 	}
 
 	# Support pre-sized files already in place, this is used on SB Touch
@@ -381,30 +521,56 @@ sub artworkRequest {
 		# Add the spec back to the fullpath if there's more than the extension
 		my $fullpathspec = $fullpath;
 
-		if ( $spec && $spec ne $ext ) {
-			$fullpathspec =~ s/($ext)$/_${spec}$1/;
+		if ( $spec ne '' && $spec ne $ext ) {
+			my $qext = quotemeta($ext);
+			$fullpathspec =~ s/(${qext})$/_${spec}$1/;
 		}
 
-		if ( -e $fullpathspec ) {
-			main::INFOLOG && $isInfo && $log->info("  Using existing pre-cached file: $fullpathspec");
+		my $presized_target = $fullpathspec;
+		if ( $is_plugins_cache ) {
+			$presized_target = _confinePluginsCachePath($fullpathspec, $real_cachedir);
+		}
 
-			my ($ext) = $fullpathspec =~ /\.(\w+)$/;
-			my $ct = 'image/' . $ext;
-			$ct =~ s/(?:jpg|jpe)/jpeg/;
+		if ( $presized_target && -e $presized_target ) {
+			main::INFOLOG && $isInfo && $log->info("  Using existing pre-cached file: $presized_target");
+
+			my $body = File::Slurp::read_file($presized_target, binmode => ':raw');
+			require Slim::Utils::GDResizer;
+			my $sniffed = Slim::Utils::GDResizer::_content_type(\$body, 1);
+			if ( !$sniffed ) {
+				send404($client, $params, $callback, @args);
+				return;
+			}
+
+			my $ct = 'image/' . $sniffed;
+			$ct =~ s/jpg/jpeg/;
 			$response->content_type($ct);
+			$response->header( 'X-Content-Type-Options' => 'nosniff' );
 
-			my $exptime = ONE_DAY;
+			my $exptime = $path =~ m{^(?:music|contributor)/} ? ONE_YEAR : ONE_DAY;
 			$response->header( 'Cache-Control' => 'max-age=' . $exptime );
 			$response->expires( time() + $exptime );
-
-			my $body = File::Slurp::read_file($fullpathspec);
 
 			$callback->( $client, $params, \$body, @args );
 			return;
 		}
 	}
 
-	if ( $fullpath && ($fullpath =~ /^https?:/ || -e $fullpath) ) {
+	if ( $is_plugins_cache ) {
+		$fullpath = _confinePluginsCachePath($fullpath, $real_cachedir);
+		if ( !$fullpath ) {
+			send404($client, $params, $callback, @args);
+			return;
+		}
+	}
+
+	if ( $fullpath && ($fullpath =~ /^https?:/i || -e $fullpath) ) {
+		if ( $fullpath =~ /^https?:/i && !Slim::Web::ImageProxy::_validateExternalHttpUrl($fullpath) ) {
+			$log->warn("Blocked disallowed remote artwork URL in Graphics: $fullpath");
+			send404($client, $params, $callback, @args);
+			return;
+		}
+
 		main::idleStreams();
 
 		main::INFOLOG && $isInfo && $log->info("  Resizing: $fullpath using spec $spec");
@@ -412,15 +578,18 @@ sub artworkRequest {
 		my $imageCb = sub {
 			my ($body, $format) = @_;
 
-			$format ||= Slim::Music::Artwork->_imageContentType($body);
+			require Slim::Utils::GDResizer;
+			my $sniffed = (defined $body && ref $body eq 'SCALAR') ? Slim::Utils::GDResizer::_content_type($body, 1) : undef;
+			$format = $sniffed || $format;
 
-			if ( $body && $format && $format !~ /application/ && ref $body eq 'SCALAR' ) {
+			if ( $body && $sniffed && $format !~ /application/ && ref $body eq 'SCALAR' ) {
 				my $ct = $format =~ /image/ ? $format : 'image/' . $format;
 				$ct =~ s/jpg/jpeg/;
 				$response->content_type($ct);
+				$response->header( 'X-Content-Type-Options' => 'nosniff' );
 
-				# Cache music URLs for 1 year, others for 1 day
-				my $exptime = $path =~ /^music/ ? ONE_YEAR : ONE_DAY;
+				# Cache music and contributor URLs for 1 year, others for 1 day
+				my $exptime = $path =~ m{^(?:music|contributor)/} ? ONE_YEAR : ONE_DAY;
 
 				if ( $no_cache ) {
 					$response->header( 'Cache-Control' => 'no-cache' );
@@ -438,6 +607,7 @@ sub artworkRequest {
 				$log->error("Artwork resize for $path failed");
 				$response->code(500);
 				$response->content_type('text/html');
+				$response->header( 'X-Content-Type-Options' => 'nosniff' );
 				$response->expires( time() - 1 );
 				$response->header( 'Cache-Control' => 'no-cache' );
 
@@ -467,11 +637,11 @@ sub artworkRequest {
 
 		my $doResize = sub {
 			my $cover = $_[0];
-			Slim::Utils::ImageResizer->resize($cover, $path, $spec, sub {
+			Slim::Utils::ImageResizer->resize($cover, $cache_key, $spec, sub {
 				my ($body, $format, $readFromCache) = @_;
 
 				# if we didn't get a valid reference returned, try to read from cache
-				if ( !($body && $format && ref $body eq 'SCALAR') && (my $c = _cached($path, $readFromCache)) ) {
+				if ( !($body && $format && ref $body eq 'SCALAR') && (my $c = _cached($cache_key, $readFromCache)) ) {
 					$body = $c->{data_ref};
 					$format = $c->{content_type};
 				}
@@ -480,26 +650,46 @@ sub artworkRequest {
 			} );
 		};
 
-		if ($fullpath =~ /^https?:/) {
+		if ($fullpath =~ /^https?:/i) {
 			require Slim::Web::ImageProxy;
 			$imgProxyCache ||= Slim::Web::ImageProxy::Cache->new();
 
-			if (my $cached = $imgProxyCache->get($fullpath)) {
+			my $proxy_key = Slim::Web::ImageProxy::proxiedImage($fullpath);
+			$proxy_key =~ s{^/}{} if defined $proxy_key;
+			my $proxy_key_nopng = ($proxy_key && $proxy_key =~ /(.*)\.png$/i) ? $1 : undef;
+
+			my $cached = $imgProxyCache->get($fullpath)
+				|| ($proxy_key && $imgProxyCache->get($proxy_key))
+				|| ($proxy_key_nopng && $imgProxyCache->get($proxy_key_nopng));
+
+			if ($cached) {
 				$doResize->($cached->{data_ref});
 			}
 			else {
-				Slim::Networking::SimpleAsyncHTTP->new(
+				_fetchExternalArtwork(
+					$fullpath,
+					$fullpath,
+					0,
 					sub {
 						my $http = shift;
+						require Slim::Utils::GDResizer;
+						my $sniffed = Slim::Utils::GDResizer::_content_type($http->contentRef, 1);
+						if (!$sniffed) {
+							send404($client, $params, $callback, @args);
+							return;
+						}
+						$imgProxyCache->set($fullpath, {
+							content_type  => $sniffed,
+							mtime         => 0,
+							original_path => undef,
+							data_ref      => $http->contentRef,
+						});
 						$doResize->($http->contentRef);
 					},
 					sub {
 						send404($client, $params, $callback, @args);
 					},
-					{
-						timeout => 15
-					}
-				)->get($fullpath);
+				);
 			}
 		}
 		else {
@@ -523,6 +713,7 @@ sub send404 {
 
 	$response->code(404);
 	$response->content_type('text/html');
+	$response->header( 'X-Content-Type-Options' => 'nosniff' );
 	$response->expires( time() - 1 );
 	$response->header( 'Cache-Control' => 'no-cache' );
 
@@ -533,7 +724,17 @@ sub send404 {
 
 sub parseSpec {
 	my ($class, $spec) = @_;
-	my ($width, $height, $mode, $bgcolor, $ext) = $spec =~ /^(?:([0-9X]+)x([0-9X]+))?(?:_(\w))?(?:_([\da-fA-F]+))?(?:\.(\w+))?$/;
+	return () unless defined $spec && length($spec);
+
+	my ($width, $height, $mode, $bgcolor, $ext) = $spec =~ /^(?:([0-9X]+)x([0-9X]+))?(?:_([mpoF]))?(?:_([0-9a-fA-F]{6}))?(?:\.(png|jpe?g|jpe|gif|bmp))?$/i;
+	return () unless defined($width) || defined($height) || defined($mode) || defined($bgcolor) || defined($ext);
+
+	if ( defined $width && $width ne 'X' ) {
+		return () if $width !~ /^\d+$/ || $width > MAX_DIMENSION;
+	}
+	if ( defined $height && $height ne 'X' ) {
+		return () if $height !~ /^\d+$/ || $height > MAX_DIMENSION;
+	}
 
 	return ($width, $height, $mode, $bgcolor, $ext);
 }

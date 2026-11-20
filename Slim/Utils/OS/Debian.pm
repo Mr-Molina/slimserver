@@ -19,8 +19,9 @@ sub initDetails {
 	# package specific addition to @INC to cater for plugin locations
 	$class->{osDetails}->{isDebian} = 1 ;
 
-	unshift @INC, '/usr/share/squeezeboxserver';
-	unshift @INC, '/usr/share/squeezeboxserver/CPAN';
+	for my $incDir ('/usr/share/squeezeboxserver', '/usr/share/squeezeboxserver/CPAN') {
+		unshift @INC, $incDir if Slim::Utils::OS::_isSafeIncDir($incDir);
+	}
 
 	# Bug 2659 - maybe. Remove old versions of modules that are now in the $Bin/lib/ tree.
 	unlink("$Bin/CPAN/MP3/Info.pm");
@@ -102,12 +103,12 @@ sub scanner {
 }
 
 sub gdresized {
-	if ( ($ENV{LMS_USE_RUST} // 1) && (my $arch = Slim::Utils::OS::_rustLinuxBinArch()) ) {
+	if ( Slim::Utils::OS::_useRust() && (my $arch = Slim::Utils::OS::_rustLinuxBinArch()) ) {
 		for my $p (
 			"/usr/share/squeezeboxserver/Bin/$arch/gdresized",
 			"$Bin/Bin/$arch/gdresized",
 		) {
-			return $p if -f $p && -x _;
+			return $p if Slim::Utils::OS::_isSafeExecutable($p);
 		}
 	}
 	return "/usr/sbin/squeezeboxserver-resized";

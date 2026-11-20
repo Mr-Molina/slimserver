@@ -5,12 +5,12 @@ CREATE TABLE tracks (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	url text NOT NULL COLLATE NOCASE,	-- bug 17457: url needs to be case insensitive, or some import actions on Windows might fail
 	title blob,
-	titlesort text,
-	titlesearch text,
-	customsearch text,
+	titlesort text COLLATE NOCASE,
+	titlesearch text COLLATE NOCASE,
+	customsearch text COLLATE NOCASE,
 	album int(10),
 	tracknum int(10),
-	content_type varchar(255),
+	content_type varchar(255) COLLATE NOCASE,
 	timestamp int(10),
 	filesize int(10),
 	audio_size int(10),
@@ -33,11 +33,11 @@ CREATE TABLE tracks (
 	remote bool,
 	lossless bool,
 	lyrics text COLLATE NOCASE, -- needs to be text so that searches are case insensitive.
-	musicbrainz_id varchar(40),	-- musicbrainz uuid (36 bytes of text)
+	musicbrainz_id varchar(40) COLLATE NOCASE,	-- musicbrainz uuid (36 bytes of text)
 	musicmagic_mixable bool,
 	replay_gain float,
 	replay_peak float,
-	extid varchar(64), 
+	extid varchar(64) COLLATE NOCASE, 
 	primary_artist int(10), 
 	urlmd5 char(32) NOT NULL default '0', 
 	coverid char(8) default NULL, 

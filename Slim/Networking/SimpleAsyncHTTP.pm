@@ -62,7 +62,7 @@ sub _createHTTPRequest {
 	my $params = $self->_params || {};
 
 	my $http = Slim::Networking::Async::HTTP->new( $self->_params );
-	$http->send_request( {
+	my %req_args = (
 		request     => $request,
 		maxRedirect => $params->{maxRedirect},
 		saveAs      => $params->{saveAs},
@@ -70,13 +70,16 @@ sub _createHTTPRequest {
 		onError     => \&onError,
 		onBody      => \&onBody,
 		passthrough => [ $self ],
-	} );
+	);
+	$req_args{maxBodySize} = $params->{maxBodySize} if defined $params->{maxBodySize};
+
+	$http->send_request( \%req_args );
 }
 
 sub onError {
 	my ( $http, $error, $self ) = @_;
 
-	my $uri = $http->request->uri;
+	my $uri = Slim::Networking::Async::HTTP::_safe_uri_string($http->request ? $http->request->uri : $self->url);
 
 	# If we have a cached copy of this request, we can use it
 	if ( $self->cachedResponse ) {
@@ -93,7 +96,7 @@ sub onError {
 
 	main::PERFMON && (my $now = AnyEvent->time);
 
-	$self->ecb->( $self, $error, $http->response );
+	$self->ecb->( $self, $error, $http->response ) if $self->ecb;
 
 	main::PERFMON && $now && Slim::Utils::PerfMon->check('async', AnyEvent->time - $now, undef, $self->ecb);
 
@@ -107,7 +110,7 @@ sub onBody {
 	my $res = $http->response;
 
 	if ( main::DEBUGLOG && $log->is_debug ) {
-		$log->debug(sprintf("status for %s is %s", $self->url, $res->status_line ));
+		$log->debug(sprintf("status for %s is %s", Slim::Networking::Async::HTTP::_safe_uri_string($self->url), $res->status_line ));
 	}
 
 	$self->code( $res->code );
@@ -131,7 +134,7 @@ sub onBody {
 
 	main::PERFMON && (my $now = AnyEvent->time);
 
-	$self->cb->( $self );
+	$self->cb->( $self ) if $self->cb;
 
 	main::PERFMON && $now && Slim::Utils::PerfMon->check('async', AnyEvent->time - $now, undef, $self->cb);
 
@@ -145,7 +148,7 @@ sub sendCachedResponse {
 
 	main::PERFMON && (my $now = AnyEvent->time);
 
-	$self->cb->( $self );
+	$self->cb->( $self ) if $self->cb;
 
 	main::PERFMON && $now && Slim::Utils::PerfMon->check('async', AnyEvent->time - $now, undef, $self->cb);
 

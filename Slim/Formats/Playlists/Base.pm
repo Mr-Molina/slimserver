@@ -8,6 +8,7 @@ package Slim::Formats::Playlists::Base;
 # under the terms of the GNU General Public License, version 2.
 
 use strict;
+use File::BOM ();
 use FileHandle ();
 use IO::String;
 use Scalar::Util qw(blessed);
@@ -98,7 +99,7 @@ sub _filehandleFromNameOrString {
 		# Always write out in UTF-8 with a BOM.
 		binmode($output, ":raw");
 
-		print $output $File::BOM::enc2bom{'utf8'};
+		print $output ($File::BOM::enc2bom{'utf8'} // "\xEF\xBB\xBF");
 
 		binmode($output, ":encoding(utf8)");
 

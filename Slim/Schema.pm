@@ -136,7 +136,8 @@ sub init {
 	my $dbh = $class->_connect($dsn, $sql) || do {
 
 		# Not much we can do if there's no DB.
-		logBacktrace("Couldn't connect to database! Fatal error: [$!] Exiting!");
+		my $err = DBI->errstr || $!;
+		logBacktrace("Couldn't connect to database! Fatal error: [$err] Exiting!");
 		exit;
 	};
 
@@ -150,18 +151,27 @@ sub init {
 	# maintain state. We need to wipe the DB and start over.
 	eval {
 		local $dbh->{HandleError} = sub {};
-		$dbh->do('SELECT name FROM metainformation') || die $dbh->errstr;
+		$dbh->do('SELECT name FROM metainformation LIMIT 1') || die $dbh->errstr;
 	};
 
 	# If we couldn't select our new 'name' column, then drop the
 	# metainformation (and possibly dbix_migration, if the db is in a
 	# wierd state), so that the migrateDB call below will update the schema.
 	if ( $@ ) {
-		main::INFOLOG && $log->is_info && $log->info("Creating new database - empty, outdated or invalid database found: $@");
+		my $err = $@;
+		if ( $err =~ /(?:no such (?:table|column)|doesn't exist|unknown column)/i ) {
+			main::INFOLOG && $log->is_info && $log->info("Creating new database - empty, outdated or invalid database found: $err");
 
-		eval {
-			$dbh->do('DROP TABLE IF EXISTS metainformation');
-			$dbh->do('DROP TABLE IF EXISTS dbix_migration');
+			eval {
+				$dbh->do('DROP TABLE IF EXISTS metainformation');
+				$dbh->do('DROP TABLE IF EXISTS dbix_migration');
+			};
+			if ( $@ ) {
+				logError("Failed to drop outdated metadata tables: [$@]");
+			}
+		}
+		else {
+			logError("Unexpected database error checking metainformation: [$err]");
 		}
 	}
 
@@ -302,6 +312,7 @@ sub throw_exception {
 	my ($self, $msg) = @_;
 
 	logBacktrace($msg);
+	die $msg;
 }
 
 =head2 updateDebug
@@ -333,6 +344,17 @@ sub disconnect {
 
 	eval { $class->storage->dbh->disconnect };
 	$class->clearCachedDbh();
+	%RS_CACHE         = ();
+	$TOTAL_CACHE      = {};
+	%contentTypeCache = ();
+	$vaObj            = undef;
+	$vaObjId          = undef;
+	$_unknownArtist   = '';
+	$_unknownGenre    = '';
+	$_unknownAlbumId  = undef;
+	$lastAlbum        = {};
+	$firstScan        = undef;
+	$class->_clearLastTrackOrUrl();
 
 	$initialized = 0;
 }
@@ -358,6 +380,44 @@ sub sourceInformation {
 	return ($driver, $source, $username, $password);
 }
 
+sub _runInTransaction {
+	my ($self, $code) = @_;
+
+	my $dbh = $self->dbh;
+	my $startedTx = 0;
+
+	if ($dbh && $dbh->{AutoCommit}) {
+		$dbh->begin_work;
+		$startedTx = 1;
+	}
+
+	my $wantarray = wantarray;
+	my (@res, $res);
+
+	eval {
+		if ($wantarray) {
+			@res = $code->();
+		}
+		else {
+			$res = $code->();
+		}
+
+		if ($startedTx) {
+			$dbh->commit;
+		}
+		1;
+	} or do {
+		my $err = $@ || 'Unknown transaction error';
+		if ($dbh && !$dbh->{AutoCommit}) {
+			eval { $dbh->rollback };
+			logError("Transaction rollback failed: [$@]") if $@;
+		}
+		die $err;
+	};
+
+	return $wantarray ? @res : $res;
+}
+
 =head2 wipeDB()
 
 Wipes and reinitializes the database schema. Calls the schema_clear.sql script
@@ -375,17 +435,25 @@ sub wipeDB {
 	main::INFOLOG && $log->is_info && $log->info("Start schema_clear");
 
 	my ($driver) = $class->sourceInformation;
+	my $dbh = $class->storage->dbh;
 
 	eval {
-		Slim::Utils::SQLHelper->executeSQLFile(
-			$driver, $class->storage->dbh, "schema_clear.sql"
-		);
+		$class->_runInTransaction(sub {
+			Slim::Utils::SQLHelper->executeSQLFile(
+				$driver, $dbh, "schema_clear.sql"
+			);
 
-		$class->migrateDB;
+			$class->migrateDB;
+		});
 	};
 
 	if ($@) {
-		logError("Failed to clear & migrate schema: [$@]");
+		my $err = $@;
+		logError("Failed to clear & migrate schema: [$err]");
+		if ($dbh && !$dbh->{AutoCommit}) {
+			eval { $dbh->rollback };
+			logError("Failed to rollback after schema_clear error: [$@]") if $@;
+		}
 	}
 
 	main::INFOLOG && $log->is_info && $log->info("End schema_clear");
@@ -405,6 +473,7 @@ sub optimizeDB {
 	main::INFOLOG && $log->is_info && $log->info("Start schema_optimize");
 
 	my ($driver) = $class->sourceInformation;
+	my $dbh = $class->storage->dbh;
 
 	my $progress = Slim::Utils::Progress->new({
 		'type'  => 'importer',
@@ -414,9 +483,11 @@ sub optimizeDB {
 	});
 
 	eval {
-		Slim::Utils::SQLHelper->executeSQLFile(
-			$driver, $class->storage->dbh, "schema_optimize.sql"
-		);
+		$class->_runInTransaction(sub {
+			Slim::Utils::SQLHelper->executeSQLFile(
+				$driver, $dbh, "schema_optimize.sql"
+			);
+		});
 
 		$progress->update();
 		$class->forceCommit;
@@ -427,7 +498,12 @@ sub optimizeDB {
 	$progress->final(2);
 
 	if ($@) {
-		logError("Failed to optimize schema: [$@]");
+		my $err = $@;
+		logError("Failed to optimize schema: [$err]");
+		if ($dbh && !$dbh->{AutoCommit}) {
+			eval { $dbh->rollback };
+			logError("Failed to rollback after schema_optimize error: [$@]") if $@;
+		}
 	}
 
 	main::INFOLOG && $log->is_info && $log->info("End schema_optimize");
@@ -456,8 +532,9 @@ sub migrateDB {
 	# Hide errors that aren't really errors
 	my $cur_handler = $dbh->{HandleError};
 	my $new_handler = sub {
-		return 1 if $_[0] =~ /no such table/;
-		goto $cur_handler;
+		return 1 if defined $_[0] && $_[0] =~ /no such table/;
+		return $cur_handler->(@_) if ref $cur_handler eq 'CODE';
+		return 0;
 	};
 
 	local $dbh->{HandleError} = $new_handler;
@@ -896,44 +973,118 @@ sub libraryObjectForUrl {
 	return $self->objectForUrl($args);
 }
 
+my %DB_URL_CLASSES = (
+	album       => 'Album',
+	composer    => 'Composer',
+	contributor => 'Contributor',
+	genre       => 'Genre',
+	playlist    => 'Playlist',
+	track       => 'Track',
+	work        => 'Work',
+	year        => 'Year',
+);
+
+sub _resolveDbUrlSource {
+	my ($schema, $baseClass, $baseSource, $rel) = @_;
+
+	return $baseSource if $rel eq 'me';
+
+	if ($baseSource->has_relationship($rel)) {
+		return $baseSource->related_source($rel);
+	}
+
+	if ($baseClass eq 'work') {
+		return $schema->source('Album')       if $rel eq 'album';
+		return $schema->source('Contributor') if $rel eq 'contributor';
+	}
+	elsif ($baseClass eq 'album') {
+		return $schema->source('Work')        if $rel eq 'work';
+		return $schema->source('Composer')    if $rel eq 'composer';
+	}
+
+	return undef;
+}
+
 sub _objForDbUrl {
 	my ($url) = @_;
 
 	if ($url =~ /^db:(\w+)\.(.+)/ ) {
-		my ($class, $values) = ($1, "me.$2"); # need to qualify the base class because of possible duplicate column names in prefetched relations
+		my ($class, $values) = (lc($1), "me.$2"); # need to qualify the base class because of possible duplicate column names in prefetched relations
+
+		my $rsClass = $DB_URL_CLASSES{$class} or return undef;
+		my $baseSource = eval { Slim::Schema->source($rsClass) };
+		return undef unless $baseSource;
 
 		my $query = {};
 		for my $term (split('&', $values)) {
-			if ($term =~ /(.*)=(.*)/) {
-				my $key = $1;
-				my $value = Slim::Utils::Misc::unescape($2);
+			return undef unless $term =~ /^([^=]*)=(.*)$/s;
+			my ($key, $rawVal) = ($1, $2);
+			return undef unless $key =~ /^([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)$/i;
 
+			my ($rel, $col) = (lc($1), $2);
+			my $targetSource = _resolveDbUrlSource('Slim::Schema', $class, $baseSource, $rel);
+			return undef unless $targetSource && $targetSource->has_column($col);
+
+			my $value = Slim::Utils::Misc::unescape($rawVal);
+
+			# Decode UTF-8 octets once safely without double-decoding or re-encoding
+			if (defined $value) {
 				if (utf8::is_utf8($value)) {
-					utf8::decode($value);
-					utf8::encode($value);
+					my $octets = $value;
+					if (utf8::downgrade($octets, 1) && utf8::decode($octets)) {
+						$value = $octets;
+					}
 				}
-
-				if ($key eq "track.performance") {
-					$value = undef if !$value; # empty performance value is meaningful and needs to result in an IS NULL check in the query
+				else {
+					my $decoded = $value;
+					if (utf8::decode($decoded)) {
+						$value = $decoded;
+					}
 				}
-				$query->{$key} = $value;
 			}
+
+			$key = "$rel.$col";
+			if ($key eq "track.performance") {
+				$value = undef if !$value; # empty performance value is meaningful and needs to result in an IS NULL check in the query
+			}
+			$query->{$key} = $value;
 		}
+
+		return undef unless keys %$query;
 
 		my $params;
 		$params->{prefetch} = [];
-		foreach (keys %$query) {
-			if (/^(?!composer|work|track|me)(.*)\./) { # exclude relations which need to be added as multi-level (see below), and also "me" which is of course the base class
-				push @{ $params->{prefetch} }, $1;
+		my %seenPrefetch;
+		foreach (sort keys %$query) {
+			if (/^([^.]+)\./) {
+				my $rel = $1;
+				next if $rel eq 'me';
+				# exclude relations which need to be added as multi-level on album/work (see below)
+				next if ($class eq 'album' || $class eq 'work') && ($rel eq 'composer' || $rel eq 'work' || $rel eq 'track');
+				if ($baseSource->has_relationship($rel) && !$seenPrefetch{$rel}++) {
+					push @{ $params->{prefetch} }, $rel;
+				}
 			}
 		}
 
 		# add multi-level prefetch relations as needed
 		push @{ $params->{prefetch} }, [{"track" => {"album" => "contributor"}}, "composer"] if $class eq "work";
-		push @{ $params->{prefetch} }, {"track" => {"work" => "composer"}} if $class eq "album" && $query->{'work.title'};
+		if ( $class eq "album" ) {
+			if ( grep { /^composer\./ } keys %$query ) {
+				push @{ $params->{prefetch} }, { "track" => { "work" => "composer" } };
+			}
+			elsif ( grep { /^work\./ } keys %$query ) {
+				push @{ $params->{prefetch} }, { "track" => "work" };
+			}
+			elsif ( grep { /^track\./ } keys %$query ) {
+				push @{ $params->{prefetch} }, "track";
+			}
+		}
 
-		return Slim::Schema->search(ucfirst($class), $query, $params)->first;
+		return Slim::Schema->search($rsClass, $query, $params)->first;
 	}
+
+	return undef;
 }
 
 sub _createOrUpdateAlbum {
@@ -1080,12 +1231,14 @@ sub _createOrUpdateAlbum {
 		# Slim::Schema::Album->title() which has different behavior.
 
 		if (
-			($extId && $lastAlbum->{extid} && $extId eq $lastAlbum->{extid} && $disc && $disc == $lastAlbum->{disc})
+			($extId && $lastAlbum->{extid} && $extId eq $lastAlbum->{extid} && (!$checkDisc || (($disc // '') eq ($lastAlbum->{disc} // ''))))
 			||
 			(  $lastAlbum->{_dirname}
 				&& $lastAlbum->{_dirname} eq $basename
-				&& $lastAlbum->{title} eq $title
-				&& (!$checkDisc || (($disc || '') eq ($lastAlbum->{disc} || 0)))
+				&& defined $lastAlbum->{title} && defined $title && $lastAlbum->{title} eq $title
+				&& ($brainzId // '') eq ($lastAlbum->{musicbrainz_id} // '')
+				&& ($extId // '') eq ($lastAlbum->{extid} // '')
+				&& (!$checkDisc || (($disc // '') eq ($lastAlbum->{disc} // '')))
 			)
 		) {
 			delete $lastAlbum->{_dirname};
@@ -1210,8 +1363,11 @@ sub _createOrUpdateAlbum {
 				# as a last resort if both DISC and DISCC are unknown.
 				(!$checkDisc && !defined $disc && !defined $discc && !$extId)
 			) {
-				push @{$search}, 'tracks.url LIKE ?';
-				push @{$values}, "$basename%";
+				my $escapedBase = $basename;
+				$escapedBase =~ s/([!%_])/!$1/g;
+				$escapedBase .= '/' unless $escapedBase =~ m{/$};
+				push @{$search}, "tracks.url LIKE ? ESCAPE '!'";
+				push @{$values}, "$escapedBase%";
 				$join = 1;
 			}
 
@@ -1247,7 +1403,7 @@ sub _createOrUpdateAlbum {
 			# the other track is not in our current directory.
 			# If so, then we need to create a new album.
 			# If not, the album object is valid.
-			if ( $albumHash->{id} && $checkDisc && !defined $isCompilation ) {
+			if ( $albumHash->{id} && $checkDisc && !defined $isCompilation && defined $trackColumns->{tracknum} ) {
 				$sth = $dbh->prepare_cached( qq{
 					SELECT url
 					FROM   tracks
@@ -1607,12 +1763,7 @@ sub _createTrack {
 			$persistentColumnValueHash->{urlmd5} = $columnValueHash->{urlmd5};
 
 			# Create a new persistent row
-			my @pcols      = keys %{$persistentColumnValueHash};
-			my $pcolstring = join( ',', @pcols );
-			my $pph        = join( ',', map { '?' } @pcols );
-
-			my $sth = $dbh->prepare_cached("INSERT INTO tracks_persistent ($pcolstring) VALUES ($pph)");
-			$sth->execute( map { $persistentColumnValueHash->{$_} } @pcols );
+			$self->_insertHash( tracks_persistent => $persistentColumnValueHash );
 		}
 		else {
 			while ( my ($key, $val) = each %{$persistentColumnValueHash} ) {
@@ -1793,7 +1944,9 @@ sub _newTrack {
 
 	# For simple cases, just create the Track row and return
 	if (($playlist && $columnValueHash{extid}) || !defined $ct || $ct eq 'dir' || $ct eq 'lnk' || !$columnValueHash{'audio'}) {
-		return $self->_createTrack(\%columnValueHash, \%persistentColumnValueHash, $source);
+		return $self->_runInTransaction(sub {
+			return $self->_createTrack(\%columnValueHash, \%persistentColumnValueHash, $source);
+		});
 	}
 
 	# Make a local variable for COMPILATION, that is easier to handle
@@ -1811,71 +1964,75 @@ sub _newTrack {
 		}
 	}
 
-	### Create Contributor rows
-	# Walk through the valid contributor roles, adding them to the database.
-	my $contributors = $self->_mergeAndCreateContributors($deferredAttributes, $isCompilation, 1);
+	$trackId = $self->_runInTransaction(sub {
+		### Create Contributor rows
+		# Walk through the valid contributor roles, adding them to the database.
+		my $contributors = $self->_mergeAndCreateContributors($deferredAttributes, $isCompilation, 1);
 
-	# Set primary_artist for the track
-	if ( my $artist = $contributors->{ARTIST} || $contributors->{TRACKARTIST} ) {
-		$columnValueHash{primary_artist} = $artist->[0];
-	}
+		# Set primary_artist for the track
+		if ( my $artist = $contributors->{ARTIST} || $contributors->{TRACKARTIST} ) {
+			$columnValueHash{primary_artist} = $artist->[0];
+		}
 
-	### Find artwork column values for the Track
-	if ( !$columnValueHash{cover} && $columnValueHash{audio} ) {
-		# Track does not have embedded artwork, look for standalone cover
-		# findStandaloneArtwork returns either a full path to cover art or 0
-		# to indicate no artwork was found.
-		my $cover = Slim::Music::Artwork->findStandaloneArtwork( \%columnValueHash, $deferredAttributes, $dirname );
+		### Find artwork column values for the Track
+		if ( !$columnValueHash{cover} && $columnValueHash{audio} ) {
+			# Track does not have embedded artwork, look for standalone cover
+			# findStandaloneArtwork returns either a full path to cover art or 0
+			# to indicate no artwork was found.
+			my $cover = Slim::Music::Artwork->findStandaloneArtwork( \%columnValueHash, $deferredAttributes, $dirname );
 
-		$columnValueHash{cover} = $cover;
-	}
+			$columnValueHash{cover} = $cover;
+		}
 
-	if ( $columnValueHash{cover} ) {
-		# Generate coverid value based on artwork, mtime, filesize
-		$columnValueHash{coverid} = Slim::Schema::Track->generateCoverId( {
-			cover => $columnValueHash{cover},
-			url   => $url,
-			mtime => $columnValueHash{timestamp},
-			size  => $columnValueHash{filesize},
-		} );
-	}
+		if ( $columnValueHash{cover} ) {
+			# Generate coverid value based on artwork, mtime, filesize
+			$columnValueHash{coverid} = Slim::Schema::Track->generateCoverId( {
+				cover => $columnValueHash{cover},
+				url   => $url,
+				mtime => $columnValueHash{timestamp},
+				size  => $columnValueHash{filesize},
+			} );
+		}
 
-	### Create Album row
-	my $albumId = $self->_createOrUpdateAlbum($deferredAttributes,
-		\%columnValueHash,														# trackColumns
-		$isCompilation,
-		$contributors->{'ALBUMARTIST'}->[0] || $contributors->{'ARTIST'}->[0],	# primary contributor-id
-		defined $contributors->{'ALBUMARTIST'}->[0] ? 1 : 0,					# hasAlbumArtist
-		1,																		# create
-		undef,																	# Track
-		$dirname,
-	);
-
-	### Create Work rows
-	my $workID;
-	if ( _workRequired($deferredAttributes->{'GENRE'}) ) {
-		$workID = $self->_createWork(
-			$deferredAttributes->{'WORK'},
-			$deferredAttributes->{'WORKSORT'},
-			$contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'},
-			1,
-			$playlist ? undef : $albumId,
+		### Create Album row
+		my $albumId = $self->_createOrUpdateAlbum($deferredAttributes,
+			\%columnValueHash,														# trackColumns
+			$isCompilation,
+			$contributors->{'ALBUMARTIST'}->[0] || $contributors->{'ARTIST'}->[0],	# primary contributor-id
+			defined $contributors->{'ALBUMARTIST'}->[0] ? 1 : 0,					# hasAlbumArtist
+			1,																		# create
+			undef,																	# Track
+			$dirname,
 		);
-	}
 
-	### Create Track row
-	$columnValueHash{'work'} = $workID if $workID;
-	$columnValueHash{'album'} = $albumId if !$playlist;
-	$trackId = $self->_createTrack(\%columnValueHash, \%persistentColumnValueHash, $source);
+		### Create Work rows
+		my $workID;
+		if ( _workRequired($deferredAttributes->{'GENRE'}) ) {
+			$workID = $self->_createWork(
+				$deferredAttributes->{'WORK'},
+				$deferredAttributes->{'WORKSORT'},
+				$contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'},
+				1,
+				$playlist ? undef : $albumId,
+			);
+		}
 
-	### Create ContributorTrack & ContributorAlbum rows
-	$self->_createContributorRoleRelationships($contributors, $trackId, $albumId);
+		### Create Track row
+		$columnValueHash{'work'} = $workID if $workID;
+		$columnValueHash{'album'} = $albumId if !$playlist;
+		my $id = $self->_createTrack(\%columnValueHash, \%persistentColumnValueHash, $source);
 
-	### Create Genre rows
-	$self->_createGenre($deferredAttributes->{'GENRE'}, $trackId, 1);
+		### Create ContributorTrack & ContributorAlbum rows
+		$self->_createContributorRoleRelationships($contributors, $id, $albumId);
 
-	### Create Comment rows
-	$self->_createComments($deferredAttributes->{'COMMENT'}, $trackId, 1);
+		### Create Genre rows
+		$self->_createGenre($deferredAttributes->{'GENRE'}, $id, 1);
+
+		### Create Comment rows
+		$self->_createComments($deferredAttributes->{'COMMENT'}, $id, 1);
+
+		return $id;
+	});
 
 	$self->forceCommit if $args->{'commit'};
 
@@ -2069,17 +2226,19 @@ sub updateOrCreateBase {
 				$trackPersistent->set_column( $key => $val );
 			}
 		}
-		$trackPersistent->update() if blessed($trackPersistent);
+		$self->_runInTransaction(sub {
+			$trackPersistent->update() if blessed($trackPersistent);
 
-		# _postCheckAttributes does an update
-		if (!$playlist) {
+			# _postCheckAttributes does an update
+			if (!$playlist) {
 
-			$self->_postCheckAttributes({
-				'track'      => $track,
-				'attributes' => $deferredAttributes,
-				'integrateRemote' => $integrateRemote
-			});
-		}
+				$self->_postCheckAttributes({
+					'track'           => $track,
+					'attributes'      => $deferredAttributes,
+					'integrateRemote' => $integrateRemote
+				});
+			}
+		});
 
 		$self->forceCommit if $commit;
 
@@ -2201,11 +2360,12 @@ sub totalTime {
 	my ($self, $client) = @_;
 
 	my $library_id = Slim::Music::VirtualLibraries->getLibraryIdForClient($client);
+	my $cacheKey   = $library_id // '';
 
-	$TOTAL_CACHE->{$library_id} ||= {};
-	my $totalCache = $TOTAL_CACHE->{$library_id};
+	$TOTAL_CACHE->{$cacheKey} ||= {};
+	my $totalCache = $TOTAL_CACHE->{$cacheKey};
 
-	if (!$totalCache->{totalTime}) {
+	if (!exists $totalCache->{totalTime}) {
 		my $dbh = $self->dbh;
 		my $sth;
 
@@ -2295,30 +2455,33 @@ sub mergeSingleVAAlbum {
 		return $is_comp;
 	}
 
-	if ( $is_comp ) {
-		my $comp_sth = $dbh->prepare_cached( qq{
-			UPDATE albums
-			SET    compilation = 1, contributor = ?
-			WHERE  id = ?
-		} );
+	$class->_runInTransaction(sub {
+		if ( $is_comp ) {
+			my $comp_sth = $dbh->prepare_cached( qq{
+				UPDATE albums
+				SET    compilation = 1, contributor = ?
+				WHERE  id = ?
+			} );
 
-		# Flag as a compilation, set primary contrib to Various Artists
-		$comp_sth->execute( $vaObjId || $class->variousArtistsObject->id, $albumid );
-	}
-	# only update if the flag is not set yet
-	elsif (!defined $is_comp_db) {
-		my $not_comp_sth = $dbh->prepare_cached( qq{
-			UPDATE albums
-			SET    compilation = 0
-			WHERE  id = ?
-		} );
+			# Flag as a compilation, set primary contrib to Various Artists
+			$comp_sth->execute( $vaObjId || $class->variousArtistsObject->id, $albumid );
+		}
+		# only update if the flag is not set yet
+		elsif (!defined $is_comp_db) {
+			my $not_comp_sth = $dbh->prepare_cached( qq{
+				UPDATE albums
+				SET    compilation = 0
+				WHERE  id = ?
+				AND    (compilation IS NULL OR compilation != 0)
+			} );
 
-		# Cache that the album is not a compilation so it's not constantly
-		# checked during every mergeVA phase.  Scanner::Local will reset
-		# compilation to undef when a new/deleted/changed track requires
-		# a re-check of VA status
-		$not_comp_sth->execute($albumid);
-	}
+			# Cache that the album is not a compilation so it's not constantly
+			# checked during every mergeVA phase.  Scanner::Local will reset
+			# compilation to undef when a new/deleted/changed track requires
+			# a re-check of VA status
+			$not_comp_sth->execute($albumid);
+		}
+	});
 }
 
 =head2 wipeCaches()
@@ -2332,6 +2495,7 @@ sub wipeCaches {
 
 	$self->forceCommit;
 
+	%RS_CACHE         = ();
 	%contentTypeCache = ();
 
 	$TOTAL_CACHE = {};
@@ -2346,6 +2510,7 @@ sub wipeCaches {
 	$self->lastTrackURL('');
 	$self->lastTrack({});
 	$lastAlbum = {};
+	$self->_clearLastTrackOrUrl();
 
 	main::INFOLOG && logger('scan.import')->info("Wiped all in-memory caches.");
 }
@@ -2401,14 +2566,19 @@ sub forceCommit {
 	$self->lastTrackURL('');
 	$self->lastTrack({});
 
-	if (!$self->storage->dbh->{'AutoCommit'}) {
+	my $dbh = $self->storage->dbh;
+
+	if ($dbh && !$dbh->{'AutoCommit'}) {
 
 		main::INFOLOG && $log->is_info && $log->info("Syncing to the database.");
 
-		eval { $self->storage->dbh->commit };
+		eval { $dbh->commit };
 
 		if ($@) {
-			logWarning("Couldn't commit transactions to DB: [$@]");
+			my $err = $@;
+			logWarning("Couldn't commit transactions to DB: [$err]");
+			eval { $dbh->rollback };
+			logError("Couldn't rollback failed commit: [$@]") if $@;
 			return;
 		}
 	}
@@ -2584,13 +2754,12 @@ sub _checkValidity {
 			'commit'   => 1,
 		});
 
-		$track = Slim::Schema->rs('Track')->find($trackId) if (defined $trackId);
+		$track = defined $trackId ? Slim::Schema->rs('Track')->find($trackId) : undef;
 	}
 
-	# Track may have been deleted by _hasChanged
-	return undef unless $track->in_storage;
-
+	# Track may have been deleted by _hasChanged or failed recreation
 	return undef unless blessed($track);
+	return undef unless $track->can('in_storage') && $track->in_storage;
 	return undef unless $track->can('url');
 
 	return $track;
@@ -2608,6 +2777,7 @@ sub _hasChanged {
 	return 0 if Slim::Utils::Misc::anchorFromURL($url);
 
 	my $filepath = Slim::Utils::Misc::pathFromFileURL($url);
+	return 0 unless defined $filepath && length $filepath;
 
 #	main::DEBUGLOG && $isDebug && $log->debug("Checking for [$filepath] - size & timestamp.");
 
@@ -2651,6 +2821,22 @@ sub _hasChanged {
 		# Bug 4402, if the entire volume/drive this file is on is unavailable,
 		# it's likely removable storage and shouldn't be deleted
 		my $offline;
+		my $isDirUnavailable = sub {
+			my ($dir) = @_;
+			return 1 if !-d $dir;
+			if ( opendir(my $dh, $dir) ) {
+				my $hasEntry = 0;
+				while ( defined(my $entry = readdir($dh)) ) {
+					if ( $entry ne '.' && $entry ne '..' ) {
+						$hasEntry = 1;
+						last;
+					}
+				}
+				closedir($dh);
+				return !$hasEntry;
+			}
+			return 0;
+		};
 
 		if ( main::ISWINDOWS ) {
 			# win32, check the drive letter
@@ -2670,8 +2856,27 @@ sub _hasChanged {
 			}
 		}
 		else {
-			# XXX: Linux/Unix, not sure how to tell if a given path
-			# is from an unmounted filesystem
+			# Linux/Unix: guard against unmounted removable/network mountpoints
+			if ( $filepath =~ m{^(/media/[^/]+|/mnt/[^/]+|/run/media/[^/]+/[^/]+)(?:/|$)} ) {
+				$offline = 1 if $isDirUnavailable->($1);
+			}
+		}
+
+		# Guard against unmounted/unavailable configured media or playlist roots on any OS
+		if ( !$offline ) {
+			my @roots = ( @{ $prefs->get('mediadirs') || [] }, $prefs->get('playlistdir') );
+			for my $root ( @roots ) {
+				next unless defined $root && length $root;
+				(my $normRoot = $root) =~ s{[\\/]+$}{};
+				next unless length $normRoot;
+				my $isChild = main::ISWINDOWS
+					? (lc($filepath) eq lc($normRoot) || index(lc($filepath), lc($normRoot) . '\\') == 0 || index(lc($filepath), lc($normRoot) . '/') == 0)
+					: ($filepath eq $normRoot || index($filepath, "$normRoot/") == 0);
+				if ( $isChild && $isDirUnavailable->($normRoot) ) {
+					$offline = 1;
+					last;
+				}
+			}
 		}
 
 		if ( $offline ) {
@@ -3084,62 +3289,64 @@ sub _postCheckAttributes {
 		}
 	}
 
-	$self->_createGenre($attributes->{'GENRE'}, $trackId, $create);
+	$self->_runInTransaction(sub {
+		$self->_createGenre($attributes->{'GENRE'}, $trackId, $create);
 
-	# Walk through the valid contributor roles, adding them to the database.
-	my $contributors = $self->_mergeAndCreateContributors($attributes, $isCompilation, $create);
+		# Walk through the valid contributor roles, adding them to the database.
+		my $contributors = $self->_mergeAndCreateContributors($attributes, $isCompilation, $create);
 
-	my $artist = $contributors->{'ALBUMARTIST'} || $contributors->{ARTIST} || $contributors->{TRACKARTIST};
-	if ($artist) {
-		$cols{primary_artist} = $artist->[0];
-	}
+		my $artist = $contributors->{'ALBUMARTIST'} || $contributors->{ARTIST} || $contributors->{TRACKARTIST};
+		if ($artist) {
+			$cols{primary_artist} = $artist->[0];
+		}
 
-	### Update Album row
-	my $albumId = $self->_createOrUpdateAlbum($attributes,
-		\%cols,																	# trackColumns
-		$isCompilation,
-		$artist->[0],	                                          # primary contributor-id
-		defined $contributors->{'ALBUMARTIST'}->[0] ? 1 : 0,					# hasAlbumArtist
-		$create,																# create
-		$track,																	# Track
-	);
+		### Update Album row
+		my $albumId = $self->_createOrUpdateAlbum($attributes,
+			\%cols,																	# trackColumns
+			$isCompilation,
+			$artist ? $artist->[0] : undef,                                          # primary contributor-id
+			defined $contributors->{'ALBUMARTIST'}->[0] ? 1 : 0,					# hasAlbumArtist
+			$create,																# create
+			$track,																	# Track
+		);
 
-	# Don't add an album to container tracks - See bug 2337
-	my $isContainer = Slim::Music::Info::isContainer($track, $trackType);
-	if (!$isContainer) {
-		$track->album($albumId);
-	}
+		# Don't add an album to container tracks - See bug 2337
+		my $isContainer = Slim::Music::Info::isContainer($track, $trackType);
+		if (!$isContainer) {
+			$track->album($albumId);
+		}
 
-	#Work
-	if (defined $attributes->{'WORK'}) {
-		if ( _workRequired($attributes->{'GENRE'}) ) {
-			my $workID = $self->_createWork(
-				$attributes->{'WORK'},
-				$attributes->{'WORKSORT'},
-				$contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'},
-				1,
-				$isContainer ? undef : $albumId,
-			);
-			if ($workID) {
-				$track->work($workID);
+		#Work
+		if (defined $attributes->{'WORK'}) {
+			if ( _workRequired($attributes->{'GENRE'}) ) {
+				my $workID = $self->_createWork(
+					$attributes->{'WORK'},
+					$attributes->{'WORKSORT'},
+					$contributors->{'COMPOSER'} || $contributors->{'ALBUMARTIST'} || $contributors->{'ARTIST'},
+					1,
+					$isContainer ? undef : $albumId,
+				);
+				if ($workID) {
+					$track->work($workID);
+				}
+			} else {
+				$track->work(undef);
 			}
-		} else {
+		}
+		else {
 			$track->work(undef);
 		}
-	}
-	else {
-		$track->work(undef);
-	}
 
-	$self->_createContributorRoleRelationships($contributors, $trackId, $albumId);
+		$self->_createContributorRoleRelationships($contributors, $trackId, $isContainer ? undef : $albumId);
 
-	# Save any changes - such as album.
-	$track->update;
+		# Save any changes - such as album.
+		$track->update;
 
-	$self->_createComments($attributes->{'COMMENT'}, $trackId);
+		$self->_createComments($attributes->{'COMMENT'}, $trackId);
 
-	# refcount--
-	%{$contributors} = ();
+		# refcount--
+		%{$contributors} = ();
+	});
 }
 
 sub _mergeAndCreateContributors {
@@ -3235,57 +3442,65 @@ sub _createContributorRoleRelationships {
 		return;
 	}
 
-	# Wipe track contributors for this track, this is necessary to handle
-	# a changed track where contributors have been removed.  Current contributors
-	# will be re-added by below
-	my $sth_delete_tracks = $self->dbh->prepare_cached( qq{
-		DELETE
-		FROM contributor_track
-		WHERE track = ?
-	} );
-	$sth_delete_tracks->execute($trackId);
+	$self->_runInTransaction(sub {
+		# Wipe track contributors for this track, this is necessary to handle
+		# a changed track where contributors have been removed.  Current contributors
+		# will be re-added by below
+		my $sth_delete_tracks = $self->dbh->prepare_cached( qq{
+			DELETE
+			FROM contributor_track
+			WHERE track = ?
+		} );
+		$sth_delete_tracks->execute($trackId);
 
-	# Using native DBI here to improve performance during scanning
-	if ( my $artist = $contributors->{ARTIST} || $contributors->{TRACKARTIST} ) {
-		my $sth_track_artist = $self->dbh->prepare_cached( qq(
-			UPDATE tracks
-			SET primary_artist = ?
-			WHERE id = ?
-		) );
-		$sth_track_artist->execute( $artist->[0], $trackId );
-	}
-
-	my $sth_track = $self->dbh->prepare_cached( qq{
-		REPLACE INTO contributor_track
-		(role, contributor, track)
-		VALUES
-		(?, ?, ?)
-	} );
-
-	my $sth_album = $self->dbh->prepare_cached( qq{
-		REPLACE INTO contributor_album
-		(role, contributor, album)
-		VALUES
-		(?, ?, ?)
-	} );
-
-	while (my ($role, $contributorList) = each %{$contributors}) {
-		my $roleId = Slim::Schema::Contributor->typeToRole($role);
-		for my $contributor (@{$contributorList}) {
-			$sth_track->execute( $roleId, $contributor, $trackId );
-
-			# Bug 4882 - Don't remove contributor <-> album mappings here as its impossible to remove only stale ones
-			# Instead recreate this table post scan in the sql optimise script so we can base it on all tracks in an album
-
-			# The following is retained at present to add mappings for BMF, entries created will be deleted in the optimise phase
-			$sth_album->execute( $roleId, $contributor, $albumId );
+		# Using native DBI here to improve performance during scanning
+		if ( my $artist = $contributors->{ARTIST} || $contributors->{TRACKARTIST} ) {
+			my $sth_track_artist = $self->dbh->prepare_cached( qq(
+				UPDATE tracks
+				SET primary_artist = ?
+				WHERE id = ?
+			) );
+			$sth_track_artist->execute( $artist->[0], $trackId );
 		}
-	}
+
+		my $sth_track = $self->dbh->prepare_cached( qq{
+			REPLACE INTO contributor_track
+			(role, contributor, track)
+			VALUES
+			(?, ?, ?)
+		} );
+
+		my $sth_album = defined $albumId ? $self->dbh->prepare_cached( qq{
+			REPLACE INTO contributor_album
+			(role, contributor, album)
+			VALUES
+			(?, ?, ?)
+		} ) : undef;
+
+		while (my ($role, $contributorList) = each %{$contributors}) {
+			my $roleId = Slim::Schema::Contributor->typeToRole($role);
+			for my $contributor (@{$contributorList}) {
+				$sth_track->execute( $roleId, $contributor, $trackId );
+
+				# Bug 4882 - Don't remove contributor <-> album mappings here as its impossible to remove only stale ones
+				# Instead recreate this table post scan in the sql optimise script so we can base it on all tracks in an album
+
+				# The following is retained at present to add mappings for BMF, entries created will be deleted in the optimise phase
+				$sth_album->execute( $roleId, $contributor, $albumId ) if $sth_album;
+			}
+		}
+	});
 }
 
 my %lastTrackOrUrl = (
 	obj => ''
 );
+
+sub _clearLastTrackOrUrl {
+	%lastTrackOrUrl = (
+		obj => ''
+	);
+}
 
 sub _validTrackOrURL {
 	my $urlOrObj = shift;
@@ -3340,9 +3555,10 @@ sub totals {
 	my ($class, $client) = @_;
 
 	my $library_id = Slim::Music::VirtualLibraries->getLibraryIdForClient($client);
+	my $cacheKey   = $library_id // '';
 
-	$TOTAL_CACHE->{$library_id} ||= {};
-	my $totalCache = $TOTAL_CACHE->{$library_id};
+	$TOTAL_CACHE->{$cacheKey} ||= {};
+	my $totalCache = $TOTAL_CACHE->{$cacheKey};
 
 	my %categories = (
 		album => ['albums', 0, 1, 'tags:CC'],
@@ -3366,16 +3582,27 @@ sub totals {
 	return $totalCache;
 }
 
+sub _quoteIdentifier {
+	my ($dbh, $ident) = @_;
+
+	die "Invalid SQL identifier" unless defined $ident && !ref($ident) && $ident =~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+	return $dbh->quote_identifier($ident);
+}
+
 sub _insertHash {
 	my ( $class, $table, $hash ) = @_;
 
-	my $dbh = $class->dbh;
+	my $dbh    = $class->dbh;
+	my $qtable = _quoteIdentifier($dbh, $table);
+	my @cols   = sort keys %{$hash};
 
-	my @cols      = keys %{$hash};
-	my $colstring = join( ',', @cols );
+	die "Cannot _insertHash into $table with no columns" unless @cols;
+
+	my $colstring = join( ',', map { _quoteIdentifier($dbh, $_) } @cols );
 	my $ph        = join( ',', map { '?' } @cols );
 
-	my $sth = $dbh->prepare_cached("INSERT INTO $table ($colstring) VALUES ($ph)");
+	my $sth = $dbh->prepare_cached("INSERT INTO $qtable ($colstring) VALUES ($ph)");
 	$sth->execute( map { $hash->{$_} } @cols );
 
 	return $dbh->last_insert_id(undef, undef, undef, undef);
@@ -3384,16 +3611,20 @@ sub _insertHash {
 sub _updateHash {
 	my ( $class, $table, $hash, $pk ) = @_;
 
-	my $id = delete $hash->{$pk};
+	die "Missing primary key '$pk' for _updateHash" unless defined $pk && exists $hash->{$pk};
 
-	# Construct SQL with placeholders for non-null values and NULL for null values
-	my @cols      = keys %{$hash};
-	my $colstring = join( ', ', map { $_ . (defined $hash->{$_} ? ' = ?' : ' = NULL') } @cols );
+	my $dbh    = $class->dbh;
+	my $qtable = _quoteIdentifier($dbh, $table);
+	my $qpk    = _quoteIdentifier($dbh, $pk);
+	my $id     = $hash->{$pk};
+	my @cols   = sort grep { $_ ne $pk } keys %{$hash};
 
-	my $sth = $class->dbh->prepare_cached("UPDATE $table SET $colstring WHERE $pk = ?");
-	$sth->execute( (grep { defined $_ } map { $hash->{$_} } @cols), $id );
+	return 1 unless @cols;
 
-	$hash->{$pk} = $id;
+	my $colstring = join( ', ', map { _quoteIdentifier($dbh, $_) . ' = ?' } @cols );
+
+	my $sth = $dbh->prepare_cached("UPDATE $qtable SET $colstring WHERE $qpk = ?");
+	$sth->execute( (map { $hash->{$_} } @cols), $id );
 
 	return 1;
 }

@@ -1,21 +1,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use image::DynamicImage;
-use image::ImageReader;
-use image::Limits;
-use lms_cache::DbArtworkStore;
-use lofty::config::apply_global_options;
-use lofty::config::GlobalOptions;
-use lofty::config::ParseOptions;
+use image::{DynamicImage, ImageReader, Limits};
+use lms_cache::{ArtworkRecord, DbArtworkStore};
+use lofty::config::{apply_global_options, GlobalOptions, ParseOptions};
 use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::path::Path;
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 pub const MAX_ARTWORK_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -94,10 +87,15 @@ pub struct ResizeSpec {
     pub explicit_format: Option<ImageFormat>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum InputSource<'a> {
     Path(&'a std::path::Path),
     Bytes(&'a [u8]),
+    OpenedFile {
+        file: std::fs::File,
+        original_path: PathBuf,
+        mtime: i64,
+    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -122,119 +120,172 @@ pub enum ImageError {
     InvalidArguments,
 }
 
+fn is_valid_bmp_header(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || !bytes.starts_with(b"BM") {
+        return false;
+    }
+    if bytes[6..10] != [0, 0, 0, 0] {
+        return false;
+    }
+    let file_size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    let off_bits = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+    file_size >= 26
+        && (file_size as usize) <= MAX_INPUT_BYTES
+        && off_bits >= 26
+        && off_bits <= file_size
+}
+
 pub fn sniff_format(bytes: &[u8]) -> Option<ImageFormat> {
-    if bytes.starts_with(b"\x89PNG") {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(ImageFormat::Png)
-    } else if bytes.starts_with(b"\xFF\xD8") {
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
         Some(ImageFormat::Jpg)
-    } else if bytes.starts_with(b"GIF") {
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         Some(ImageFormat::Gif)
-    } else if bytes.starts_with(b"BM") {
+    } else if is_valid_bmp_header(bytes) {
         Some(ImageFormat::Bmp)
     } else {
         None
     }
 }
 
-fn parse_dim_component(dim: &str) -> Option<u32> {
+fn parse_dim_component(dim: &str) -> Result<Option<u32>, ImageError> {
     if dim.is_empty() || dim == "X" || dim == "x" {
-        return None;
+        return Ok(None);
     }
     if dim.chars().all(|c| c.is_ascii_digit()) {
-        dim.parse::<u32>().ok().filter(|&v| v > 0)
+        let value = dim
+            .parse::<u32>()
+            .map_err(|_| ImageError::InvalidSpec(format!("dimension overflow: {dim}")))?;
+        Ok((value > 0).then_some(value))
     } else {
-        None
+        Err(ImageError::InvalidSpec(format!(
+            "invalid dimension component: {dim}"
+        )))
     }
 }
 
-pub fn parse_single_spec(spec: &str) -> ResizeSpec {
+/// Parse and strictly validate a resize specification string.
+pub fn try_parse_single_spec(spec: &str) -> Result<ResizeSpec, ImageError> {
+    if spec.is_empty() {
+        return Err(ImageError::InvalidSpec("empty resize spec".to_string()));
+    }
     let mut remainder = spec;
 
     let mut explicit_format = None;
     if let Some((prefix, ext)) = remainder.rsplit_once('.') {
         let lower_ext = ext.to_ascii_lowercase();
-        let recognized = matches!(
-            lower_ext.as_str(),
-            "jpg" | "jpeg" | "png" | "gif" | "gd" | "webp" | "bmp"
-        );
-        if recognized {
-            explicit_format = ImageFormat::from_ext(&lower_ext);
-            remainder = prefix;
-        }
+        let parsed_fmt = ImageFormat::from_ext(&lower_ext)
+            .ok_or_else(|| ImageError::InvalidSpec(format!("unsupported output format: {ext}")))?;
+        explicit_format = Some(parsed_fmt);
+        remainder = prefix;
     }
 
     let parts: Vec<&str> = remainder.split('_').collect();
-    let mut width = None;
-    let mut height = None;
+    let first = parts
+        .first()
+        .copied()
+        .ok_or_else(|| ImageError::InvalidSpec(format!("missing dimensions: {spec}")))?;
+    let (w_str, h_str) = first
+        .split_once('x')
+        .or_else(|| first.split_once('X'))
+        .ok_or_else(|| ImageError::InvalidSpec(format!("missing WxH separator: {spec}")))?;
+    let width = parse_dim_component(w_str)?;
+    let height = parse_dim_component(h_str)?;
+
     let mut mode = ResizeMode::Max;
     let mut bgcolor = None;
+    let mut part_idx = 1;
 
-    if let Some(&first) = parts.first() {
-        if let Some((w_str, h_str)) = first.split_once('x').or_else(|| first.split_once('X')) {
-            width = parse_dim_component(w_str);
-            height = parse_dim_component(h_str);
-        }
-
-        let mut part_idx = 1;
-        if let Some(&p) = parts.get(part_idx) {
-            if p.len() == 1 && p.chars().all(|c| c.is_ascii_alphabetic()) {
-                if let Some(ch) = p.chars().next() {
-                    mode = match ch {
-                        'm' | 'M' => ResizeMode::Max,
-                        'p' | 'P' => ResizeMode::Pad,
-                        'o' | 'O' => ResizeMode::Original,
-                        'f' | 'F' => ResizeMode::FitOrKeep,
-                        _ => ResizeMode::Max,
-                    };
-                    part_idx += 1;
+    if let Some(&p) = parts.get(part_idx) {
+        if p.len() == 1 {
+            let ch = p.chars().next().ok_or_else(|| {
+                ImageError::InvalidSpec(format!("invalid resize mode in spec: {spec}"))
+            })?;
+            mode = match ch {
+                'm' | 'M' => ResizeMode::Max,
+                'p' | 'P' => ResizeMode::Pad,
+                'o' | 'O' => ResizeMode::Original,
+                'f' | 'F' => ResizeMode::FitOrKeep,
+                _ => {
+                    return Err(ImageError::InvalidSpec(format!("invalid resize mode: {p}")));
                 }
-            }
-        }
-
-        if let Some(&p) = parts.get(part_idx) {
-            if !p.is_empty() && p.chars().all(|c| c.is_ascii_hexdigit()) {
-                if p.len() == 6 {
-                    bgcolor = u32::from_str_radix(p, 16)
-                        .ok()
-                        .map(|rgb| 0xFF00_0000 | rgb)
-                        .or(Some(0xFFFF_FFFF));
-                } else if p.len() == 8 {
-                    bgcolor = u32::from_str_radix(p, 16).ok().or(Some(0xFFFF_FFFF));
-                } else {
-                    bgcolor = Some(0xFFFF_FFFF);
-                }
-            }
+            };
+            part_idx += 1;
         }
     }
 
-    ResizeSpec {
+    if let Some(&p) = parts.get(part_idx) {
+        if (p.len() == 6 || p.len() == 8) && p.chars().all(|c| c.is_ascii_hexdigit()) {
+            let parsed = u32::from_str_radix(p, 16).map_err(|_| {
+                ImageError::InvalidSpec(format!("invalid background color hex: {p}"))
+            })?;
+            bgcolor = Some(if p.len() == 6 {
+                0xFF00_0000 | parsed
+            } else {
+                parsed
+            });
+            part_idx += 1;
+        } else {
+            return Err(ImageError::InvalidSpec(format!(
+                "invalid background color hex: {p}"
+            )));
+        }
+    }
+
+    if parts.len() > part_idx {
+        return Err(ImageError::InvalidSpec(format!(
+            "unexpected trailing segment in spec: {spec}"
+        )));
+    }
+
+    Ok(ResizeSpec {
         width,
         height,
         mode,
         bgcolor,
         explicit_format,
-    }
+    })
+}
+
+pub fn parse_single_spec(spec: &str) -> ResizeSpec {
+    try_parse_single_spec(spec).unwrap_or(ResizeSpec {
+        width: None,
+        height: None,
+        mode: ResizeMode::Max,
+        bgcolor: None,
+        explicit_format: None,
+    })
 }
 
 struct BoundedReader<'a, R> {
     inner: &'a mut R,
+    offset: u64,
     pos: u64,
-    limit: u64,
+    len: u64,
 }
 
-impl<'a, R> BoundedReader<'a, R> {
-    fn new(inner: &'a mut R, limit: u64) -> Self {
-        Self {
+impl<'a, R: Seek> BoundedReader<'a, R> {
+    fn new(inner: &'a mut R, offset: u64, len: u64) -> std::io::Result<Self> {
+        offset.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded stream range overflow",
+            )
+        })?;
+        inner.seek(SeekFrom::Start(offset))?;
+        Ok(Self {
             inner,
+            offset,
             pos: 0,
-            limit,
-        }
+            len,
+        })
     }
 }
 
 impl<R: Read> Read for BoundedReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.limit.saturating_sub(self.pos);
+        let remaining = self.len.saturating_sub(self.pos);
         if remaining == 0 {
             return Ok(0);
         }
@@ -249,20 +300,25 @@ impl<R: Read> Read for BoundedReader<'_, R> {
 
 impl<R: Seek> Seek for BoundedReader<'_, R> {
     fn seek(&mut self, style: SeekFrom) -> std::io::Result<u64> {
-        let target = match style {
-            SeekFrom::Start(offset) => Some(offset),
-            SeekFrom::End(offset) => self.limit.checked_add_signed(offset),
-            SeekFrom::Current(offset) => self.pos.checked_add_signed(offset),
-        };
-        let next = target.ok_or_else(|| {
+        let next = match style {
+            SeekFrom::Start(delta) => Some(delta),
+            SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        }
+        .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "seek before start of bounded stream",
             )
         })?;
-        if next <= self.limit {
-            self.inner.seek(SeekFrom::Start(next))?;
+        if next > self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek past end of bounded stream",
+            ));
         }
+        let abs = self.offset + next;
+        self.inner.seek(SeekFrom::Start(abs))?;
         self.pos = next;
         Ok(next)
     }
@@ -311,6 +367,11 @@ fn parse_flac_picture_block(buf: &[u8]) -> Result<Option<ExtractedArtwork>, Imag
         .ok()
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    if mime_type.as_deref() == Some("-->") {
+        return Err(ImageError::Lofty(
+            "FLAC URI picture blocks are not supported".to_string(),
+        ));
+    }
 
     let (desc_len_u32, offset) = read_be_u32_at(buf, mime_end).ok_or_else(malformed)?;
     let desc_len = usize::try_from(desc_len_u32).map_err(|_| malformed())?;
@@ -377,12 +438,14 @@ fn extract_flac_artwork<R: Read + Seek>(
             let mut buf = vec![0u8; block_usize];
             reader.read_exact(&mut buf)?;
             if let Some(pic) = parse_flac_picture_block(&buf)? {
-                let is_front_cover = pic.picture_type == 3;
-                if is_front_cover {
-                    return Ok(Some(pic));
-                }
-                if best_pic.is_none() {
-                    best_pic = Some(pic);
+                match &best_pic {
+                    Some(best) if pic.picture_type < best.picture_type => {
+                        best_pic = Some(pic);
+                    }
+                    None => {
+                        best_pic = Some(pic);
+                    }
+                    _ => {}
                 }
             }
         } else if block_len > 0 {
@@ -557,7 +620,7 @@ fn extract_with_lofty<R: Read + Seek>(
 ) -> Result<Option<ExtractedArtwork>, ImageError> {
     reader.seek(SeekFrom::Start(0))?;
     let cap = len.min(MAX_INPUT_BYTES as u64);
-    let bounded = BoundedReader::new(reader, cap);
+    let bounded = BoundedReader::new(reader, 0, cap)?;
 
     apply_global_options(GlobalOptions::new().allocation_limit(MAX_ARTWORK_BYTES));
     let parse_options = ParseOptions::new().read_properties(false);
@@ -569,8 +632,18 @@ fn extract_with_lofty<R: Read + Seek>(
         .map_err(|e| ImageError::Lofty(e.to_string()))?;
 
     let mut best_pic: Option<(&lofty::picture::Picture, u8)> = None;
+    let mut pic_count = 0usize;
     for tag in tagged_file.tags() {
         for pic in tag.pictures() {
+            if pic_count >= MAX_FLAC_METADATA_BLOCKS {
+                break;
+            }
+            pic_count += 1;
+            if pic.mime_type().is_some_and(|m| m.as_str() == "-->") {
+                return Err(ImageError::Lofty(
+                    "URI picture blocks are not supported".to_string(),
+                ));
+            }
             let pic_type = pic.pic_type().as_u8();
             match best_pic {
                 Some((_, best_type)) if pic_type < best_type => {
@@ -581,6 +654,9 @@ fn extract_with_lofty<R: Read + Seek>(
                 }
                 _ => {}
             }
+        }
+        if pic_count >= MAX_FLAC_METADATA_BLOCKS {
+            break;
         }
     }
 
@@ -624,13 +700,35 @@ pub fn extract_embedded_artwork_from_reader<R: Read + Seek>(
     extract_with_lofty(reader, len)
 }
 
-/// Extract embedded artwork from a regular audio file path.
-pub fn extract_embedded_artwork(path: &Path) -> Result<Vec<u8>, ImageError> {
-    let mut file = File::open(path)?;
-    let meta = file.metadata()?;
+#[cfg(unix)]
+fn unix_open_flags() -> i32 {
+    libc::O_NONBLOCK | libc::O_NOFOLLOW
+}
+
+fn validate_regular_file_metadata(meta: &Metadata) -> Result<(), ImageError> {
     if !meta.is_file() || meta.len() > MAX_INPUT_BYTES as u64 {
         return Err(ImageError::InvalidArguments);
     }
+    Ok(())
+}
+
+fn open_regular_file(path: &Path) -> Result<(File, Metadata), ImageError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(unix_open_flags());
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    validate_regular_file_metadata(&meta)?;
+    Ok((file, meta))
+}
+
+/// Extract embedded artwork from a regular audio file path.
+pub fn extract_embedded_artwork(path: &Path) -> Result<Vec<u8>, ImageError> {
+    let (mut file, meta) = open_regular_file(path)?;
 
     match extract_embedded_artwork_from_reader(&mut file, meta.len())? {
         Some(art) => Ok(art.data),
@@ -653,6 +751,47 @@ fn resolve_bg_rgba(bgcolor: Option<u32>, format: ImageFormat) -> image::Rgba<u8>
             } else {
                 image::Rgba([0, 0, 0, 255])
             }
+        }
+    }
+}
+
+fn compose_on_canvas(
+    scaled: DynamicImage,
+    canvas_w: u32,
+    canvas_h: u32,
+    spec: &ResizeSpec,
+    format: ImageFormat,
+) -> DynamicImage {
+    let scaled_w = scaled.width();
+    let scaled_h = scaled.height();
+    let needs_pad = scaled_w != canvas_w || scaled_h != canvas_h;
+    let needs_jpg_alpha = format == ImageFormat::Jpg && scaled.color().has_alpha();
+
+    if !needs_pad && !needs_jpg_alpha {
+        return scaled;
+    }
+
+    let mut bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
+    if format == ImageFormat::Jpg {
+        // JPEG has no alpha channel; composite onto an opaque background.
+        bg_rgba.0[3] = 255;
+    }
+    let offset_x = i64::from(canvas_w.saturating_sub(scaled_w) / 2);
+    let offset_y = i64::from(canvas_h.saturating_sub(scaled_h) / 2);
+
+    if format == ImageFormat::Jpg && !scaled.color().has_alpha() {
+        let [r, g, b, _] = bg_rgba.0;
+        let mut canvas = image::RgbImage::from_pixel(canvas_w, canvas_h, image::Rgb([r, g, b]));
+        image::imageops::overlay(&mut canvas, &scaled.to_rgb8(), offset_x, offset_y);
+        DynamicImage::ImageRgb8(canvas)
+    } else {
+        let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
+        let scaled_rgba = scaled.to_rgba8();
+        image::imageops::overlay(&mut canvas, &scaled_rgba, offset_x, offset_y);
+        if format == ImageFormat::Jpg {
+            DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(canvas).to_rgb8())
+        } else {
+            DynamicImage::ImageRgba8(canvas)
         }
     }
 }
@@ -778,16 +917,6 @@ fn resize_decoded_image(
 
     let output_image: DynamicImage = match spec.mode {
         ResizeMode::Max | ResizeMode::Pad => {
-            // Bug 17140: switch to png if image will contain padded space,
-            // unless a format was explicitly requested.
-            if spec.explicit_format.is_none() && format != ImageFormat::Png {
-                let in_aspect = in_height as f64 / in_width as f64;
-                let target_aspect = height as f64 / width as f64;
-                if (in_aspect - target_aspect).abs() > 1e-4 {
-                    format = ImageFormat::Png;
-                }
-            }
-
             // Do not upscale if requested size exceeds original on both axes.
             if width > in_width && height > in_height {
                 if (in_height as f64 / in_width as f64) > 1.0 {
@@ -813,39 +942,17 @@ fn resize_decoded_image(
             let scaled_w = ((in_width as f64 * scale).round() as u32).clamp(1, canvas_w);
             let scaled_h = ((in_height as f64 * scale).round() as u32).clamp(1, canvas_h);
 
-            let scaled = resize_with_downsample(img, scaled_w, scaled_h, filter);
-
-            if scaled_w == canvas_w && scaled_h == canvas_h {
-                scaled
-            } else {
-                let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
-                let offset_x = (canvas_w - scaled_w) / 2;
-                let offset_y = (canvas_h - scaled_h) / 2;
-                if format == ImageFormat::Jpg && !scaled.color().has_alpha() {
-                    let mut canvas = image::RgbImage::from_pixel(
-                        canvas_w,
-                        canvas_h,
-                        image::Rgb([bg_rgba.0[0], bg_rgba.0[1], bg_rgba.0[2]]),
-                    );
-                    image::imageops::overlay(
-                        &mut canvas,
-                        &scaled.to_rgb8(),
-                        offset_x as i64,
-                        offset_y as i64,
-                    );
-                    DynamicImage::ImageRgb8(canvas)
-                } else {
-                    let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
-                    let scaled_rgba = scaled.to_rgba8();
-                    image::imageops::overlay(
-                        &mut canvas,
-                        &scaled_rgba,
-                        offset_x as i64,
-                        offset_y as i64,
-                    );
-                    DynamicImage::ImageRgba8(canvas)
-                }
+            // Bug 17140: switch to png if image will contain padded space,
+            // unless a format was explicitly requested.
+            if spec.explicit_format.is_none()
+                && format != ImageFormat::Png
+                && (scaled_w != canvas_w || scaled_h != canvas_h)
+            {
+                format = ImageFormat::Png;
             }
+
+            let scaled = resize_with_downsample(img, scaled_w, scaled_h, filter);
+            compose_on_canvas(scaled, canvas_w, canvas_h, spec, format)
         }
         ResizeMode::FitOrKeep => {
             // Requested size is bigger than original -> return original size
@@ -866,35 +973,7 @@ fn resize_decoded_image(
             let scaled_h = ((in_height as f64 * scale).round() as u32).clamp(1, canvas_h);
 
             let scaled = resize_with_downsample(img, scaled_w, scaled_h, filter);
-            if scaled_w == canvas_w && scaled_h == canvas_h {
-                scaled
-            } else {
-                let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
-                let offset_x = (canvas_w - scaled_w) / 2;
-                let offset_y = (canvas_h - scaled_h) / 2;
-                if format == ImageFormat::Jpg && !scaled.color().has_alpha() {
-                    let [r, g, b, _] = bg_rgba.0;
-                    let mut canvas =
-                        image::RgbImage::from_pixel(canvas_w, canvas_h, image::Rgb([r, g, b]));
-                    image::imageops::overlay(
-                        &mut canvas,
-                        &scaled.to_rgb8(),
-                        offset_x as i64,
-                        offset_y as i64,
-                    );
-                    DynamicImage::ImageRgb8(canvas)
-                } else {
-                    let mut canvas = image::RgbaImage::from_pixel(canvas_w, canvas_h, bg_rgba);
-                    let scaled_rgba = scaled.to_rgba8();
-                    image::imageops::overlay(
-                        &mut canvas,
-                        &scaled_rgba,
-                        offset_x as i64,
-                        offset_y as i64,
-                    );
-                    DynamicImage::ImageRgba8(canvas)
-                }
-            }
+            compose_on_canvas(scaled, canvas_w, canvas_h, spec, format)
         }
         ResizeMode::Original => {
             // mode 'o': only use width
@@ -920,15 +999,7 @@ fn resize_decoded_image(
             }
 
             let scaled = resize_with_downsample(img, target_w, target_h, filter);
-            if format == ImageFormat::Jpg && scaled.color().has_alpha() {
-                let bg_rgba = resolve_bg_rgba(spec.bgcolor, format);
-                let mut canvas = image::RgbaImage::from_pixel(target_w, target_h, bg_rgba);
-                let scaled_rgba = scaled.to_rgba8();
-                image::imageops::overlay(&mut canvas, &scaled_rgba, 0, 0);
-                DynamicImage::ImageRgba8(canvas)
-            } else {
-                scaled
-            }
+            compose_on_canvas(scaled, target_w, target_h, spec, format)
         }
     };
 
@@ -1026,7 +1097,51 @@ fn format_series_spec_str(spec: &ResizeSpec) -> String {
         Some(h) => h.to_string(),
         None => "X".to_string(),
     };
-    format!("{w_str}x{h_str}_{}", spec.mode.as_char())
+    let mut out = format!("{w_str}x{h_str}_{}", spec.mode.as_char());
+    if let Some(bg) = spec.bgcolor {
+        if (bg >> 24) == 0xFF {
+            out.push_str(&format!("_{:06x}", bg & 0x00FF_FFFF));
+        } else {
+            out.push_str(&format!("_{bg:08x}"));
+        }
+    }
+    if let Some(fmt) = spec.explicit_format {
+        out.push('.');
+        out.push_str(fmt.as_str());
+    }
+    out
+}
+
+fn read_image_or_embedded_from_file(
+    file: &mut File,
+    meta: &Metadata,
+) -> Result<Vec<u8>, ImageError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = Vec::with_capacity(16);
+    (&mut *file).take(16).read_to_end(&mut header)?;
+
+    if sniff_format(&header).is_some() {
+        let remaining_cap = (MAX_INPUT_BYTES + 1).saturating_sub(header.len()) as u64;
+        let mut full = header;
+        file.take(remaining_cap).read_to_end(&mut full)?;
+        if full.len() > MAX_INPUT_BYTES {
+            return Err(ImageError::InvalidArguments);
+        }
+        Ok(full)
+    } else {
+        match extract_embedded_artwork_from_reader(file, meta.len())? {
+            Some(art) => Ok(art.data),
+            None => Err(ImageError::NoArtworkFound),
+        }
+    }
+}
+
+fn clamp_mtime_to_u32(mtime: i64) -> u32 {
+    if mtime <= 0 {
+        0
+    } else {
+        u32::try_from(mtime).unwrap_or(u32::MAX)
+    }
 }
 
 pub fn gdresize_to_cache(
@@ -1046,32 +1161,29 @@ pub fn gdresize_to_cache(
 
     let (src_bytes, original_path, mtime) = match file_or_data {
         InputSource::Path(p) => {
-            let metadata = std::fs::metadata(p).ok();
-            let mtime = metadata
-                .and_then(|m| m.modified().ok())
+            let (mut file, meta) = open_regular_file(p)?;
+            let mtime = meta
+                .modified()
+                .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
                 .unwrap_or(0);
             let path_str = p.to_string_lossy().to_string();
-
-            let mut file = std::fs::File::open(p)?;
-            let mut header = Vec::with_capacity(16);
-            (&mut file).take(16).read_to_end(&mut header)?;
-
-            let raw = if sniff_format(&header).is_some() {
-                let remaining_cap = (MAX_INPUT_BYTES + 1).saturating_sub(header.len()) as u64;
-                let mut full = header;
-                file.take(remaining_cap).read_to_end(&mut full)?;
-                if full.len() > MAX_INPUT_BYTES {
-                    return Err(ImageError::InvalidArguments);
-                }
-                full
-            } else {
-                extract_embedded_artwork(p)?
-            };
+            let raw = read_image_or_embedded_from_file(&mut file, &meta)?;
             (Cow::Owned(raw), path_str, mtime)
         }
         InputSource::Bytes(b) => (Cow::Borrowed(b), String::new(), 0),
+        InputSource::OpenedFile {
+            mut file,
+            original_path,
+            mtime,
+        } => {
+            let meta = file.metadata()?;
+            validate_regular_file_metadata(&meta)?;
+            let raw = read_image_or_embedded_from_file(&mut file, &meta)?;
+            let path_str = original_path.to_string_lossy().to_string();
+            (Cow::Owned(raw), path_str, clamp_mtime_to_u32(mtime))
+        }
     };
 
     if src_bytes.len() > MAX_INPUT_BYTES {
@@ -1079,11 +1191,11 @@ pub fn gdresize_to_cache(
     }
 
     if let [single_spec] = specs {
-        let spec_parsed = parse_single_spec(single_spec);
+        let spec_parsed = try_parse_single_spec(single_spec)?;
         let (out_bytes, out_format) = resize_image(src_bytes.as_ref(), &spec_parsed, faster)?;
 
         if !cachekey.is_empty() {
-            let record = lms_cache::ArtworkRecord {
+            let record = ArtworkRecord {
                 content_type: out_format.as_str().to_string(),
                 mtime,
                 original_path,
@@ -1101,7 +1213,7 @@ pub fn gdresize_to_cache(
 
         let mut parsed_specs: Vec<ResizeSpec> = Vec::with_capacity(specs.len());
         for s in specs {
-            let parsed = parse_single_spec(s);
+            let parsed = try_parse_single_spec(s)?;
             if let Some(w) = parsed.width {
                 if w > 8_192 {
                     return Err(ImageError::InvalidArguments);
@@ -1115,9 +1227,9 @@ pub fn gdresize_to_cache(
             parsed_specs.push(parsed);
         }
 
-        let (mut current_img, mut current_fmt) = decode_checked(&src_bytes)?;
-        let src_w = current_img.width();
-        let src_h = current_img.height();
+        let (src_img, src_fmt) = decode_checked(&src_bytes)?;
+        let src_w = src_img.width();
+        let src_h = src_img.height();
         if src_w == 0 || src_h == 0 {
             return Err(ImageError::InvalidArguments);
         }
@@ -1149,11 +1261,12 @@ pub fn gdresize_to_cache(
 
         series.sort_by_key(|a| std::cmp::Reverse((a.sort_w, a.sort_h)));
 
+        let mut staged: Vec<(String, ArtworkRecord)> = Vec::with_capacity(series.len());
         let mut first_result: Option<(Vec<u8>, ImageFormat)> = None;
 
         for item in &series {
             let (next_img, resized_bytes, format) =
-                resize_decoded_image(&current_img, current_fmt, &item.parsed, faster)?;
+                resize_decoded_image(&src_img, src_fmt, &item.parsed, faster)?;
             if next_img.width() > 8_192 || next_img.height() > 8_192 {
                 return Err(ImageError::InvalidArguments);
             }
@@ -1161,27 +1274,24 @@ pub fn gdresize_to_cache(
             let spec_str = format_series_spec_str(&item.parsed);
             let key = format_series_cachekey(cachekey, &spec_str);
 
-            let is_first = first_result.is_none();
-            let record_data = resized_bytes.clone();
+            let record_data = if first_result.is_none() {
+                let data = resized_bytes.clone();
+                first_result = Some((resized_bytes, format));
+                data
+            } else {
+                resized_bytes
+            };
 
-            let record = lms_cache::ArtworkRecord {
+            let record = ArtworkRecord {
                 content_type: format.as_str().to_string(),
                 mtime,
                 original_path: original_path.clone(),
                 data: record_data,
             };
-            store.set(&key, &record)?;
-
-            if is_first {
-                first_result = Some((resized_bytes, format));
-            }
-
-            if next_img.width() >= 100 && next_img.height() >= 100 && !next_img.color().has_alpha()
-            {
-                current_img = next_img;
-                current_fmt = format;
-            }
+            staged.push((key, record));
         }
+
+        store.set_batch(&staged)?;
 
         first_result.ok_or_else(|| ImageError::InvalidSpec("no series processed".to_string()))
     }
@@ -1433,10 +1543,130 @@ mod tests {
     #[test]
     fn test_sniff_format_all_types() {
         assert_eq!(sniff_format(b"\x89PNG\r\n\x1a\n"), Some(ImageFormat::Png));
+        assert_eq!(sniff_format(b"\x89PNG"), None);
         assert_eq!(sniff_format(b"\xFF\xD8\xFF\xE0"), Some(ImageFormat::Jpg));
+        assert_eq!(sniff_format(b"\xFF\xD8"), None);
+        assert_eq!(sniff_format(b"GIF87a"), Some(ImageFormat::Gif));
         assert_eq!(sniff_format(b"GIF89a"), Some(ImageFormat::Gif));
-        assert_eq!(sniff_format(b"BM"), Some(ImageFormat::Bmp));
+        assert_eq!(sniff_format(b"GIF"), None);
+        assert_eq!(sniff_format(b"GIF99a"), None);
+        let valid_bmp = b"BM\x36\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00";
+        assert_eq!(sniff_format(valid_bmp), Some(ImageFormat::Bmp));
+        assert_eq!(sniff_format(b"BM"), None);
+        let bad_bmp_off = b"BM\x36\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        assert_eq!(sniff_format(bad_bmp_off), None);
         assert_eq!(sniff_format(b"UNKNOWN_MAGIC"), None);
+    }
+
+    #[test]
+    fn test_jpg_rgba_compositing_when_scaled_equals_canvas() {
+        let mut rgba = image::RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 0]));
+        for y in 25..75 {
+            for x in 25..75 {
+                rgba.put_pixel(x, y, image::Rgba([10, 200, 30, 255]));
+            }
+        }
+        let mut png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png_bytes), ImgFmt::Png)
+            .expect("encode rgba png");
+
+        let cases = [
+            ("100x100_m_ff0000.jpg", (230u8, 25u8, 25u8), true),
+            ("100x100_p_00ff00.jpg", (25u8, 230u8, 25u8), false),
+            ("100x100_F_0000ff.jpg", (25u8, 25u8, 230u8), false),
+        ];
+        for (spec_str, expected, is_red) in cases {
+            let spec = parse_single_spec(spec_str);
+            let (out, fmt) = resize_image(&png_bytes, &spec, false).expect("resize rgba to jpg");
+            assert_eq!(fmt, ImageFormat::Jpg);
+            let dec = image::load_from_memory(&out).expect("decode jpg").to_rgb8();
+            let corner = dec.get_pixel(0, 0);
+            if is_red {
+                assert!(corner[0] > expected.0 && corner[1] < expected.1 && corner[2] < expected.2);
+            } else if spec_str.contains("_p_") {
+                assert!(corner[0] < expected.0 && corner[1] > expected.1 && corner[2] < expected.2);
+            } else {
+                assert!(corner[0] < expected.0 && corner[1] < expected.1 && corner[2] > expected.2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_series_renders_independently_from_original_source() {
+        let mut rgba = image::RgbaImage::from_pixel(200, 100, image::Rgba([0, 0, 0, 0]));
+        for y in 0..100 {
+            for x in 100..200 {
+                rgba.put_pixel(x, y, image::Rgba([20, 180, 40, 255]));
+            }
+        }
+        let mut png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png_bytes), ImgFmt::Png)
+            .expect("encode source png");
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = lms_cache::DbArtworkStore::open(dir.path(), false).expect("open store");
+        let specs = vec!["150x150_p_ff0000.jpg".to_string(), "100x100_o".to_string()];
+        gdresize_to_cache(
+            InputSource::Bytes(&png_bytes),
+            &specs,
+            &store,
+            "music/series_orig/cover_",
+            false,
+        )
+        .expect("series resize");
+
+        let rec = store
+            .get("music/series_orig/cover_100x100_o")
+            .expect("get 100x100_o")
+            .expect("100x100_o present");
+        assert_eq!(rec.content_type, "png");
+        let dec = image::load_from_memory(&rec.data)
+            .expect("decode 100x100_o")
+            .to_rgba8();
+        assert_eq!(dec.width(), 100);
+        assert_eq!(dec.height(), 50);
+        assert_eq!(dec.get_pixel(0, 0)[3], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rejects_symlinks_and_non_regular_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let img_path = dir.path().join("real.jpg");
+        std::fs::write(&img_path, make_jpeg(100, 100)).expect("write real.jpg");
+
+        let sym_path = dir.path().join("link.jpg");
+        std::os::unix::fs::symlink(&img_path, &sym_path).expect("create symlink");
+
+        let store = lms_cache::DbArtworkStore::open(dir.path(), false).expect("open store");
+        assert!(extract_embedded_artwork(&sym_path).is_err());
+        assert!(gdresize_to_cache(
+            InputSource::Path(&sym_path),
+            &["50x50_m".to_string()],
+            &store,
+            "cached/sym",
+            false,
+        )
+        .is_err());
+
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+        assert!(matches!(
+            extract_embedded_artwork(&subdir),
+            Err(ImageError::InvalidArguments)
+        ));
+        assert!(matches!(
+            gdresize_to_cache(
+                InputSource::Path(&subdir),
+                &["50x50_m".to_string()],
+                &store,
+                "cached/dir",
+                false,
+            ),
+            Err(ImageError::InvalidArguments)
+        ));
     }
 
     #[test]
@@ -1738,5 +1968,418 @@ mod tests {
             resize_image(&data, &spec, false),
             Err(ImageError::InvalidArguments)
         ));
+    }
+
+    #[test]
+    fn test_try_parse_single_spec_rejects_malformed_and_overflow_specs() {
+        assert!(matches!(
+            try_parse_single_spec("4294967296x100_m"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x4294967296_m"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x100_z"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x100_p_123"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x100_p_zzzzzz"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x100_m.webp"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x100_m.gd"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            try_parse_single_spec("100x100_m_ff0000_extra"),
+            Err(ImageError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn test_bug_17140_aspect_rounding_without_padding_stays_jpg() {
+        let src_3x2 = make_jpeg(300, 200);
+        let spec_x = parse_single_spec("100xX_m");
+        let (out_bytes, fmt) = resize_image(&src_3x2, &spec_x, false).expect("resize 300x200");
+        assert_eq!(fmt, ImageFormat::Jpg);
+        let dec = image::load_from_memory(&out_bytes).expect("decode 100x67 jpg");
+        assert_eq!(dec.width(), 100);
+        assert_eq!(dec.height(), 67);
+
+        let src_100x101 = make_jpeg(100, 101);
+        let spec_sq = parse_single_spec("50x50_m");
+        let (_, fmt_sq) = resize_image(&src_100x101, &spec_sq, false).expect("resize 100x101");
+        assert_eq!(fmt_sq, ImageFormat::Jpg);
+    }
+
+    #[test]
+    fn test_gif_and_bmp_decode_resize_and_encode() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(80, 40, |x, _| {
+            if x < 40 {
+                image::Rgb([220, 40, 40])
+            } else {
+                image::Rgb([40, 40, 220])
+            }
+        }));
+
+        let mut gif_bytes = Vec::new();
+        img.write_to(&mut Cursor::new(&mut gif_bytes), ImgFmt::Gif)
+            .expect("encode gif");
+        assert_eq!(sniff_format(&gif_bytes), Some(ImageFormat::Gif));
+        let spec_gif = parse_single_spec("40x20_m.gif");
+        let (out_gif, fmt_gif) = resize_image(&gif_bytes, &spec_gif, false).expect("resize gif");
+        assert_eq!(fmt_gif, ImageFormat::Gif);
+        assert_eq!(sniff_format(&out_gif), Some(ImageFormat::Gif));
+        let dec_gif = image::load_from_memory(&out_gif).expect("decode resized gif");
+        assert_eq!(dec_gif.width(), 40);
+        assert_eq!(dec_gif.height(), 20);
+
+        let mut bmp_bytes = Vec::new();
+        img.write_to(&mut Cursor::new(&mut bmp_bytes), ImgFmt::Bmp)
+            .expect("encode bmp");
+        assert_eq!(sniff_format(&bmp_bytes), Some(ImageFormat::Bmp));
+        let spec_bmp = parse_single_spec("40x20_m.bmp");
+        let (out_bmp, fmt_bmp) = resize_image(&bmp_bytes, &spec_bmp, false).expect("resize bmp");
+        assert_eq!(fmt_bmp, ImageFormat::Bmp);
+        assert_eq!(sniff_format(&out_bmp), Some(ImageFormat::Bmp));
+        let dec_bmp = image::load_from_memory(&out_bmp).expect("decode resized bmp");
+        assert_eq!(dec_bmp.width(), 40);
+        assert_eq!(dec_bmp.height(), 20);
+    }
+
+    #[test]
+    fn test_rgba_to_jpg_default_black_and_alpha_blend() {
+        let mut rgba = image::RgbaImage::from_pixel(60, 60, image::Rgba([0, 0, 0, 0]));
+        for y in 20..40 {
+            for x in 20..40 {
+                rgba.put_pixel(x, y, image::Rgba([200, 0, 0, 128]));
+            }
+        }
+        let mut png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png_bytes), ImgFmt::Png)
+            .expect("encode rgba png");
+
+        let spec_default = parse_single_spec("60x60_m.jpg");
+        let (out_default, fmt_default) =
+            resize_image(&png_bytes, &spec_default, false).expect("rgba to default jpg");
+        assert_eq!(fmt_default, ImageFormat::Jpg);
+        let dec_default = image::load_from_memory(&out_default)
+            .expect("decode default jpg")
+            .to_rgb8();
+        assert!(dec_default.get_pixel(0, 0)[0] < 10);
+        assert!(dec_default.get_pixel(0, 0)[1] < 10);
+        assert!(dec_default.get_pixel(0, 0)[2] < 10);
+
+        let spec_white = parse_single_spec("60x60_m_ffffff.jpg");
+        let (out_white, _) =
+            resize_image(&png_bytes, &spec_white, false).expect("rgba over white jpg");
+        let dec_white = image::load_from_memory(&out_white)
+            .expect("decode white jpg")
+            .to_rgb8();
+        let center = dec_white.get_pixel(30, 30);
+        assert!(center[0] > 200 && center[1] > 90 && center[1] < 165);
+    }
+
+    #[test]
+    fn test_series_set_batch_transactional_and_distinct_specs() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = lms_cache::DbArtworkStore::open(dir.path(), false).expect("open store");
+        let src = make_jpeg(200, 200);
+
+        // Failing second spec must not commit the first spec.
+        let failing_specs = vec!["100x100_o".to_string(), "150x150_p_badhex".to_string()];
+        assert!(matches!(
+            gdresize_to_cache(
+                InputSource::Bytes(&src),
+                &failing_specs,
+                &store,
+                "music/tx_fail/cover_",
+                false
+            ),
+            Err(ImageError::InvalidSpec(_))
+        ));
+        assert!(store
+            .get("music/tx_fail/cover_100x100_o")
+            .expect("query tx_fail")
+            .is_none());
+
+        // Distinct bgcolor + format specs in a series must not collide on cache keys.
+        let distinct_specs = vec![
+            "100x100_p_ff0000.jpg".to_string(),
+            "100x100_p_00ff00.png".to_string(),
+        ];
+        gdresize_to_cache(
+            InputSource::Bytes(&src),
+            &distinct_specs,
+            &store,
+            "music/tx_ok/cover_",
+            false,
+        )
+        .expect("series with distinct bgcolor and format");
+        let rec_jpg = store
+            .get("music/tx_ok/cover_100x100_p_ff0000.jpg")
+            .expect("get red jpg")
+            .expect("red jpg present");
+        assert_eq!(rec_jpg.content_type, "jpg");
+        let rec_png = store
+            .get("music/tx_ok/cover_100x100_p_00ff00.png")
+            .expect("get green png")
+            .expect("green png present");
+        assert_eq!(rec_png.content_type, "png");
+    }
+
+    #[test]
+    fn test_flac_rejects_uri_picture_and_preserves_lowest_type_priority() {
+        let mut uri_flac = Vec::new();
+        uri_flac.extend_from_slice(b"fLaC");
+        uri_flac.extend_from_slice(&build_flac_block(false, 0, &[0u8; 34]));
+        let uri_pic = build_flac_picture_payload(3, "-->", b"https://example.com/cover.jpg");
+        uri_flac.extend_from_slice(&build_flac_block(true, 6, &uri_pic));
+        let uri_len = uri_flac.len() as u64;
+        assert!(matches!(
+            extract_embedded_artwork_from_reader(&mut Cursor::new(uri_flac), uri_len),
+            Err(ImageError::Lofty(_))
+        ));
+
+        let mut prio_flac = Vec::new();
+        prio_flac.extend_from_slice(b"fLaC");
+        prio_flac.extend_from_slice(&build_flac_block(false, 0, &[0u8; 34]));
+        let pic_front = build_flac_picture_payload(3, "image/jpeg", b"FRONT");
+        let pic_icon = build_flac_picture_payload(1, "image/png", b"ICON");
+        prio_flac.extend_from_slice(&build_flac_block(false, 6, &pic_front));
+        prio_flac.extend_from_slice(&build_flac_block(true, 6, &pic_icon));
+        let prio_len = prio_flac.len() as u64;
+        let extracted = extract_embedded_artwork_from_reader(&mut Cursor::new(prio_flac), prio_len)
+            .expect("prio flac succeeds")
+            .expect("artwork present");
+        assert_eq!(extracted.picture_type, 1);
+        assert_eq!(extracted.data, b"ICON");
+    }
+
+    #[test]
+    fn test_bounded_reader_seek_within_offset_range() {
+        let backing: Vec<u8> = (0u8..30).collect();
+        let mut cursor = Cursor::new(backing);
+        let mut br = BoundedReader::new(&mut cursor, 10, 10).expect("create bounded reader");
+
+        assert_eq!(br.seek(SeekFrom::End(0)).expect("seek end 0"), 10);
+        assert_eq!(br.seek(SeekFrom::End(-3)).expect("seek end -3"), 7);
+        let mut buf = [0u8; 4];
+        let n = br.read(&mut buf).expect("read bounded");
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..n], &[17, 18, 19]);
+
+        assert!(br.seek(SeekFrom::End(-11)).is_err());
+        assert!(br.seek(SeekFrom::End(1)).is_err());
+        assert!(br.seek(SeekFrom::Start(11)).is_err());
+        assert!(BoundedReader::new(&mut cursor, u64::MAX - 5, 10).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_open_flags_rejects_symlinks() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let flags = unix_open_flags();
+        assert_ne!(flags & libc::O_NOFOLLOW, 0);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let real_path = dir.path().join("real.jpg");
+        std::fs::write(&real_path, make_jpeg(64, 64)).expect("write real.jpg");
+        let sym_path = dir.path().join("sym.jpg");
+        std::os::unix::fs::symlink(&real_path, &sym_path).expect("create symlink");
+
+        let sym_open = OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(&sym_path);
+        assert!(sym_open.is_err());
+        assert!(open_regular_file(&sym_path).is_err());
+        assert!(open_regular_file(&real_path).is_ok());
+    }
+
+    #[test]
+    fn test_opened_file_rewinds_and_preserves_metadata_without_reopening() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let img_path = dir.path().join("source.jpg");
+        std::fs::write(&img_path, make_jpeg(200, 200)).expect("write source.jpg");
+
+        let mut file = File::open(&img_path).expect("open source.jpg");
+        file.seek(SeekFrom::Start(12)).expect("seek forward");
+
+        let virtual_path = PathBuf::from("/virtual/nonexistent/album/cover.jpg");
+        let expected_mtime: i64 = 1_700_000_123;
+        let store = lms_cache::DbArtworkStore::open(dir.path(), false).expect("open store");
+        let (out, fmt) = gdresize_to_cache(
+            InputSource::OpenedFile {
+                file,
+                original_path: virtual_path.clone(),
+                mtime: expected_mtime,
+            },
+            &["100x100_m".to_string()],
+            &store,
+            "cached/opened_single",
+            false,
+        )
+        .expect("gdresize opened file");
+        assert_eq!(fmt, ImageFormat::Jpg);
+        assert!(!out.is_empty());
+
+        let cached = store
+            .get("cached/opened_single")
+            .expect("get cached record")
+            .expect("cached record present");
+        assert_eq!(cached.data, out);
+        assert_eq!(cached.content_type, "jpg");
+        assert_eq!(cached.mtime, 1_700_000_123);
+        assert_eq!(cached.original_path, virtual_path.to_string_lossy());
+
+        let mut series_file = File::open(&img_path).expect("reopen for series");
+        series_file.seek(SeekFrom::End(0)).expect("seek to end");
+        gdresize_to_cache(
+            InputSource::OpenedFile {
+                file: series_file,
+                original_path: virtual_path.clone(),
+                mtime: expected_mtime,
+            },
+            &["120x120_o".to_string(), "60x60_m".to_string()],
+            &store,
+            "cached/opened_series_",
+            false,
+        )
+        .expect("gdresize opened file series");
+
+        for key in [
+            "cached/opened_series_120x120_o",
+            "cached/opened_series_60x60_m",
+        ] {
+            let rec = store
+                .get(key)
+                .expect("query series record")
+                .expect("series record present");
+            assert_eq!(rec.mtime, 1_700_000_123);
+            assert_eq!(rec.original_path, virtual_path.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn test_opened_file_embedded_artwork_rejections_and_mtime_clamp() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mp3_path = dir.path().join("tagged.mp3");
+        std::fs::copy(silence_mp3_path(), &mp3_path).expect("copy silence.mp3");
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        let pic = Picture::new_unchecked(
+            PictureType::CoverFront,
+            Some(MimeType::Jpeg),
+            None,
+            make_jpeg(120, 120),
+        );
+        tag.push_picture(pic);
+        tag.save_to_path(&mp3_path, WriteOptions::default())
+            .expect("save mp3 tag");
+
+        let mut mp3_file = File::open(&mp3_path).expect("open tagged.mp3");
+        mp3_file.seek(SeekFrom::Start(5)).expect("seek forward");
+
+        let store = lms_cache::DbArtworkStore::open(dir.path(), false).expect("open store");
+        let virtual_mp3 = PathBuf::from("/virtual/nonexistent/track.mp3");
+        gdresize_to_cache(
+            InputSource::OpenedFile {
+                file: mp3_file,
+                original_path: virtual_mp3.clone(),
+                mtime: -5,
+            },
+            &["60x60_m".to_string()],
+            &store,
+            "cached/opened_mp3",
+            false,
+        )
+        .expect("gdresize opened mp3");
+
+        let rec = store
+            .get("cached/opened_mp3")
+            .expect("query mp3 record")
+            .expect("mp3 record present");
+        assert_eq!(rec.original_path, virtual_mp3.to_string_lossy());
+        assert_eq!(rec.mtime, 0);
+
+        let img_path = dir.path().join("clamp.jpg");
+        std::fs::write(&img_path, make_jpeg(80, 80)).expect("write clamp.jpg");
+        let clamp_file = File::open(&img_path).expect("open clamp.jpg");
+        gdresize_to_cache(
+            InputSource::OpenedFile {
+                file: clamp_file,
+                original_path: PathBuf::from("/virtual/clamp.jpg"),
+                mtime: i64::MAX,
+            },
+            &["40x40_m".to_string()],
+            &store,
+            "cached/opened_clamp",
+            false,
+        )
+        .expect("gdresize opened clamp");
+        let clamp_rec = store
+            .get("cached/opened_clamp")
+            .expect("query clamp record")
+            .expect("clamp record present");
+        assert_eq!(clamp_rec.mtime, u32::MAX);
+
+        let oversize_path = dir.path().join("oversize_opened.jpg");
+        {
+            let mut file = File::create(&oversize_path).expect("create oversize file");
+            file.write_all(b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01")
+                .expect("write jpeg header");
+            file.set_len((MAX_INPUT_BYTES + 1) as u64)
+                .expect("extend oversize file");
+        }
+        let oversize_file = File::open(&oversize_path).expect("open oversize file");
+        assert!(matches!(
+            gdresize_to_cache(
+                InputSource::OpenedFile {
+                    file: oversize_file,
+                    original_path: oversize_path,
+                    mtime: 100,
+                },
+                &["50x50_m".to_string()],
+                &store,
+                "cached/opened_oversize",
+                false,
+            ),
+            Err(ImageError::InvalidArguments)
+        ));
+
+        #[cfg(unix)]
+        {
+            let subdir = dir.path().join("opened_subdir");
+            std::fs::create_dir(&subdir).expect("create subdir");
+            let dir_file = File::open(&subdir).expect("open subdir");
+            assert!(matches!(
+                gdresize_to_cache(
+                    InputSource::OpenedFile {
+                        file: dir_file,
+                        original_path: subdir,
+                        mtime: 100,
+                    },
+                    &["50x50_m".to_string()],
+                    &store,
+                    "cached/opened_dir",
+                    false,
+                ),
+                Err(ImageError::InvalidArguments)
+            ));
+        }
     }
 }

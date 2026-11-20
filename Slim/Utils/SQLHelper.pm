@@ -19,8 +19,8 @@ Run the commands as specified in the sqlFile.
 
 Valid commands are:
 
-ALTER, CREATE, USE, SET, INSERT, UPDATE, DELETE, DROP, SELECT, OPTIMIZE,
-TRUNCATE, UNLOCK, START, COMMIT
+ANALYZE, ALTER, CREATE, USE, SET, INSERT, UPDATE, DELETE, DROP, SELECT,
+OPTIMIZE, TRUNCATE, UNLOCK, START, COMMIT, PRAGMA
 
 =head1 SEE ALSO
 
@@ -58,6 +58,7 @@ sub executeSQLFile {
 
 	my $statement   = '';
 	my $inStatement = 0;
+	my $success     = 1;
 
 	for my $line (<$fh>) {
 		chomp $line;
@@ -69,20 +70,26 @@ sub executeSQLFile {
 		next if $line =~ /^--/;
 		next if $line =~ /^\s*$/;
 
-		if ($line =~ /^\s*(?:ANALYZE|ALTER|CREATE|USE|SET|INSERT|UPDATE|DELETE|DROP|SELECT|OPTIMIZE|TRUNCATE|UNLOCK|START|COMMIT)\b/oi) {
+		if ($line =~ /^\s*(?:ANALYZE|ALTER|CREATE|USE|SET|INSERT|UPDATE|DELETE|DROP|SELECT|OPTIMIZE|TRUNCATE|UNLOCK|START|COMMIT|PRAGMA)\b/oi) {
 			$inStatement = 1;
 		}
 
 		if ($line =~ /;/ && $inStatement) {
 
-			$statement .= $line;
+			$statement .= ($statement ne '' ? ' ' : '') . $line;
 
 			main::INFOLOG && logger('database.sql')->info("Executing SQL: [$statement]");
 
 			eval { $dbh->do($statement) };
 
 			if ($@) {
-				logError("Couldn't execute SQL statement: [$statement] : [$@]");
+				my $err = $@;
+				logError("Couldn't execute SQL statement: [$statement] : [$err]");
+				if ($dbh && !$dbh->{AutoCommit}) {
+					close $fh;
+					die $err;
+				}
+				$success = 0;
 			}
 
 			$statement   = '';
@@ -90,12 +97,12 @@ sub executeSQLFile {
 			next;
 		}
 
-		$statement .= $line if $inStatement;
+		$statement .= ($statement ne '' ? ' ' : '') . $line if $inStatement;
 	}
 
 	close $fh;
 
-	return 1;
+	return $success;
 }
 
 1;

@@ -10,6 +10,7 @@ package Slim::Networking::Select;
 use strict;
 
 use Errno qw(EAGAIN);
+use Hash::Util::FieldHash qw(fieldhash);
 use Slim::Networking::IO::Select;
 use Slim::Utils::Errno;
 use Slim::Utils::Log;
@@ -35,7 +36,14 @@ Usually, you'll want to use higher such as L<Slim::Networking::Async::HTTP>.
 
 my $log = logger('server.select');
 
-our %writeQueue = ();
+fieldhash( our %writeQueue );
+
+sub _safeFileno {
+	my $socket = shift;
+	return -1 unless defined $socket;
+	my $fno = eval { fileno($socket) };
+	return defined($fno) ? $fno : -1;
+}
 
 =head2 writeNoBlock( $socket, $chunkRef )
 
@@ -50,7 +58,13 @@ sub writeNoBlock {
 	my $socket = shift;
 	my $chunkRef = shift;
 
-	return unless ($socket && $socket->opened());
+	if ( !defined $socket || !defined eval { fileno($socket) } || ( $socket->can('opened') && !$socket->opened() ) ) {
+		removeWrite($socket) if defined $socket;
+		removeWriteNoBlockQ($socket) if defined $socket;
+		return;
+	}
+
+	return unless defined $chunkRef && ref($chunkRef) && defined($$chunkRef) && length($$chunkRef);
 
 	push @{$writeQueue{$socket}}, {
 		'data'   => $chunkRef,
@@ -64,6 +78,16 @@ sub writeNoBlock {
 sub _writeNoBlock {
 	my $socket = shift;
 
+	if ( !defined $socket ) {
+		return;
+	}
+
+	if ( !defined eval { fileno($socket) } || ( $socket->can('opened') && !$socket->opened() ) ) {
+		removeWrite($socket);
+		removeWriteNoBlockQ($socket);
+		return;
+	}
+
 	if ( !$writeQueue{$socket} || !@{$writeQueue{$socket}} ) {
 		removeWrite($socket);
 		delete $writeQueue{$socket};
@@ -74,16 +98,12 @@ sub _writeNoBlock {
 
 	while (my $segment = shift(@{$writeQueue{$socket}})) {
 
-		if ( main::INFOLOG && $log->is_info ) {
-			$log->info(sprintf("fileno: [%d] Wrote $segment->{'length'} bytes", fileno($socket)));
-		}
-
 		my $sentbytes = syswrite($socket, ${$segment->{'data'}}, $segment->{'length'}, $segment->{'offset'});
 
 		if (!defined $sentbytes) {
 			if ($! == EWOULDBLOCK || $! == EAGAIN || $! == EINTR) {
 				if ( main::INFOLOG && $log->is_info ) {
-					$log->info(sprintf("fileno: [%d] Would block while sending.", fileno($socket)));
+					$log->info(sprintf("fileno: [%d] Would block while sending.", _safeFileno($socket)));
 				}
 				$sentbytes = 0;
 			}
@@ -92,7 +112,7 @@ sub _writeNoBlock {
 		if (!defined($sentbytes)) {
 
 			if ( main::INFOLOG && $log->is_info ) {
-				$log->info(sprintf("fileno: [%d] Send to socket had error, aborting.", fileno($socket)));
+				$log->info(sprintf("fileno: [%d] Send to socket had error (%s), aborting.", _safeFileno($socket), "$!"));
 			}
 
 			removeWrite($socket);
@@ -100,11 +120,15 @@ sub _writeNoBlock {
 			return;
 		}
 
+		if ( main::INFOLOG && $log->is_info && $sentbytes > 0 ) {
+			$log->info(sprintf("fileno: [%d] Wrote %d bytes", _safeFileno($socket), $sentbytes));
+		}
+
 		# sent incomplete message
 		if ($sentbytes < $segment->{'length'}) {
 
 			if ( main::INFOLOG && $log->is_info ) {
-				$log->info(sprintf("fileno: [%d] Incomplete message, sent only: $sentbytes", fileno($socket)));
+				$log->info(sprintf("fileno: [%d] Incomplete message, sent only: $sentbytes", _safeFileno($socket)));
 			}
 
 			$segment->{'length'} -= $sentbytes;
@@ -119,7 +143,7 @@ sub _writeNoBlock {
 		last if ++$count >= 16;
 	}
 
-	if ( !@{$writeQueue{$socket}} ) {
+	if ( !$writeQueue{$socket} || !@{$writeQueue{$socket}} ) {
 		removeWrite($socket);
 		delete $writeQueue{$socket};
 	}
@@ -140,7 +164,14 @@ Returns -1 if there are no chunks to be written.
 sub writeNoBlockQLen {
 	my $socket = shift;
 
-	if (defined $socket && defined $writeQueue{$socket} && ref($writeQueue{$socket}) eq 'ARRAY') {
+	return -1 unless defined $socket;
+
+	if ( !defined eval { fileno($socket) } ) {
+		removeWriteNoBlockQ($socket);
+		return -1;
+	}
+
+	if (exists $writeQueue{$socket} && defined $writeQueue{$socket} && ref($writeQueue{$socket}) eq 'ARRAY') {
 
 		return scalar @{$writeQueue{$socket}};
 	}
@@ -157,10 +188,12 @@ Remove $socket and any associated chunks from being sent.
 sub removeWriteNoBlockQ {
 	my $socket = shift;
 
+	return unless defined $socket;
+
 	if ( exists($writeQueue{$socket}) ) {
 
 		if ( main::INFOLOG && $log->is_info ) {
-			$log->info(sprintf("fileno: [%d] removing writeNoBlock queue", fileno($socket)));
+			$log->info(sprintf("fileno: [%d] removing writeNoBlock queue", _safeFileno($socket)));
 		}
 
 		delete($writeQueue{$socket});

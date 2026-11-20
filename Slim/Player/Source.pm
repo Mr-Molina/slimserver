@@ -26,7 +26,19 @@ my $log = logger('player.source');
 my $prefs = preferences('server');
 
 sub systell {
-	$_[0]->sysseek(0, SEEK_CUR) if $_[0]->can('sysseek');
+	my $fd = shift;
+	return undef unless defined $fd && Scalar::Util::blessed($fd) && $fd->can('sysseek');
+
+	if ($fd->isa('Slim::Player::Protocols::File')
+		&& (Scalar::Util::reftype($fd) || '') eq 'GLOB'
+		&& ${*$fd}{'mp3cut'}
+		&& defined ${*$fd}{'position'})
+	{
+		return ${*$fd}{'position'};
+	}
+
+	my $pos = $fd->sysseek(0, SEEK_CUR);
+	return defined $pos ? $pos + 0 : undef;
 }
 
 # fractional progress (0 - 1.0) of playback in the current song.
@@ -115,6 +127,11 @@ sub nextChunk {
 
 	return if !$client;
 
+	if (defined($maxChunkSize) && $maxChunkSize <= 0) {
+		$log->warn("Invalid maxChunkSize: $maxChunkSize");
+		return undef;
+	}
+
 	my $queued_chunks = $client->chunks;
 
 	# if there's a chunk in the queue, then use it.
@@ -122,7 +139,7 @@ sub nextChunk {
 
 		$chunk = shift @$queued_chunks;
 
-		$len = length($$chunk);
+		$len = ref($chunk) eq 'SCALAR' && defined($$chunk) ? length($$chunk) : 0;
 
 	} else {
 
@@ -130,6 +147,7 @@ sub nextChunk {
 		# If any client in sync-group has exceeded the high water-mark, then just sleep
 		# until the queue gets drained.
 		foreach ($client->syncGroupActiveMembers()) {
+			next unless $_;
 			if (ref($_->chunks) eq 'ARRAY' && scalar(@{$_->chunks}) >= QUEUED_CHUNKS_HWM) {
 				main::DEBUGLOG && $log->is_debug && $log->debug('Waiting for queue to drain for ', $_->id);
 				$client->streamReadableCallback($callback) if $callback;
@@ -139,20 +157,23 @@ sub nextChunk {
 
 		# otherwise, read a new chunk
 		my $controller = $client->controller();
+		return undef unless $controller;
 		my $master = $controller->master();
+		return undef unless $master;
 
 		$chunk = _readNextChunk($master, $maxChunkSize, defined($callback));
 
 		if (defined($chunk)) {
 
-			$len = length($$chunk);
+			$len = ref($chunk) eq 'SCALAR' && defined($$chunk) ? length($$chunk) : 0;
 
 			if ($len) {
 
 				# let everybody I'm synced with use this chunk
 				foreach my $buddy ($controller->activePlayers()) {
-					next if $client == $buddy;
-					push @{$buddy->chunks}, $chunk;
+					next if !$buddy || $client == $buddy;
+					my $buddy_chunks = $buddy->chunks;
+					push @$buddy_chunks, $chunk if ref($buddy_chunks) eq 'ARRAY';
 				}
 
 				# And save the data for analysis, if we are synced.
@@ -169,13 +190,15 @@ sub nextChunk {
 
 	$client->streamReadableCallback(undef) if defined($chunk);
 
-	if (defined($chunk) && ($len > $maxChunkSize)) {
+	if (defined($chunk) && defined($maxChunkSize) && $maxChunkSize > 0 && ($len > $maxChunkSize)) {
 
 		0 && $log->debug("Chunk too big, pushing the excess for later.");
 
 		my $queued = substr($$chunk, $maxChunkSize - $len, $len - $maxChunkSize);
 
-		unshift @$queued_chunks, \$queued;
+		if (ref($queued_chunks) eq 'ARRAY') {
+			unshift @$queued_chunks, \$queued;
+		}
 
 		my $returned = substr($$chunk, 0, $maxChunkSize);
 
@@ -194,6 +217,7 @@ sub nextChunk {
 		# have its queue full and it can correctly reset its callback registration before we signal
 		# the waiters.
 		foreach ($client->syncGroupActiveMembers()) {
+			next unless $_;
 			if (ref($_->chunks) eq 'ARRAY' && scalar(@{$_->chunks}) >= QUEUED_CHUNKS_HWM) {
 				main::DEBUGLOG && $log->is_debug && $log->debug('Still waiting for queue to drain for ', $_->id);
 				return $chunk;
@@ -201,7 +225,8 @@ sub nextChunk {
 		}
 
 		main::DEBUGLOG && $log->is_debug && $log->debug('Wake up queued clients as have drained queue for ', $client->id);
-		_wakeupOnReadable(undef, $client->controller()->master());
+		my $controller = $client->controller();
+		_wakeupOnReadable(undef, $controller->master()) if $controller;
 	}
 
 	return $chunk;
@@ -281,8 +306,15 @@ sub _readNextChunk {
 	my $givenChunkSize = shift;
 	my $callback = shift;
 
+	return undef unless $client;
+
 	if (!defined($givenChunkSize)) {
-		$givenChunkSize = $prefs->get('udpChunkSize') * 10;
+		my $udpChunkSize = $prefs->get('udpChunkSize');
+		$givenChunkSize = defined($udpChunkSize) ? ($udpChunkSize * 10) : 0;
+	}
+
+	if ($givenChunkSize <= 0) {
+		return undef;
 	}
 
 	my $chunksize = $givenChunkSize;
@@ -291,11 +323,12 @@ sub _readNextChunk {
 
 	my $endofsong = undef;
 
-	if ($client->streamBytes() == 0 && $client->streamformat() eq 'mp3') {
+	if (($client->streamBytes() || 0) == 0 && ($client->streamformat() || '') eq 'mp3') {
 
 		my $silence = 0;
 		# use the maximum silence prelude for the whole sync group...
 		foreach my $buddy ($client->syncGroupActiveMembers()) {
+			next unless $buddy;
 
 			my $asilence = $prefs->client($buddy)->get('mp3SilencePrelude');
 
@@ -306,9 +339,16 @@ sub _readNextChunk {
 
 		0 && $log->debug("We need to send $silence seconds of silence...");
 
-		while ($silence > 0) {
-			$chunk .=  ${Slim::Web::HTTP::getStaticContent("html/lbrsilence.mp3")};
-			$silence -= (1152 / 44100);
+		if ($silence > 0) {
+			my $silenceRef = Slim::Web::HTTP::getStaticContent("html/lbrsilence.mp3");
+			if (ref($silenceRef) eq 'SCALAR' && defined($$silenceRef) && length($$silenceRef)) {
+				while ($silence > 0) {
+					$chunk .= $$silenceRef;
+					$silence -= (1152 / 44100);
+				}
+			} else {
+				$log->warn("Unable to load static content html/lbrsilence.mp3");
+			}
 		}
 
 		my $len = length($chunk);
@@ -320,7 +360,9 @@ sub _readNextChunk {
 		return \$chunk if ($len);
 	}
 
-	my $fd = $client->controller()->songStreamController() ? $client->controller()->songStreamController()->streamHandler() : undef;
+	my $controller = $client->controller();
+	my $ssc = $controller ? $controller->songStreamController() : undef;
+	my $fd  = $ssc ? $ssc->streamHandler() : undef;
 
 	if ($fd) {
 
@@ -343,14 +385,15 @@ sub _readNextChunk {
 						my $weakClient = $client;
 						Scalar::Util::weaken($weakClient);
 
-						my $readFh  = ${*$fd}{'pipeline_reader'} || $fd;
-						my $writeFh = ${*$fd}{'pipeline_writer'};
+						my $isGlob  = _isGlob($fd);
+						my $readFh  = ($isGlob && ${*$fd}{'pipeline_reader'}) ? ${*$fd}{'pipeline_reader'} : $fd;
+						my $writeFh = $isGlob ? ${*$fd}{'pipeline_writer'} : undef;
 
-						Slim::Networking::Select::addRead($readFh, sub { _wakeupOnReadable(shift, $weakClient, $writeFh); }, 1);
+						Slim::Networking::Select::addRead($readFh, sub { _wakeupOnReadable(shift, $weakClient, $writeFh); }, 1) if _isGlob($readFh);
 
 						# If this pipeline's input is full, also wake up when it drains. Until the pipeline
 						# produces its first output, the reader above cannot become readable.
-						if (${*$fd}{'pipeline_pending_size'} && defined $writeFh) {
+						if ($isGlob && ${*$fd}{'pipeline_pending_size'} && _isGlob($writeFh)) {
 							Slim::Networking::Select::addWrite($writeFh, sub { _wakeupOnWritable(shift, $weakClient, $readFh); }, 1);
 						}
 					}
@@ -385,34 +428,47 @@ bail:
 	if ($endofsong) {
 
 		if (defined $fd) {
-			Slim::Networking::Select::removeRead(${*$fd}{'pipeline_reader'} || $fd);
-			Slim::Networking::Select::removeWrite(${*$fd}{'pipeline_writer'}) if defined ${*$fd}{'pipeline_writer'};
+			my $isGlob      = _isGlob($fd);
+			my $readFh      = ($isGlob && ${*$fd}{'pipeline_reader'}) ? ${*$fd}{'pipeline_reader'} : $fd;
+			my $writeFh     = $isGlob ? ${*$fd}{'pipeline_writer'} : undef;
+			my $isReadGlob  = _isGlob($readFh);
+			my $isWriteGlob = _isGlob($writeFh);
+			Slim::Networking::Select::removeRead($readFh)   if $isReadGlob;
+			Slim::Networking::Select::removeWrite($writeFh) if $isWriteGlob;
+			Slim::Networking::Select::removeError($readFh)  if $isReadGlob;
+			Slim::Networking::Select::removeError($writeFh) if $isWriteGlob;
 		}
 
 		if ( main::INFOLOG && $log->is_info ) {
-			my $msg = "end of file or error on socket, song pos: " . $client->songBytes;
-			$msg .= ", tell says: " . systell($fd) . ", totalbytes: "
-					 . $client->controller()->songStreamController()->song()->totalbytes()
-				if $fd->isa('Slim::Player::Protocols::File');
+			my $msg = "end of file or error on socket, song pos: " . ($client->songBytes // 0);
+			if (defined $fd && Scalar::Util::blessed($fd) && $fd->isa('Slim::Player::Protocols::File')) {
+				my $tell = systell($fd);
+				my $eof_ssc  = $controller ? $controller->songStreamController() : undef;
+				my $eof_song = $eof_ssc ? $eof_ssc->song() : undef;
+				$msg .= ", tell says: " . (defined $tell ? $tell : 'undef')
+				      . ", totalbytes: " . ($eof_song && defined $eof_song->totalbytes() ? $eof_song->totalbytes() : 'undef');
+			}
 			$log->info($msg);
 		}
 
 		# Mark the end of stream
 		for my $buddy ($client->syncGroupActiveMembers()) {
+			next unless $buddy;
 			main::INFOLOG && $log->info($buddy->id() . " mark end of stream");
-			push @{$buddy->chunks}, \'';
+			my $buddy_chunks = $buddy->chunks;
+			push @$buddy_chunks, \'' if ref($buddy_chunks) eq 'ARRAY';
 		}
 
-		if ($client->streamBytes() == 0 && $client->reportsTrackStart()) {
+		if (($client->streamBytes() || 0) == 0 && $client->reportsTrackStart()) {
 
 			# If we haven't streamed any bytes, then it is most likely an error
 
 			main::INFOLOG && $log->info("Didn't stream any bytes for this song; mark it as failed");
-			$client->controller()->playerStreamingFailed($client);
-			return;
+			$controller->playerStreamingFailed($client) if $controller;
+			return undef;
 		}
 
-		$client->controller()->localEndOfStream();
+		$controller->localEndOfStream() if $controller;
 
 		return undef;
 	}
@@ -420,18 +476,23 @@ bail:
 	my $chunkLength = length($chunk);
 
 	if ($chunkLength > 0) {
-		$client->songBytes($client->songBytes() + $chunkLength);
-		$client->streamBytes($client->streamBytes() + $chunkLength);
+		$client->songBytes(($client->songBytes() || 0) + $chunkLength);
+		$client->streamBytes(($client->streamBytes() || 0) + $chunkLength);
 	}
 
 	return \$chunk;
 }
 
+sub _isGlob {
+	my $fh = shift;
+	return defined($fh) && (Scalar::Util::reftype($fh) || '') eq 'GLOB';
+}
+
 sub _wakeupOnReadable {
 	my ($fd, $master, $writeFh) = @_;
 
-	Slim::Networking::Select::removeRead($fd) if defined $fd;
-	Slim::Networking::Select::removeWrite($writeFh) if defined $writeFh;
+	Slim::Networking::Select::removeRead($fd) if _isGlob($fd);
+	Slim::Networking::Select::removeWrite($writeFh) if _isGlob($writeFh);
 
 	return unless $master;
 
@@ -443,8 +504,8 @@ sub _wakeupOnReadable {
 sub _wakeupOnWritable {
 	my ($fd, $master, $readFh) = @_;
 
-	Slim::Networking::Select::removeWrite($fd) if defined $fd;
-	Slim::Networking::Select::removeRead($readFh) if defined $readFh;
+	Slim::Networking::Select::removeWrite($fd) if _isGlob($fd);
+	Slim::Networking::Select::removeRead($readFh) if _isGlob($readFh);
 
 	return unless $master;
 

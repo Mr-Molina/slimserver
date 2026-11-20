@@ -11,6 +11,7 @@ package Slim::Formats::Playlists::CUE;
 use strict;
 use base qw(Slim::Formats::Playlists::Base);
 
+use Cwd ();
 use File::Slurp;
 
 use Slim::Music::Info;
@@ -120,7 +121,7 @@ sub parse {
 		my $enc = Slim::Utils::Unicode::encodingFromString($line);
 
 		# Prefer UTF8 for CUE sheets.
-		$line = Slim::Utils::Unicode::utf8decode_guess($line, 'utf8', $enc) unless $line =~ /^FILE\s+/i;
+		$line = Slim::Utils::Unicode::utf8decode_guess($line, 'utf8', $enc) unless $line =~ /^\s*FILE\s+/i;
 
 		# strip whitespace from end
 		$line =~ s/\s*$//;
@@ -206,17 +207,29 @@ sub parse {
 				#Ignored
 				main::DEBUGLOG && $log->debug("Index found for missing Track");
 
-			} elsif ($value =~ /^00\s+(\d+):(\d+):(\d+)/i) {
+			} elsif ($value =~ /^00\s+(\d+):(\d{1,2}):(\d{1,2})(?:\s|$)/i) {
 
-				$tracks->{$currtrack}->{'PREGAP'} = ($1 * 60) + $2 + ($3 / 75);
+				if ($2 < 60 && $3 < 75) {
+					$tracks->{$currtrack}->{'PREGAP'} = ($1 * 60) + $2 + ($3 / 75);
+				} else {
+					$log->warn("Invalid INDEX 00 timecode in CUE: $value");
+				}
 
-			} elsif ($value =~ /^01\s+(\d+):(\d+):(\d+)/i) {
+			} elsif ($value =~ /^01\s+(\d+):(\d{1,2}):(\d{1,2})(?:\s|$)/i) {
 
 				if ($fileHasChanged) {
 					$log->warn("Found INDEX 01 after FILE but before TRACK. Looks like non-compliant CUE. Skipping.");
 					return;
 				}
-				$tracks->{$currtrack}->{'START'} = ($1 * 60) + $2 + ($3 / 75);
+				if ($2 < 60 && $3 < 75) {
+					$tracks->{$currtrack}->{'START'} = ($1 * 60) + $2 + ($3 / 75);
+				} else {
+					$log->warn("Invalid INDEX 01 timecode in CUE: $value");
+				}
+
+			} elsif ($value =~ /^(?:00|01)\s+/i) {
+
+				$log->warn("Malformed INDEX timecode in CUE: $value");
 			}
 
 		} elsif ($command eq 'REM') {
@@ -261,15 +274,23 @@ sub parse {
 					#Ignored
 					main::DEBUGLOG && $log->debug("End found for missing Track");
 
-				} elsif ($remValue =~ /^(\d+):(\d+):(\d+)/i) {
+				} elsif ($remValue =~ /^(\d+):(\d{1,2}):(\d{1,2})\s*$/i) {
 
-					$tracks->{$currtrack}->{'END'} = ($1 * 60) + $2 + ($3 / 75);
+					if ($2 < 60 && $3 < 75) {
+						$tracks->{$currtrack}->{'END'} = ($1 * 60) + $2 + ($3 / 75);
+					} else {
+						$log->warn("Invalid REM END timecode in CUE: $remValue");
+					}
 
-				} elsif ($remValue =~ /^(.+)/i) {
+				} elsif ($remValue =~ /^(\d+(?:\.\d+)?)\s*$/) {
 
 					# Bug 11950, pass absolute end time in seconds (FLAC), since some loss of accuracy would
 					# occur if passing in MM:SS:FF format
-					$tracks->{$currtrack}->{'END'} = $1;
+					$tracks->{$currtrack}->{'END'} = 0 + $1;
+
+				} else {
+
+					$log->warn("Invalid REM END value in CUE: $remValue");
 				}
 
 			} elsif ($remCommand eq 'REPLAYGAIN_ALBUM_GAIN' || $remCommand eq 'REPLAYGAIN_TRACK_GAIN') {
@@ -328,36 +349,39 @@ sub parse {
 		} elsif ($command eq 'FILE') {
 
 			if ($value =~ /^\"(.*)\"/i) {
-				$filename = $embedded || $1;
-				$filename = Slim::Utils::Misc::fixPath($filename, $baseDir);
-				$fileHasChanged = 1;
+				my $raw = $1;
+				$filename = $embedded || _resolveCueFilePath($raw, $baseDir);
+				$fileHasChanged = defined $filename ? 1 : 0;
 
 				main::DEBUGLOG && $log->is_debug && $log->debug('Filename with quotes ' . Data::Dump::dump({
 					line		=> $line,
 					command		=> $command,
 					value		=> $value,
 					filename	=> $filename,
-					returned	=> $1
+					returned	=> $raw
 				}));
 
 			} elsif ($value =~ /^\"?(\S+)\"?/i) {
 
 				# Some cue sheets may not have quotes. Allow that, but
 				# the filenames can't have any spaces in them."
-				$filename = $embedded || $1;
-				$filename = Slim::Utils::Misc::fixPath($filename, $baseDir);
+				my $raw = $1;
+				$filename = $embedded || _resolveCueFilePath($raw, $baseDir);
+				$fileHasChanged = defined $filename ? 1 : 0;
 
 				main::DEBUGLOG && $log->is_debug && $log->debug('Filename with no quotes ' . Data::Dump::dump({
 					line		=> $line,
 					command		=> $command,
 					value		=> $value,
 					filename	=> $filename,
-					returned	=> $1
+					returned	=> $raw
 				}));
 
 			} else {
 
 				# Invalid filename, skipped.
+				$filename = undef;
+				$fileHasChanged = 0;
 				main::DEBUGLOG && $log->is_debug && $log->debug('Invalid filename ' . Data::Dump::dump({
 					line		=> $line,
 					command		=> $command,
@@ -488,10 +512,16 @@ sub parse {
 	}
 
 	my $lastpos = 0;
+	my $lastfile;
 	for my $key (sort {$b <=> $a} keys %$tracks) {
 
 		my $track = $tracks->{$key};
 		my $file = $track->{'FILENAME'};
+
+		if (!defined $lastfile || (defined $file && $file ne $lastfile)) {
+			$lastpos = 0;
+			$lastfile = $file;
+		}
 
 		if (!defined $track->{'END'}) {
 			if (!$embedded && !$lastpos && $file) {
@@ -500,7 +530,7 @@ sub parse {
 
 				my $tags = Slim::Formats->readTags($file);
 
-				$lastpos = $tags->{SECS};
+				$lastpos = ($tags && ref $tags eq 'HASH') ? $tags->{SECS} : undef;
 			}
 
 			if (!$lastpos) {
@@ -520,10 +550,12 @@ sub parse {
 		my $track = $tracks->{$key};
 		my $file = $track->{'FILENAME'};
 
-		if (!defined $track->{'START'} || !defined $track->{'END'} || !defined $file ) {
+		if (!defined $track->{'START'} || !defined $track->{'END'} || !defined $file
+			|| $track->{'START'} < 0 || $track->{'END'} <= $track->{'START'}) {
 
-			logError("Missing file or start/end points for track $file.");
+			logError("Missing or invalid start/end points for track " . ($file // '<unknown>') . ".");
 			main::INFOLOG && $log->is_info && $log->info(Data::Dump::dump($track));
+			delete $tracks->{$key};
 			next;
 		}
 
@@ -591,6 +623,82 @@ sub parse {
 	main::DEBUGLOG && $log->is_debug && $log->debug('End of CUE sheet parsing ' . Data::Dump::dump($tracks));
 
 	return $tracks;
+}
+
+sub _resolveCueFilePath {
+	my ($rawFilename, $baseDir) = @_;
+
+	return undef unless defined $rawFilename && length $rawFilename;
+
+	my $fixed = Slim::Utils::Misc::fixPath($rawFilename, $baseDir);
+	return undef unless defined $fixed && length $fixed;
+
+	my $localPath = Slim::Utils::Misc::pathFromFileURL($fixed);
+	return undef unless defined $localPath && length $localPath;
+
+	my $realFile = Cwd::realpath($localPath);
+	if (!defined $realFile) {
+		$log->warn("Unable to canonicalize CUE FILE path: $rawFilename");
+		return undef;
+	}
+
+	my @allowedRoots;
+	if (defined $baseDir && length $baseDir) {
+		my $basePath = Slim::Music::Info::isFileURL($baseDir)
+			? Slim::Utils::Misc::pathFromFileURL($baseDir)
+			: $baseDir;
+		if (defined $basePath && length $basePath) {
+			if (my $realBase = Cwd::realpath($basePath)) {
+				push @allowedRoots, $realBase;
+			}
+		}
+	}
+
+	my $mediaDirs = eval { Slim::Utils::Misc::getMediaDirs() } || [];
+	for my $dir (@$mediaDirs) {
+		next unless defined $dir && length $dir;
+		if (my $realDir = Cwd::realpath($dir)) {
+			push @allowedRoots, $realDir;
+		}
+	}
+
+	for my $root (@allowedRoots) {
+		my $normRoot = $root;
+		$normRoot =~ s{[\\/]+$}{} unless $normRoot eq '/';
+
+		my $confined = ($normRoot eq '/')
+			? ($realFile =~ m{^/})
+			: ($realFile eq $normRoot || $realFile =~ /^\Q$normRoot\E[\\\/]/);
+
+		if ($confined) {
+			return Slim::Utils::Misc::fileURLFromPath($realFile);
+		}
+	}
+
+	$log->warn("Rejected CUE FILE path outside allowed directories: $rawFilename ($realFile)");
+	return undef;
+}
+
+sub _runLmsAudioscan {
+	my ($bin, @args) = @_;
+	return undef unless defined $bin && -x $bin;
+
+	my $json = eval {
+		open(my $pipe, '-|', $bin, @args) or die "open failed: $!";
+		binmode($pipe, ':raw');
+		local $/;
+		my $out = <$pipe>;
+		close($pipe);
+		die "exit $?" if $? != 0;
+		$out;
+	};
+	return undef if $@ || !defined $json || !length $json;
+
+	my $data = eval {
+		require JSON::XS;
+		JSON::XS::decode_json($json);
+	};
+	return ($@ || ref $data ne 'HASH') ? undef : $data;
 }
 
 sub _addCommand {
@@ -692,7 +800,7 @@ sub read {
 			next if $attribute eq 'id';
 			next if $attribute eq 'url';
 
-			if (defined defined $data{$attribute} && !exists $track->{uc $attribute}) {
+			if (defined $data{$attribute} && !exists $track->{uc $attribute}) {
 
 				$track->{uc $attribute} = $data{$attribute};
 			}
@@ -726,7 +834,7 @@ sub processAnchor {
 
 	# rewrite the size, offset and duration if it's just a fragment
 	# This is mostly (always?) for cue sheets.
-	if (!defined $start && !defined $end) {
+	if (!defined $start || !defined $end) {
 
 		$log->warn("Couldn't process anchored file fragment for $attributesHash->{'URI'}");
 
@@ -734,6 +842,12 @@ sub processAnchor {
 	}
 
 	my $duration = $end - $start;
+	if ($start < 0 || $duration <= 0) {
+
+		$log->warn("Invalid or inverted fragment interval ($start-$end) for $attributesHash->{'URI'}");
+
+		return 0;
+	}
 
 	# Don't divide by 0
 	if (!defined $attributesHash->{'SECS'} && $duration) {
@@ -755,52 +869,88 @@ sub processAnchor {
 	my $ct = $attributesHash->{'CONTENT_TYPE'};
 	my $formatclass = Slim::Formats->classForFormat($ct);
 
-	if ( $formatclass->can('findFrameBoundaries') ) {
+	if ( $formatclass && $formatclass->can('findFrameBoundaries') ) {
 		my $path = Slim::Utils::Misc::pathFromFileURL( $attributesHash->{'FILENAME'} );
-		open my $fh, '<', $path;
+		my $fh;
+		if ( !defined $path || !open($fh, '<:raw', $path) ) {
+			$log->warn("Unable to open CUE audio file " . ($path // $attributesHash->{'FILENAME'} // '<undef>') . ": $!");
+			return 0;
+		}
 
 		if ( $start > 0 ) {
 			$startbytes = $formatclass->findFrameBoundaries( $fh, undef, $start );
+			if ( !defined $startbytes || $startbytes < 0 ) {
+				$log->warn("Invalid start frame boundary for $attributesHash->{'URI'}");
+				close $fh;
+				return 0;
+			}
 			$attributesHash->{'OFFSET'} = $startbytes;
 		}
 		else {
 			$attributesHash->{'OFFSET'} = $header;
 
-			if ( $ct eq 'mp3' && $attributesHash->{LAYER_ID} == 1 ) { # LAYER_ID 1 == mp3
-				require Audio::Scan;
+			if ( $ct eq 'mp3' && ($attributesHash->{LAYER_ID} // 0) == 1 ) { # LAYER_ID 1 == mp3
+				my $s;
+				if ( ($ENV{LMS_USE_RUST} // 1) && (my $audioscanBin = Slim::Utils::Misc::findbin('lms-audioscan')) ) {
+					$s = _runLmsAudioscan($audioscanBin, 'scan', '--info-only', $path);
+				}
+				if ( !$s || ref $s ne 'HASH' || ref $s->{info} ne 'HASH' || !defined $s->{info}->{lame_encoder_version} ) {
+					require Audio::Scan;
 
-				# MP3 only - We need to skip past the LAME header so the first chunk
-				# doesn't get truncated by the firmware thinking it needs to remove encoder padding
-				seek $fh, 0, 0;
-				my $s = Audio::Scan->scan_fh( mp3 => $fh, { filter => 0x01 } );
-				if ( $s->{info}->{lame_encoder_version} ) {
+					# MP3 only - We need to skip past the LAME header so the first chunk
+					# doesn't get truncated by the firmware thinking it needs to remove encoder padding
+					seek $fh, 0, 0;
+					my $fallback = Audio::Scan->scan_fh( mp3 => $fh, { filter => 0x01 } );
+					if ( $fallback && ref $fallback eq 'HASH' && ref $fallback->{info} eq 'HASH' ) {
+						if ( $s && ref $s eq 'HASH' && ref $s->{info} eq 'HASH' ) {
+							$s->{info}->{lame_encoder_version} = $fallback->{info}->{lame_encoder_version}
+								if defined $fallback->{info}->{lame_encoder_version};
+						}
+						else {
+							$s = $fallback;
+						}
+					}
+				}
+				if ( $s && ref $s eq 'HASH' && ref $s->{info} eq 'HASH' && $s->{info}->{lame_encoder_version} ) {
+					seek($fh, 0, 0);
 					my $next = Slim::Formats::MP3->findFrameBoundaries( $fh, $header + 1 );
-					$attributesHash->{'OFFSET'} += $next;
+					if ( defined $next && $next >= 0 ) {
+						$attributesHash->{'OFFSET'} += $next;
+					}
 				}
 
 				eval {
 					# Pre-scan the file with MP3::Cut::Gapless or lms-mp3cut to create frame data cache file
 					# that will be used during playback
 					require File::Spec::Functions;
-					my $cachedir = File::Spec::Functions::catdir( $prefs->get('librarycachedir'), 'mp3cut' );
-					my $filepath = $path;
-					my $indexed  = 0;
-
-					if ( ($ENV{LMS_USE_RUST} // 1) && (my $mp3cutBin = Slim::Utils::Misc::findbin('lms-mp3cut')) ) {
-						main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data via lms-mp3cut for $filepath");
-						if ( system($mp3cutBin, '--file', $filepath, '--cache-dir', $cachedir, '--index-only') == 0 ) {
-							$indexed = 1;
-						}
+					my $libcachedir = $prefs->get('librarycachedir');
+					if ( !defined $libcachedir || !length $libcachedir || !-d $libcachedir ) {
+						$log->warn("Invalid or missing librarycachedir; skipping MP3::Cut::Gapless pre-cache for $path");
 					}
+					else {
+						my $cachedir = File::Spec::Functions::catdir( $libcachedir, 'mp3cut' );
+						my $filepath = $path;
+						my $indexed  = 0;
 
-					if ( !$indexed ) {
-						require MP3::Cut::Gapless;
-						main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data for $path");
+						if ( ($ENV{LMS_USE_RUST} // 1) && (my $mp3cutBin = Slim::Utils::Misc::findbin('lms-mp3cut')) ) {
+							main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data via lms-mp3cut for $filepath");
+							if ( system($mp3cutBin, '--file', $filepath, '--cache-dir', $cachedir, '--index-only') == 0 ) {
+								$indexed = 1;
+							}
+							else {
+								$log->warn("lms-mp3cut failed (exit $?) for $filepath, falling back to MP3::Cut::Gapless");
+							}
+						}
 
-						MP3::Cut::Gapless->new(
-							file      => $path,
-							cache_dir => $cachedir,
-						);
+						if ( !$indexed ) {
+							require MP3::Cut::Gapless;
+							main::INFOLOG && $log->is_info && $log->info("Pre-caching MP3 gapless split data for $path");
+
+							MP3::Cut::Gapless->new(
+								file      => $path,
+								cache_dir => $cachedir,
+							);
+						}
 					}
 				};
 				if ($@) {
@@ -809,7 +959,7 @@ sub processAnchor {
 			}
 		}
 
-		if ( $attributesHash->{SECS} == $attributesHash->{END} ) {
+		if ( defined $attributesHash->{END} && $attributesHash->{SECS} == $attributesHash->{END} ) {
 			# Bug 11950, The last track should always extend to the end of the file
 			$endbytes = $attributesHash->{SIZE};
 		}
@@ -817,9 +967,20 @@ sub processAnchor {
 			seek $fh, 0, 0;
 
 			my $newend = $formatclass->findFrameBoundaries( $fh, undef, $end );
-			if ( $newend ) {
+			if ( defined $newend && $newend >= 0 ) {
 				$endbytes = $newend;
 			}
+			else {
+				$log->warn("Invalid end frame boundary for $attributesHash->{'URI'}");
+				close $fh;
+				return 0;
+			}
+		}
+
+		if ( !defined $endbytes || $endbytes < $attributesHash->{'OFFSET'} ) {
+			$log->warn("Invalid byte range for $attributesHash->{'URI'}");
+			close $fh;
+			return 0;
 		}
 
 		$attributesHash->{'SIZE'} = $endbytes - $attributesHash->{'OFFSET'};
@@ -828,13 +989,14 @@ sub processAnchor {
 	}
 	else {
 		# Just take a guess as to the offset position
-		my $byterate = $attributesHash->{'SIZE'} / $attributesHash->{'SECS'};
+		my $byterate = ($attributesHash->{'SECS'} > 0) ? ($attributesHash->{'SIZE'} / $attributesHash->{'SECS'}) : 0;
 
 		$startbytes = int($byterate * $start);
 		$endbytes   = int($byterate * $end);
 
 		$startbytes -= $startbytes % $attributesHash->{'BLOCK_ALIGNMENT'} if $attributesHash->{'BLOCK_ALIGNMENT'};
 		$endbytes   -= $endbytes % $attributesHash->{'BLOCK_ALIGNMENT'} if $attributesHash->{'BLOCK_ALIGNMENT'};
+		$endbytes    = $startbytes if $endbytes < $startbytes;
 
 		$attributesHash->{'OFFSET'} = $header + $startbytes;
 		$attributesHash->{'SIZE'} = $endbytes - $startbytes;

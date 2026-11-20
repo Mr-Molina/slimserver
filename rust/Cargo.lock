@@ -368,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "image",
+ "libc",
  "lms-cache",
  "lms-image",
  "tempfile",
@@ -379,6 +380,7 @@ name = "lms-image"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "lms-cache",
  "lofty",
  "tempfile",

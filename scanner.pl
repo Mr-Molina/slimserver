@@ -15,6 +15,11 @@
 require 5.010;
 use strict;
 
+my $scanner_exit_code;
+END {
+	$? = $scanner_exit_code if defined $scanner_exit_code;
+}
+
 use FindBin qw($Bin);
 use lib $Bin;
 use Config;
@@ -74,6 +79,8 @@ if (!$@) {
 	$XML::Simple::PREFERRED_PARSER = 'XML::Parser';
 }
 
+use Errno ();
+use Fcntl ();
 use Getopt::Long;
 use File::Path;
 use File::Spec::Functions qw(:ALL);
@@ -103,9 +110,39 @@ our $prefs;
 our $progress;
 our $pidfile;
 
+my $cleanupDone;
+my $scanCompleted     = 0;
+my $scanAborted       = 0;
+my $ownsScannerLock   = 0;
+
+my %allowed_db_helpers = (
+	SQLite => 'Slim::Utils::SQLiteHelper',
+	MySQL  => 'Slim::Utils::MySQLHelper',
+);
+
 my $sqlHelperClass = Slim::Utils::OSDetect->getOS()->sqlHelperClass();
 eval "use $sqlHelperClass";
 die $@ if $@;
+
+sub _handleAbortSignal {
+	my ($sig) = @_;
+
+	$SIG{TERM} = 'IGNORE';
+	$SIG{INT}  = 'IGNORE';
+	$scanAborted = 1;
+
+	eval {
+		if ($INC{'Slim/Utils/Log.pm'}) {
+			logger('server')->warn("Scanner received SIG$sig, aborting and rolling back...");
+		} else {
+			warn "Scanner received SIG$sig, aborting...\n";
+		}
+	};
+
+	cleanup();
+	$scanner_exit_code = ($sig eq 'INT') ? 130 : 143;
+	exit($scanner_exit_code);
+}
 
 sub main {
 
@@ -121,7 +158,10 @@ sub main {
 
 	$prefs->readonly;
 
-	GetOptions(
+	my $prefsdir;
+	Getopt::Long::Configure('no_pass_through');
+
+	if ( !GetOptions(
 		'force'        => \$force,
 		# 'cleanup'      => sub {},
 		'rescan'       => \$rescan,
@@ -129,6 +169,7 @@ sub main {
 		'playlists'    => \$playlists,
 		'onlinelibrary'=> \$onlineLibrary,
 		# prefsdir parsed by Slim::Utils::Prefs
+		'prefsdir=s'   => \$prefsdir,
 		'prefsfile=s'  => \$prefsFile,
 		'pidfile=s'    => \$pidfile,
 		# these values are parsed separately, we don't need these values in a variable - just get them off the list
@@ -145,21 +186,42 @@ sub main {
 		'dbtype=s'     => \$dbtype,
 		'LogTimestamp!'=> \$LogTimestamp,
 		'help'         => \$help,
-	);
+	) ) {
+		usage();
+		$scanner_exit_code = 1;
+		exit 1;
+	}
 
-	save_pid_file();
+	unshift @ARGV, ('--prefsdir', $prefsdir) if defined $prefsdir;
+
+	if ( defined $dbtype && !exists $allowed_db_helpers{$dbtype} ) {
+		warn "Invalid --dbtype '$dbtype'. Allowed values: " . join(', ', sort keys %allowed_db_helpers) . "\n";
+		usage();
+		$scanner_exit_code = 1;
+		exit 1;
+	}
 
 	# If dbsource has been changed via settings, it overrides the default
-	if ( $prefs->get('dbtype') ) {
-		$dbtype ||= $prefs->get('dbtype') =~ /SQLite/ ? 'SQLite' : 'MySQL';
+	if ( !defined $dbtype && $prefs->get('dbtype') ) {
+		$dbtype = $prefs->get('dbtype') =~ /SQLite/ ? 'SQLite' : 'MySQL';
 	}
 
-	if ( $dbtype ) {
+	if ( defined $dbtype ) {
 		# For testing SQLite, can specify a different database type
-		$sqlHelperClass = "Slim::Utils::${dbtype}Helper";
-		eval "use $sqlHelperClass";
-		die $@ if $@;
+		$sqlHelperClass = $allowed_db_helpers{$dbtype};
+		if ( Slim::bootstrap::tryModuleLoad($sqlHelperClass) || $@ ) {
+			die($@ || "Couldn't load $sqlHelperClass\n");
+		}
 	}
+
+	if ($help || (!$rescan && !$wipe && !$playlists && !$onlineLibrary)) {
+		usage();
+		exit;
+	}
+
+	$SIG{HUP}  = 'IGNORE';
+	$SIG{TERM} = \&_handleAbortSignal;
+	$SIG{INT}  = \&_handleAbortSignal;
 
 	# Start a fresh scanner.log on every scan
 	if ( my $file = Slim::Utils::Log->scannerLogFile() ) {
@@ -173,11 +235,6 @@ sub main {
 		'logtype' => 'scanner',
 		'debug'   => $debug,
 	});
-
-	if ($help || (!$rescan && !$wipe && !$playlists && !$onlineLibrary)) {
-		usage();
-		exit;
-	}
 
 	# Start/stop profiler during runtime (requires Devel::NYTProf)
 	# and NYTPROF env var set to 'start=no'
@@ -235,7 +292,25 @@ sub main {
 		msg("Import: There appears to be an existing scanner running.\n");
 		msg("Import: If this is not the case, run with --force\n");
 		msg("Exiting!\n");
-		exit;
+		$scanner_exit_code = 1;
+		exit 1;
+	}
+
+	if (!$force && defined $pidfile && !-l $pidfile && -f $pidfile) {
+		if (open my $fh, '<', $pidfile) {
+			my $existing_pid = <$fh>;
+			close $fh;
+			if (defined $existing_pid && $existing_pid =~ /^\s*(\d+)\s*$/) {
+				my $pid = $1;
+				if ($pid > 0 && $pid != $$ && (kill(0, $pid) || $!{EPERM})) {
+					msg("Import: Existing scanner process (PID $pid) appears to be running.\n");
+					msg("Import: If this is not the case, run with --force\n");
+					msg("Exiting!\n");
+					$scanner_exit_code = 1;
+					exit 1;
+				}
+			}
+		}
 	}
 
 	# pull in the memory usage module if requested.
@@ -290,6 +365,9 @@ sub main {
 	# Perform pre-scan steps specific to the database type, i.e. SQLite needs to copy to a new file
 	$sqlHelperClass->beforeScan();
 
+	$ownsScannerLock = 1;
+	save_pid_file();
+
 	# Take the db out of autocommit mode - this makes for a much faster scan.
 	# Scanner::Local will commit every few operations
 	Slim::Schema->dbh->{'AutoCommit'} = 0;
@@ -313,7 +391,10 @@ sub main {
 		if ($@) {
 			logError("Failed when calling Slim::Schema->wipeAllData: [$@]");
 			logError("This is a fatal error. Exiting");
-			exit(-1);
+			$scanAborted = 1;
+			cleanup();
+			$scanner_exit_code = 1;
+			exit 1;
 		}
 	}
 
@@ -341,6 +422,7 @@ sub main {
 
 		logError("Failed when running main scan: [$@]");
 		logError("Skipping post-process & Not updating lastRescanTime!");
+		$scanAborted = 1;
 
 	} else {
 
@@ -351,6 +433,7 @@ sub main {
 
 			logError("Failed when running scan post-process: [$@]");
 			logError("Not updating lastRescanTime!");
+			$scanAborted = 1;
 
 		} else {
 
@@ -361,11 +444,16 @@ sub main {
 
 			# Notify server we are done scanning
 			$sqlHelperClass->afterScan();
+
+			$scanCompleted = 1 unless $scanAborted;
 		}
 	}
 
 	# Cleanup after we're done, we can't rely on this being called from a sig handler
 	cleanup();
+
+	$scanner_exit_code = ($scanCompleted && !$scanAborted) ? 0 : 1;
+	exit($scanner_exit_code);
 
 	# To debug scanner memory usage, uncomment this line and kill -USR2 the scanner process
 	# after it's finished scanning.
@@ -433,7 +521,6 @@ EOF
 
 }
 
-my $cleanupDone;
 sub cleanup {
 
 	# cleanup() is called at the end of main() and possibly again from a sig handler
@@ -441,23 +528,40 @@ sub cleanup {
 	return if $cleanupDone;
 	$cleanupDone = 1;
 
-	Slim::Utils::PluginManager->shutdownPlugins();
+	if ($ownsScannerLock) {
+		eval { Slim::Utils::PluginManager->shutdownPlugins(); };
 
-	# Make sure to flush anything in the database to disk.
-	if ($INC{'Slim/Schema.pm'} && Slim::Schema->storage) {
-		Slim::Music::Import->setIsScanning(0);
+		# Make sure to flush committed work or rollback aborted scans.
+		if ($INC{'Slim/Schema.pm'} && Slim::Schema->storage) {
+			if ($scanCompleted && !$scanAborted) {
+				Slim::Music::Import->setIsScanning(0);
+				Slim::Schema->forceCommit;
+			} else {
+				eval {
+					if (Slim::Schema->can('rollback')) {
+						Slim::Schema->rollback;
+					} elsif (my $dbh = Slim::Schema->dbh) {
+						$dbh->rollback unless $dbh->{'AutoCommit'};
+					}
+					if (my $dbh = Slim::Schema->dbh) {
+						$dbh->{'AutoCommit'} = 1;
+					}
+				};
+				if ($@) {
+					eval { logger('server')->error("Failed to rollback aborted scan transaction: [$@]"); };
+				}
+				eval { Slim::Music::Import->setIsScanning(0); };
+			}
 
-		Slim::Schema->forceCommit;
+			eval { Slim::Schema->disconnect; };
+		}
 
-		Slim::Schema->disconnect;
+		# Notify server we are exiting
+		eval { $sqlHelperClass->exitScan(); };
+		eval { $sqlHelperClass->cleanup; };
+
+		remove_pid_file();
 	}
-
-	# Notify server we are exiting
-	$sqlHelperClass->exitScan();
-
-	$sqlHelperClass->cleanup;
-
-	remove_pid_file();
 }
 
 sub checkDataSource {
@@ -479,20 +583,56 @@ sub checkDataSource {
 }
 
 sub save_pid_file {
-	if (defined $pidfile) {
-		logger('')->info("Scanner saving pid file.");
-		File::Slurp::write_file($pidfile, $$);
+	return unless defined $pidfile && $pidfile ne '';
+	logger('')->info("Scanner saving pid file.");
+
+	if (-l $pidfile) {
+		die "Refusing to write PID file '$pidfile': target is a symlink\n";
 	}
+
+	my $nofollow = eval { Fcntl::O_NOFOLLOW() } || 0;
+	my $flags    = Fcntl::O_WRONLY() | Fcntl::O_CREAT() | $nofollow;
+	sysopen(my $fh, $pidfile, $flags, 0644)
+		or die "Cannot safely open PID file '$pidfile': $!\n";
+
+	my @lst = lstat($pidfile);
+	my @fst = stat($fh);
+	if (!@lst || !@fst || -l $pidfile || !-f $fh || $lst[0] != $fst[0] || $lst[1] != $fst[1]) {
+		close $fh;
+		die "Refusing to write PID file '$pidfile': unsafe file type or symlink race\n";
+	}
+
+	truncate($fh, 0) or do {
+		my $err = $!;
+		close $fh;
+		die "Cannot truncate PID file '$pidfile': $err\n";
+	};
+	seek($fh, 0, 0);
+	print {$fh} $$ or do {
+		my $err = $!;
+		close $fh;
+		die "Cannot write PID file '$pidfile': $err\n";
+	};
+	close $fh;
 }
 
 sub remove_pid_file {
-	if (defined $pidfile) {
-		unlink $pidfile;
+	return unless defined $pidfile && $pidfile ne '';
+	return if -l $pidfile || !-f $pidfile;
+	if (open my $fh, '<', $pidfile) {
+		my $content = do { local $/; <$fh> };
+		close $fh;
+		if (defined $content && $content =~ /^\s*(\d+)\s*$/ && $1 == $$) {
+			unlink $pidfile;
+		}
 	}
 }
 
 sub END {
+	my $exit_status = $?;
+	cleanup() if $ownsScannerLock && !$cleanupDone;
 	Slim::bootstrap::theEND();
+	$? = $exit_status;
 }
 
 sub idleStreams {}

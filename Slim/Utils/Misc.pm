@@ -33,7 +33,8 @@ use Exporter::Lite;
 
 our @EXPORT = qw(assert msg msgf errorMsg specified dumpFiltered safe_md5_hex);
 
-use File::Basename qw(basename);
+use Cwd ();
+use File::Basename qw(basename dirname);
 use File::Spec::Functions qw(:ALL);
 use File::Path qw(mkpath rmtree);
 use File::Temp qw(tempdir tempfile);
@@ -71,7 +72,7 @@ my $WEBBROWSER_UA_RE = qr/\b(?:FireFox|Chrome|Safari|Mozilla)\b/i;
 
 my $canFollowAlias = 0;
 
-if (main::ISWINDOWS) {
+if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
 	require Win32::File;
 	require Slim::Utils::OS::Win32;
 	require File::Which;
@@ -108,9 +109,17 @@ $prefs->setChange( sub {
 sub findbin {
 	my $executable = shift;
 
-	main::DEBUGLOG && $ospathslog->is_debug && $ospathslog->debug("Looking for executable: [$executable]");
+	return undef unless defined $executable && length($executable);
 
-	if (main::ISWINDOWS && $executable !~ /\.\w{3}$/) {
+	# Reject path separators and traversal segments in executable name
+	if ($executable =~ m{[\\/]} || $executable =~ m{(?:^|[\\/])\.\.(?:$|[\\/])}) {
+		(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("Rejected invalid executable name: [$executable]");
+		return undef;
+	}
+
+	(defined(&main::DEBUGLOG) && main::DEBUGLOG()) && $ospathslog->is_debug && $ospathslog->debug("Looking for executable: [$executable]");
+
+	if ((defined(&main::ISWINDOWS) && main::ISWINDOWS()) && $executable !~ /\.\w{3}$/) {
 
 		$executable .= '.exe';
 	}
@@ -119,29 +128,29 @@ sub findbin {
 
 		my $path = catdir($search, $executable);
 
-		main::DEBUGLOG && $ospathslog->is_debug && $ospathslog->debug("Checking for $executable in $path");
+		(defined(&main::DEBUGLOG) && main::DEBUGLOG()) && $ospathslog->is_debug && $ospathslog->debug("Checking for $executable in $path");
 
-		if (-x $path) {
+		if (-f $path && -x _) {
 
-			main::INFOLOG && $ospathslog->is_info && $ospathslog->info("Found binary $path for $executable");
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("Found binary $path for $executable");
 
 			return $path;
 		}
 	}
 
 	# For Windows we don't include the path in @findBinPaths so now search this
-	if (main::ISWINDOWS && (my $path = File::Which::which($executable))) {
+	if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
+		my $path = File::Which::which($executable);
+		if ($path && -f $path && -x _) {
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("Found binary $path for $executable");
 
-		main::INFOLOG && $ospathslog->is_info && $ospathslog->info("Found binary $path for $executable");
-
-		return $path;
-
-	} else {
-
-		main::INFOLOG && $ospathslog->is_info && $ospathslog->info("Didn't find binary for $executable");
-
-		return undef;
+			return $path;
+		}
 	}
+
+	(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("Didn't find binary for $executable");
+
+	return undef;
 }
 
 =head2 addFindBinPaths( $path1, $path2, ... )
@@ -153,21 +162,28 @@ sub addFindBinPaths {
 
 	while (my $path = shift) {
 
-		# don't register duplicate entries
-		if (grep { $_ eq $path } @findBinPaths) {
+		next unless defined $path && length($path);
 
-			main::INFOLOG && $ospathslog->is_info && $ospathslog->info("not adding $path - duplicate entry");
+		if (!file_name_is_absolute($path) || $path =~ m{(?:^|[\\/])\.\.(?:$|[\\/])}) {
+
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("not adding $path - relative or traversal path rejected");
+
+		}
+		# don't register duplicate entries
+		elsif (grep { $_ eq $path } @findBinPaths) {
+
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("not adding $path - duplicate entry");
 
 		}
 		elsif (-d $path) {
 
-			main::INFOLOG && $ospathslog->is_info && $ospathslog->info("adding $path");
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("adding $path");
 
 			push @findBinPaths, $path;
 
 		} else {
 
-			main::INFOLOG && $ospathslog->is_info && $ospathslog->info("not adding $path - does not exist");
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("not adding $path - does not exist");
 		}
 	}
 }
@@ -202,7 +218,7 @@ Return the filepath for a given Mac Alias
 
 =cut
 
-sub pathFromMacAlias { if (main::ISMAC) {
+sub pathFromMacAlias { if (defined(&main::ISMAC) && main::ISMAC()) {
 	my $fullpath = shift;
 	my $path = '';
 
@@ -225,7 +241,9 @@ sub pathFromFileURL {
 	my $url     = shift;
 	my $noCache = shift || 0;
 
-	if (!$noCache && $fileToPathCache{$url}) {
+	return undef unless defined $url;
+
+	if (!$noCache && exists $fileToPathCache{$url}) {
 		return $fileToPathCache{$url};
 	}
 
@@ -236,27 +254,47 @@ sub pathFromFileURL {
 		return $url;
 	}
 
-	# Bug 3589, support win32 backslashes in URLs, file://C:\foo\bar
-	$url =~ s/\\/\//g;
+	my $cleanUrl = $url;
+	# Encode Unicode character strings to UTF-8 bytes before URI parsing so wide characters
+	# are preserved and URI->file returns raw byte paths without double-encoding.
+	utf8::encode($cleanUrl) if utf8::is_utf8($cleanUrl);
 
-	my $uri  = URI->new($url);
-	my $file = undef;
-
-	# TODO - FIXME - this isn't mac or dos friendly with the path...
-	# Use File::Spec::rel2abs ? or something along those lines?
-	#
-	# file URLs must start with file:/// or file://localhost/ or file://\\uncpath
-	my $path = $uri->path;
-
-	my $canLog = Slim::Utils::Log->isInitialized;
-	if ($canLog) {
-
-		main::INFOLOG && $osfileslog->is_info && $osfileslog->info("Got $path from file url $url");
+	# Bug 3589, support win32 backslashes in URLs, file://C:\foo\bar (Windows only)
+	if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
+		$cleanUrl =~ s/\\/\//g;
 	}
 
-	# only allow absolute file URLs and don't allow .. in files...
-	if ($path !~ /[\/\\]\.\.[\/\\]/) {
-		$file = $uri->file;
+	my $uri  = URI->new($cleanUrl);
+	my $file = undef;
+
+	my $canLog = Slim::Utils::Log->isInitialized;
+
+	if ($uri && lc($uri->scheme || '') eq 'file') {
+		my $host = eval { $uri->host };
+		if ($@ || (defined $host && $host ne '' && lc($host) ne 'localhost')) {
+			$osfileslog->warn("Rejected file: url with non-local host: $url") if $canLog;
+		}
+		else {
+			my $path = $uri->path;
+			$path = '' unless defined $path;
+
+			if ($canLog) {
+				(defined(&main::INFOLOG) && main::INFOLOG()) && $osfileslog->is_info && $osfileslog->info("Got $path from file url $url");
+			}
+
+			my $unescaped = unescape($path);
+
+			# Reject dot-dot traversal segments before and after percent-unescaping, plus null bytes
+			if ($path !~ /(?:^|[\/\\])\.\.(?:$|[\/\\])/
+				&& $unescaped !~ /(?:^|[\/\\])\.\.(?:$|[\/\\])/
+				&& $unescaped !~ /\0/
+			) {
+				my $candidate = eval { $uri->file };
+				if (defined $candidate && $candidate !~ /(?:^|[\/\\])\.\.(?:$|[\/\\])/ && $candidate !~ /\0/) {
+					$file = $candidate;
+				}
+			}
+		}
 	}
 
 	if ($canLog) {
@@ -264,14 +302,11 @@ sub pathFromFileURL {
 		if (!defined($file))  {
 			$osfileslog->warn("Bad file: url $url");
 		} else {
-			main::INFOLOG && $osfileslog->is_info && $osfileslog->info("Extracted: $file from $url");
+			(defined(&main::INFOLOG) && main::INFOLOG()) && $osfileslog->is_info && $osfileslog->info("Extracted: $file from $url");
 		}
 	}
 
-	# Bug 17530, $file is in raw bytes but will have the UTF8 flag enabled.
-	# This causes problems if the file is later passed to stat().
-	if (utf8::is_utf8($file)) {
-		utf8::decode($file);
+	if (defined $file && utf8::is_utf8($file)) {
 		utf8::encode($file);
 	}
 
@@ -292,36 +327,29 @@ sub pathFromFileURL {
 sub fileURLFromPath {
 	my $path = shift;
 
-	if ($pathToFileCache{$path}) {
+	return $path unless defined $path;
+
+	if (exists $pathToFileCache{$path}) {
 		return $pathToFileCache{$path};
 	}
 
-	return $path if (Slim::Music::Info::isURL($path));
+	return $path if ($path eq '' || Slim::Music::Info::isURL($path));
 
-	# All paths should be in raw bytes, warn if it appears to be UTF-8
-	# XXX remove this later, before release
-=pod
-	if ( utf8::is_utf8($path) ) {
-		my $test = $path;
-		utf8::decode($test);
-		utf8::encode($test);
-		if ( $test ne $path ) {
-			logWarning("fileURLFromPath got decoded UTF-8 path: " . Data::Dump::dump($path));
-			bt();
-		}
-	}
-=cut
+	my $cacheKey = $path;
+	my $workPath = $path;
 
 	# Bug 15511
 	# URI::file->new() will strip trailing space from path. Use a trailing / to defeat this if necessary.
 	my $addedSlash;
-	if ($path =~ /[\s"]$/) {
-		$path .= '/';
+	if ($workPath =~ /[\s"]$/) {
+		$workPath .= '/';
 		$addedSlash = 1;
 	}
 
-	my $uri = URI::file->new($path);
-	$uri->host('');
+	my $uri = file_name_is_absolute($workPath)
+		? URI::file->new($workPath)
+		: URI::file->new_abs($workPath);
+	$uri->host('') if $uri && $uri->can('host');
 
 	my $file = $uri->as_string;
 	$file =~ s%/$%% if $addedSlash;
@@ -330,7 +358,7 @@ sub fileURLFromPath {
 		%pathToFileCache = ();
 	}
 
-	$pathToFileCache{$path} = $file;
+	$pathToFileCache{$cacheKey} = $file;
 
 	return $file;
 }
@@ -397,10 +425,12 @@ sub crackURL {
 
 	my $proxied = "http://$host:$port$path" if $prefs->get('webproxy') && $host !~ /(?:localhost|127.0.0.1)/;
 
-	if ( main::DEBUGLOG && $ospathslog->is_debug ) {
-		$ospathslog->debug("Cracked: $string with [$host],[$port],[$path]");
-		$ospathslog->debug("   user: [$user]") if $user;
-		$ospathslog->debug("   pass: [$pass]") if $pass;
+	if ( (defined(&main::DEBUGLOG) && main::DEBUGLOG()) && $ospathslog->is_debug ) {
+		my $safeString = defined $string ? $string : '';
+		$safeString =~ s|(://[^\@/:]+:)[^\@/]*\@|${1}***\@|;
+		$ospathslog->debug("Cracked: $safeString with [$host],[$port],[$path]");
+		$ospathslog->debug("   user: [$user]") if defined $user && length($user);
+		$ospathslog->debug("   pass: [***]") if defined $pass && length($pass);
 	}
 
 	return ($host, $port, $path, $user, $pass, $proxied);
@@ -443,6 +473,93 @@ sub cloneProtocol {
 
 =cut
 
+sub _resolveRealPath {
+	my $path = shift;
+	return undef unless defined $path;
+	return '' if $path eq '';
+
+	my $isWin = defined(&main::ISWINDOWS) && main::ISWINDOWS();
+	my $curPath = $path;
+	my $maxIter = 16;
+
+	for (my $iter = 0; $iter < $maxIter; $iter++) {
+		# If the path or symlink target exists, resolve via Cwd::realpath
+		if (-e $curPath) {
+			my $real = eval { Cwd::realpath($curPath) };
+			return $real if defined $real;
+		}
+
+		my $prior = canonpath($curPath);
+		$prior =~ s{[\\/]+$}{} if length($prior) > 1 && !($isWin && $prior =~ /^[A-Za-z]:[\\\/]?$/);
+
+		# For dangling symlinks or non-existent paths, resolve deepest existing ancestor
+		my $cur = $prior;
+		my @tail;
+		my $resolved;
+
+		while (defined $cur && length($cur)) {
+			if (-e $cur) {
+				my $realBase = eval { Cwd::realpath($cur) };
+				if (defined $realBase) {
+					if (@tail) {
+						# @tail is already in forward order (segments were unshifted);
+						# collapse '.' and '..' segments against resolved $realBase.
+						$resolved = stripRel(catfile($realBase, @tail));
+						$resolved =~ s{[\\/]+$}{} if length($resolved) > 1 && !($isWin && $resolved =~ /^[A-Za-z]:[\\\/]?$/);
+					} else {
+						$resolved = $realBase;
+					}
+				}
+				last;
+			}
+			my $parent = dirname($cur);
+			last if !defined $parent || $parent eq $cur;
+			unshift @tail, basename($cur);
+			$cur = $parent;
+		}
+
+		if (defined $resolved) {
+			return $resolved if $resolved eq $prior;
+			$curPath = $resolved;
+			next;
+		}
+
+		last;
+	}
+
+	my $normalized = stripRel(canonpath($curPath));
+	$normalized =~ s{[\\/]+$}{} if length($normalized) > 1 && !($isWin && $normalized =~ /^[A-Za-z]:[\\\/]?$/);
+	return $normalized;
+}
+
+sub _isPathWithinDir {
+	my ($path, $dir) = @_;
+	return 0 unless defined $path && length($path) && defined $dir && length($dir);
+
+	my $realPath = _resolveRealPath($path);
+	my $realDir  = _resolveRealPath($dir);
+	return 0 unless defined $realPath && length($realPath) && defined $realDir && length($realDir);
+
+	# Collapse any remaining dot/dot-dot segments before containment prefix checks
+	$realPath = stripRel($realPath);
+	$realDir  = stripRel($realDir);
+	return 0 if $realPath =~ m{(?:^|[\\/])\.\.?(?:$|[\\/])} || $realDir =~ m{(?:^|[\\/])\.\.?(?:$|[\\/])};
+
+	my $isWin = defined(&main::ISWINDOWS) && main::ISWINDOWS();
+	$realPath =~ s{[\\/]+$}{} if length($realPath) > 1 && !($isWin && $realPath =~ /^[A-Za-z]:[\\\/]$/);
+	$realDir  =~ s{[\\/]+$}{} if length($realDir)  > 1 && !($isWin && $realDir  =~ /^[A-Za-z]:[\\\/]$/);
+
+	if ($isWin) {
+		return 1 if lc($realPath) eq lc($realDir);
+		return 1 if $realDir =~ m{^(?:[A-Za-z]:)?[\\/]$} && index(lc($realPath), lc($realDir)) == 0;
+		return lc($realPath) =~ m{^\Q@{[lc($realDir)]}\E[\\/]} ? 1 : 0;
+	}
+
+	return 1 if $realPath eq $realDir;
+	return 1 if $realDir eq '/' && index($realPath, '/') == 0;
+	return $realPath =~ m{^\Q$realDir\E/} ? 1 : 0;
+}
+
 # there's not really a better way to do this..
 sub fixPath {
 	# Only using encode_locale() here as a safety measure because
@@ -467,9 +584,14 @@ sub fixPath {
 
 		my $uri = URI->new($file) || return $file;
 
-		if ($uri->scheme() eq 'file') {
+		if (lc($uri->scheme() || '') eq 'file') {
+			my $localPath = pathFromFileURL($file);
+			return undef unless defined $localPath;
 
-			$uri->host('');
+			my $resolved = _resolveRealPath($localPath);
+			return undef unless defined $resolved;
+
+			return fileURLFromPath($resolved);
 		}
 
 		return $uri->as_string;
@@ -480,13 +602,13 @@ sub fixPath {
 		return $file;
 	}
 
-	if (Slim::Music::Info::isFileURL($base)) {
+	if ($base && Slim::Music::Info::isFileURL($base)) {
 		$base = pathFromFileURL($base);
 	}
 
 	# People sometimes use playlists generated on Windows elsewhere.
 	# See Bug 236
-	unless (main::ISWINDOWS) {
+	unless (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
 
 		$file =~ s/^[C-Z]://i;
 		$file =~ s/\\/\//g;
@@ -497,15 +619,15 @@ sub fixPath {
 	my $mediadirs = Slim::Utils::Misc::getMediaDirs();
 	my $savedplaylistdir = Slim::Utils::Misc::getPlaylistDir();
 
-	if (scalar @$mediadirs && grep { $file =~ /^\Q$_\E/ } @$mediadirs) {
+	if (scalar @$mediadirs && grep { length($_) && _isPathWithinDir($file, $_) } @$mediadirs) {
 
-		$fixed = $file;
+		$fixed = _resolveRealPath($file);
 
-	} elsif ($savedplaylistdir && $file =~ /^\Q$savedplaylistdir\E/) {
+	} elsif ($savedplaylistdir && _isPathWithinDir($file, $savedplaylistdir)) {
 
-		$fixed = $file;
+		$fixed = _resolveRealPath($file);
 
-	} elsif (Slim::Music::Info::isURL($file) && (!scalar @$mediadirs || !grep {-r catfile($_, $file)} @$mediadirs)) {
+	} elsif (Slim::Music::Info::isURL($file) && (!scalar @$mediadirs || !grep { length($_) && -r catfile($_, $file) } @$mediadirs)) {
 
 		$fixed = $file;
 
@@ -513,7 +635,7 @@ sub fixPath {
 
 		if (file_name_is_absolute($file)) {
 
-			if (main::ISWINDOWS) {
+			if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
 
 				my ($volume) = splitpath($file);
 
@@ -527,7 +649,7 @@ sub fixPath {
 
 		} else {
 
-			if (main::ISWINDOWS) {
+			if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
 
 				# rel2abs will convert ../../ paths correctly only for windows
 				$fixed = fixPath(rel2abs($file,$base));
@@ -540,7 +662,11 @@ sub fixPath {
 
 	} elsif (file_name_is_absolute($file) || !Slim::Music::Info::isFileURL($file)) {
 
-		$fixed = $file;
+		if (file_name_is_absolute($file) && $file =~ m{(?:^|[\\/])\.\.?(?:$|[\\/])}) {
+			$fixed = _resolveRealPath($file);
+		} else {
+			$fixed = $file;
+		}
 
 	} else {
 
@@ -551,6 +677,8 @@ sub fixPath {
 		$file =~ s/\Q$audiodir\E//;
 		$fixed = catfile($audiodir, $file);
 	}
+
+	return undef unless defined $fixed;
 
 	# I hate Windows & HFS+.
 	# A playlist or the like can have a completely different case than
@@ -567,7 +695,7 @@ sub fixPath {
 #		}
 	}
 
-	if (main::INFOLOG && $file ne $fixed && $ospathslog->is_info) {
+	if ((defined(&main::INFOLOG) && main::INFOLOG()) && $file ne $fixed && $ospathslog->is_info) {
 
 		$ospathslog->info("Fixed: $file to $fixed");
 
@@ -586,13 +714,46 @@ sub fixPath {
 sub stripRel {
 	my $file = shift;
 
-	main::INFOLOG && $ospathslog->is_info && $ospathslog->info("Original: $file");
+	return $file unless defined $file && length($file);
 
-	while ($file =~ m#[\/\\]\.\.[\/\\]#) {
-		$file =~ s#[^\/\\]+[\/\\]\.\.[\/\\]##sg;
+	(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("Original: $file");
+
+	my $sep = ($file =~ /\\/ && $file !~ /\//) ? '\\' : '/';
+	my $prefix = '';
+	my $rest = $file;
+
+	if ($rest =~ s/^([A-Za-z]:[\/\\]+)//) {
+		$prefix = $1;
+		$sep = '\\' if $prefix =~ /\\/;
+		$prefix =~ s/[\/\\]+$/$sep/;
+	}
+	elsif ($rest =~ s/^([\/\\]{2}[^\/\\]+[\/\\][^\/\\]+(?:[\/\\]+|$))//) {
+		$prefix = $1;
+		$sep = '\\' if $prefix =~ /\\/;
+		$prefix =~ s/[\/\\]+$/$sep/;
+	}
+	elsif ($rest =~ s/^([\/\\]+)//) {
+		$prefix = substr($1, 0, 1);
+		$sep = $prefix;
 	}
 
-	main::INFOLOG && $ospathslog->is_info && $ospathslog->info("Stripped: $file");
+	my $trailing = ($rest =~ /[\/\\]$/) ? $sep : '';
+
+	my @stack;
+	for my $seg (split m{[\/\\]+}, $rest) {
+		next if !defined $seg || $seg eq '' || $seg eq '.';
+		if ($seg eq '..') {
+			pop @stack if @stack;
+		}
+		else {
+			push @stack, $seg;
+		}
+	}
+
+	$file = $prefix . join($sep, @stack);
+	$file .= $trailing if @stack && $trailing;
+
+	(defined(&main::INFOLOG) && main::INFOLOG()) && $ospathslog->is_info && $ospathslog->info("Stripped: $file");
 
 	return $file;
 }
@@ -798,7 +959,7 @@ sub _checkInFolder {
 	$path = fixPath($path) || return 0;
 	$path = pathFromFileURL($path) || return 0;
 
-	if ($checkdir && $path =~ /^\Q$checkdir\E/) {
+	if ($checkdir && _isPathWithinDir($path, $checkdir)) {
 		return 1;
 	} else {
 		return 0;
@@ -857,7 +1018,7 @@ sub fileFilter {
 	# Ignore special named files and directories
 	# __ is a match against our old __history and __mac playlists.
 	return 0 if $item =~ /^__\S+\.m3u$/o;
-	return 0 if ($item =~ /^\.[^\.]+/o && !main::ISWINDOWS);
+	return 0 if ($item =~ /^\.[^\.]+/o && !(defined(&main::ISWINDOWS) && main::ISWINDOWS()));
 
 	if ((my $ignore = $prefs->get('ignoreDirRE') || '') ne '') {
 		return 0 if $item =~ /$ignore/;
@@ -867,7 +1028,7 @@ sub fileFilter {
 	my $fullpath = $dirname ? catdir($dirname, $item) : $item;
 
 	# Don't display hidden/system folders on Windows
-	if (main::ISWINDOWS && !$showHidden) {
+	if ((defined(&main::ISWINDOWS) && main::ISWINDOWS()) && !$showHidden) {
 		my $attributes;
 		Win32::File::GetAttributes($fullpath, $attributes);
 		return 0 if ($attributes & Win32::File::HIDDEN()) || ($attributes & Win32::File::SYSTEM());
@@ -882,32 +1043,59 @@ sub fileFilter {
 
 	return 0 unless (-l _ || -d _ || -f _);
 
+	my $isSymlink = (-l _) ? 1 : 0;
+	my $isDir     = (-d _) ? 1 : 0;
+	my $isFile    = (-f _) ? 1 : 0;
+	my $isMac     = (defined(&main::ISMAC) && main::ISMAC()) ? 1 : 0;
+
 	# Make sure we can read the file, honoring ACLs. This check is optional and provided by a plugin only.
-	if ( !main::ISWINDOWS && (my $filetest = Slim::Utils::OSDetect::getOS->aclFiletest()) ) {
+	if ( !(defined(&main::ISWINDOWS) && main::ISWINDOWS()) && (my $filetest = Slim::Utils::OSDetect::getOS->aclFiletest()) ) {
 		return 0 unless $filetest->($fullpath);
 	}
 	else {
-		return 0 if ! -r _;
+		return 0 if !$isSymlink && ! -r _;
 	}
 
 	my $target;
 
 	# a file can be an Alias on Mac
-	if (main::ISMAC && -f _ && (stat _)[7] == 0 && $validRE && ($target = pathFromMacAlias($fullpath))) {
+	if ($isMac && $isFile && (stat _)[7] == 0 && $validRE && ($target = pathFromMacAlias($fullpath))) {
 		unless (-d $target) {
 			return 0;
 		}
 	}
 	# Don't bother with file types we don't understand.
-	elsif ($validRE && -f _) {
+	elsif ($validRE && $isFile) {
 		return 0 if $item !~ $validRE;
 	}
-	elsif ($validRE && -l _ && defined ($target = readlink($fullpath))) {
-		# fix relative/absolute path
-		$target = ($target =~ /^\// ? $target : catdir($dirname, $target));
+	elsif ($isSymlink) {
+		# Resolve symlink target with realpath to close dangling, special-file, unreadable, and boundary-escape gaps
+		my $resolved = eval { Cwd::realpath($fullpath) };
+		return 0 unless defined $resolved && length($resolved);
+		return 0 unless (-d $resolved || -f $resolved) && -r $resolved;
 
-		if (-f $target) {
-			return 0 if $target !~ $validRE;
+		my $targetBase = basename($resolved);
+		return 0 if $_ignoredItems{$targetBase} && $_ignoredItems{$targetBase} eq '1';
+		return 0 if $targetBase =~ /^\.[^\.]+/o && !(defined(&main::ISWINDOWS) && main::ISWINDOWS());
+		if ((my $ignore = $prefs->get('ignoreDirRE') || '') ne '') {
+			return 0 if $targetBase =~ /$ignore/;
+		}
+
+		if ($validRE && -f $resolved) {
+			return 0 if $resolved !~ $validRE;
+		}
+
+		# Enforce symlink target containment within configured media/playlist roots (or $dirname)
+		my $mediadirs = getMediaDirs();
+		my $savedplaylistdir = getPlaylistDir();
+		my @allowedRoots = grep { defined $_ && length($_) } (@$mediadirs, $savedplaylistdir);
+		my $checkParent = $dirname || dirname($fullpath);
+
+		if (@allowedRoots && grep { _isPathWithinDir($checkParent, $_) } @allowedRoots) {
+			return 0 unless grep { _isPathWithinDir($resolved, $_) } @allowedRoots;
+		}
+		elsif (defined $checkParent && length($checkParent)) {
+			return 0 unless _isPathWithinDir($resolved, $checkParent);
 		}
 	}
 
@@ -927,7 +1115,7 @@ sub folderFilter {
 	# Skip this folder (and subfolders) if there is a sentinel file.
 	my $skipsentinel = $prefs->get('skipsentinel');
 	if ( $skipsentinel && -f catdir(@path, $folder, $skipsentinel) ) {
-		main::INFOLOG && $scannerlog->is_info &&
+		(defined(&main::INFOLOG) && main::INFOLOG()) && $scannerlog->is_info &&
 			$scannerlog->info("Skipping: " . catdir(@path, $folder));
 		return 0;
 	}
@@ -937,7 +1125,7 @@ sub folderFilter {
 	my $file = catdir(@path);
 
 	# Bug 15209, Hack for UNC bug where catdir turns \\foo into \foo
-	if ( main::ISWINDOWS && $path[0] eq '' && $path[1] eq '' && $file !~ /^\\{2}/ ) {
+	if ( (defined(&main::ISWINDOWS) && main::ISWINDOWS()) && $path[0] eq '' && $path[1] eq '' && $file !~ /^\\{2}/ ) {
 		$file = '\\' . $file;
 	}
 
@@ -955,8 +1143,10 @@ sub folderFilter {
 sub cleanupFilename {
 	my $filename = shift;
 
+	return $filename unless defined $filename;
+
 	$filename =~ tr|:\x00-\x1f\/\\| |s;
-	$filename =~ s/^\.//;
+	$filename =~ s/^\.+//;
 
 	return $filename;
 }
@@ -979,12 +1169,12 @@ sub readDirectory {
 
 	my $native_dirname = Slim::Utils::Unicode::encode_locale($dirname);
 
-	if (main::ISWINDOWS) {
+	if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
 		my ($volume) = splitpath($native_dirname);
 
 		if ($volume && isWinDrive($volume) && !Slim::Utils::OS::Win32->isDriveReady($volume)) {
 
-			main::DEBUGLOG && $osfileslog->is_debug && $osfileslog->debug("drive [$dirname] not ready");
+			(defined(&main::DEBUGLOG) && main::DEBUGLOG()) && $osfileslog->is_debug && $osfileslog->debug("drive [$dirname] not ready");
 
 			return @diritems;
 		}
@@ -1001,19 +1191,19 @@ sub readDirectory {
 		}) };
 	}
 	else {
-		opendir(DIR, $native_dirname) || do {
+		opendir(my $dirh, $native_dirname) || do {
 
-			main::DEBUGLOG && $osfileslog->is_debug && $osfileslog->debug("opendir on [$dirname] failed: $!");
+			(defined(&main::DEBUGLOG) && main::DEBUGLOG()) && $osfileslog->is_debug && $osfileslog->debug("opendir on [$dirname] failed: $!");
 
 			return @diritems;
 		};
 
-		main::INFOLOG && $osfileslog->is_info && $osfileslog->info("Reading directory: $dirname");
+		(defined(&main::INFOLOG) && main::INFOLOG()) && $osfileslog->is_info && $osfileslog->info("Reading directory: $dirname");
 
-		while (defined (my $item = readdir(DIR)) ) {
+		while (defined (my $item = readdir($dirh)) ) {
 			# call idle streams to service timers - used for blocking animation.
-			if (!scalar @diritems % 20) {
-				main::idleStreams();
+			if (!(scalar(@diritems) % 20)) {
+				main::idleStreams() if defined &main::idleStreams;
 			}
 
 	        # readdir returns only bytes, so try and decode the
@@ -1032,12 +1222,12 @@ sub readDirectory {
 			push @diritems, $item;
 		}
 
-		closedir(DIR);
+		closedir($dirh);
 
 		@diritems = Slim::Music::Info::sortFilename(@diritems);
 	}
 
-	if ( main::INFOLOG && $osfileslog->is_info ) {
+	if ( (defined(&main::INFOLOG) && main::INFOLOG()) && $osfileslog->is_info ) {
 		$osfileslog->info("Directory contains " . scalar(@diritems) . " items");
 	}
 
@@ -1090,7 +1280,7 @@ sub findAndScanDirectoryTree {
 		}
 	}
 
-	if (main::ISMAC && blessed($topLevelObj) && $topLevelObj->can('path')) {
+	if ((defined(&main::ISMAC) && main::ISMAC()) && blessed($topLevelObj) && $topLevelObj->can('path')) {
 		my $topPath = $topLevelObj->path;
 
 		if ( my $alias = Slim::Utils::Misc::pathFromMacAlias($topPath) ) {
@@ -1109,7 +1299,7 @@ sub findAndScanDirectoryTree {
 
 		logError("Couldn't find a topLevelObj!");
 
-		main::INFOLOG && $scannerlog->is_info && $scannerlog->info("Params: " . Data::Dump::dump($params));
+		(defined(&main::INFOLOG) && main::INFOLOG()) && $scannerlog->is_info && $scannerlog->info("Params: " . Data::Dump::dump($params));
 
 		return ();
 	}
@@ -1120,11 +1310,11 @@ sub findAndScanDirectoryTree {
 	my $fsMTime = (stat($path))[9] || 0;
 	my $dbMTime = $topLevelObj->timestamp || 0;
 
-	main::DEBUGLOG && $scannerlog->is_debug && $scannerlog->debug( "findAndScanDirectoryTree( $path ): fsMTime: $fsMTime, dbMTime: $dbMTime" );
+	(defined(&main::DEBUGLOG) && main::DEBUGLOG()) && $scannerlog->is_debug && $scannerlog->debug( "findAndScanDirectoryTree( $path ): fsMTime: $fsMTime, dbMTime: $dbMTime" );
 
 	if ($fsMTime != $dbMTime && !$topLevelObj->remote) {
 
-		if ( main::INFOLOG && $scannerlog->is_info ) {
+		if ( (defined(&main::INFOLOG) && main::INFOLOG()) && $scannerlog->is_info ) {
 			$scannerlog->info("mtime db: $dbMTime : " . localtime($dbMTime));
 			$scannerlog->info("mtime fs: $fsMTime : " . localtime($fsMTime));
 		}
@@ -1157,7 +1347,10 @@ Delete all files matching $typeRegEx in folder $dir
 sub deleteFiles {
 	my ($dir, $typeRegEx, $excludeFile) = @_;
 
-	opendir my ($dirh), $dir;
+	opendir(my $dirh, $dir) or do {
+		logError("Unable to open directory $dir: $!");
+		return;
+	};
 
 	my @files = grep { /$typeRegEx/ } readdir $dirh;
 
@@ -1178,7 +1371,7 @@ No low-level check is done whether the drive actually exists.
 
 =cut
 
-sub isWinDrive { if (main::ISWINDOWS) {
+sub isWinDrive { if (defined(&main::ISWINDOWS) && main::ISWINDOWS()) {
 	my $path = shift;
 
 	return 0 if length($path) > 3;
@@ -1202,10 +1395,15 @@ sub parseRevision {
 	my ($revision, $builddate) = split (/\n/, $tempBuildInfo);
 
 	# if we're running from a git clone, report the last commit ID and timestamp
-	# "git -C ..." is only available in recent git version, more recent than what CentOS provides...
-	if ( !main::ISWINDOWS && $revision eq 'TRUNK' && `cd $Bin && git show -s --format=%h\\|%ci 2> /dev/null` =~ /^([0-9a-f]+)\|(\d{4}-\d\d-\d\d.*)/i ) {
-		$revision = 'git-' . $1;
-		$builddate = $2;
+	if ( !(defined(&main::ISWINDOWS) && main::ISWINDOWS()) && $revision eq 'TRUNK' && -e catdir($Bin, '.git') ) {
+		if ( open(my $git_fh, '-|', 'git', '-C', $Bin, 'show', '-s', '--format=%h|%ci') ) {
+			my $line = <$git_fh>;
+			close($git_fh);
+			if ( defined $line && $line =~ /^([0-9a-f]+)\|(\d{4}-\d\d-\d\d.*)/i ) {
+				$revision  = 'git-' . $1;
+				$builddate = $2;
+			}
+		}
 	}
 
 	# Once we've read the file, split it up so we have the Revision and Build Date
@@ -1329,18 +1527,18 @@ sub bt {
 		}
 	}
 
-	if ($assertfile) {
-		open SRC, $assertfile;
+	if ($assertfile && open(my $src, '<', $assertfile)) {
 		my $line;
 		my $line_n = 0;
 		$msg .= "\nHere's the problem. $assertfile, line $assertline:\n\n";
 
-		while ($line=<SRC>) {
+		while ($line = <$src>) {
 			$line_n++;
-			if (abs($assertline-$line_n) <=10) {
-				$msg.="$line_n\t$line";
+			if (abs($assertline - $line_n) <= 10) {
+				$msg .= "$line_n\t$line";
 			}
 		}
+		close $src;
 	}
 
 	$msg.="\n";
@@ -1414,7 +1612,7 @@ sub dumpFiltered {
 	my ($object) = @_;
 
 	# Data::Dump is only loaded if in INFO or DEBUG mode
-	if (main::INFOLOG && ref $object) {
+	if ((defined(&main::INFOLOG) && main::INFOLOG()) && ref $object) {
 		return Data::Dump::dumpf($object, sub {
 			my ($ctx, $obj) = @_;
 

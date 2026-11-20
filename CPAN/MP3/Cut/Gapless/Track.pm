@@ -4,20 +4,22 @@ use strict;
 
 sub new {
     my $class = shift;
-    
-    my $self;
-    
-    if ( ref $_[0] eq 'Audio::Cuefile::Parser::Track' ) {
-        $self = {
-            start_ms  => _parseMSF( $_[0]->index ),
-            performer => $_[0]->performer,
-            position  => $_[0]->position,
-            title     => $_[0]->title,
-        };
+    my $track = shift;
+
+    if ( !defined $track || !eval { $track->isa('Audio::Cuefile::Parser::Track') } ) {
+        die "Invalid track: expected Audio::Cuefile::Parser::Track object\n";
     }
-    
+
+    my $self = {
+        index     => $track->index,
+        start_ms  => _parseMSF( $track->index ),
+        performer => $track->performer,
+        position  => $track->position,
+        title     => $track->title,
+    };
+
     bless $self, $class;
-    
+
     return $self;
 }
 
@@ -30,11 +32,18 @@ sub end_ms { $_[0]->{end_ms} }
 
 sub _parseMSF {
     my $msf = shift;
-    
-    my ($min, $sec, $frm) = split /:/, $msf, 3;
-    
-    return sprintf "%d", ((60 * $min) + $sec + ($frm / 75)) * 1000;
-}    
+
+    if ( !defined $msf || ref($msf) || $msf !~ /\A\s*([0-9]+):([0-9]{1,2}):([0-9]{1,2})\s*\z/ ) {
+        die "Invalid MSF timestamp: " . ( defined $msf ? $msf : 'undef' ) . "\n";
+    }
+
+    my ( $min, $sec, $frm ) = ( 0 + $1, 0 + $2, 0 + $3 );
+    if ( $sec >= 60 || $frm >= 75 ) {
+        die "Out-of-range MSF timestamp: $msf\n";
+    }
+
+    return int( ((60 * $min) + $sec + ($frm / 75)) * 1000 + 0.5 );
+}
 
 1;
 __END__

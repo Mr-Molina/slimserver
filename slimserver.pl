@@ -19,16 +19,16 @@ use constant SCANNER      => 0;
 use constant RESIZER      => 0;
 use constant ISWINDOWS    => ( $^O =~ /^m?s?win/i ) ? 1 : 0;
 use constant ISMAC        => ( $^O =~ /darwin/i ) ? 1 : 0;
-use constant TRANSCODING  => ( grep { /--notranscoding/ } @ARGV ) ? 0 : 1;
-use constant PERFMON      => ( grep { /--perfwarn/ } @ARGV ) ? 1 : 0;
-use constant DEBUGLOG     => ( grep { /--no(?:debug|info)log/ } @ARGV ) ? 0 : 1;
-use constant INFOLOG      => ( grep { /--noinfolog/ } @ARGV ) ? 0 : 1;
-use constant STATISTICS   => ( grep { /--nostatistics/ } @ARGV ) ? 0 : 1;
-use constant SB1SLIMP3SYNC=> ( grep { /--nosb1slimp3sync/ } @ARGV ) ? 0 : 1;
-use constant WEBUI        => ( grep { /--noweb/ } @ARGV ) ? 0 : 1;
+use constant TRANSCODING  => ( grep { /^--notranscoding$/ } @ARGV ) ? 0 : 1;
+use constant PERFMON      => ( grep { /^--perf(?:mon|warn(?:=|$))/ } @ARGV ) ? 1 : 0;
+use constant DEBUGLOG     => ( grep { /^--no(?:debug|info)log$/ } @ARGV ) ? 0 : 1;
+use constant INFOLOG      => ( grep { /^--noinfolog$/ } @ARGV ) ? 0 : 1;
+use constant STATISTICS   => ( grep { /^--nostatistics$/ } @ARGV ) ? 0 : 1;
+use constant SB1SLIMP3SYNC=> ( grep { /^--nosb1slimp3sync$/ } @ARGV ) ? 0 : 1;
+use constant WEBUI        => ( grep { /^--noweb$/ } @ARGV ) ? 0 : 1;
 use constant NOMYSB       => 1;
-use constant LOCALFILE    => ( grep { /--localfile/ } @ARGV ) ? 1 : 0;
-use constant NOBROWSECACHE=> ( grep { /--nobrowsecache/ } @ARGV ) ? 1 : 0;
+use constant LOCALFILE    => ( grep { /^--localfile$/ } @ARGV ) ? 1 : 0;
+use constant NOBROWSECACHE=> ( grep { /^--nobrowsecache$/ } @ARGV ) ? 1 : 0;
 
 # leaving some legacy flags for the moment - unlikely but possibly some 3rd party plugin is referring to it
 use constant SLIM_SERVICE => 0;
@@ -81,10 +81,11 @@ BEGIN {
 	Slim::bootstrap->loadModules();
 };
 
+use Fcntl qw(:DEFAULT);
 use File::Slurp;
 use Getopt::Long;
 use File::Spec::Functions qw(:ALL);
-use POSIX qw(setsid);
+use POSIX qw(setsid setgid setuid _exit);
 use Time::HiRes;
 use EV;
 use AnyEvent;
@@ -183,8 +184,15 @@ if ( DEBUGLOG ) {
 	require Slim::Utils::PerlRunTime;
 }
 
+my %allowed_db_helpers = (
+	'SQLite' => 'Slim::Utils::SQLiteHelper',
+	'MySQL'  => 'Slim::Utils::MySQLHelper',
+);
+
 my $sqlHelperClass = Slim::Utils::OSDetect->getOS()->sqlHelperClass();
-eval "use $sqlHelperClass";
+die "Invalid SQL helper class: " . (defined $sqlHelperClass ? $sqlHelperClass : 'undef')
+	unless defined $sqlHelperClass && grep { $_ eq $sqlHelperClass } values %allowed_db_helpers;
+Slim::bootstrap::tryModuleLoad($sqlHelperClass);
 die $@ if $@;
 
 our @AUTHORS = (
@@ -256,6 +264,8 @@ our (
 	$d_startup, # Needed for Slim::bootstrap
 );
 
+my $reloadSettings = 0;
+
 sub init {
 	$inInit = 1;
 
@@ -282,7 +292,8 @@ sub init {
 	$log->error("Starting Lyrion Music Server (v$main::VERSION, $REVISION, $BUILDDATE) perl $] - " . $main::Config{archname});
 
 	if ($diag) {
-		eval "use diagnostics";
+		Slim::bootstrap::tryModuleLoad('diagnostics');
+		die $@ if $@;
 	}
 
 	# force a charset from the command line
@@ -294,9 +305,11 @@ sub init {
 	}
 
 	if ( $dbtype ) {
-		# For testing SQLite, can specify a different database type
-		$sqlHelperClass = "Slim::Utils::${dbtype}Helper";
-		eval "use $sqlHelperClass";
+		# For testing SQLite, can specify a different database type via allowlist
+		my $helper = $allowed_db_helpers{$dbtype}
+			or die "Unsupported --dbtype '$dbtype'. Allowed values: " . join(', ', sort keys %allowed_db_helpers) . "\n";
+		$sqlHelperClass = $helper;
+		Slim::bootstrap::tryModuleLoad($sqlHelperClass);
 		die $@ if $@;
 	}
 
@@ -311,8 +324,11 @@ sub init {
 
 	main::INFOLOG && $log->info("OS Specific init...");
 
+	$SIG{'PIPE'} = 'IGNORE';
+	$SIG{'TERM'} = sub { $::stop = 1; };
+	$SIG{'INT'}  = sub { $::stop = 1; };
 	unless (main::ISWINDOWS) {
-		$SIG{'HUP'} = \&initSettings;
+		$SIG{'HUP'} = sub { $reloadSettings = 1; };
 	}
 
 	$SIG{'QUIT'} = \&Slim::bootstrap::sigquit;
@@ -354,7 +370,7 @@ sub init {
 	$failsafe ? $prefs->set('failsafe', 1) : $prefs->remove('failsafe');
 
 	# Change UID/GID after the pid & logfiles have been opened.
-	unless ($os->dontSetUserAndGroup() || (defined($user) && $> != 0)) {
+	unless ($os->dontSetUserAndGroup()) {
 		main::INFOLOG && $log->info("Server settings effective user and group if requested...");
 		changeEffectiveUserAndGroup();
 	}
@@ -420,7 +436,7 @@ sub init {
 	main::INFOLOG && $log->info("Server Buttons init...");
 	Slim::Buttons::Common::init();
 
-	if ($stdio || ($ENV{LMS_STDIO} && $REVISION =~ /TRUNK|git-/)) {
+	if (!$daemon && ($stdio || ($ENV{LMS_STDIO} && $REVISION =~ /TRUNK|git-/))) {
 		main::INFOLOG && $log->info("Server Stdio init...");
 		Slim::Control::Stdio::init(\*STDIN, \*STDOUT);
 	}
@@ -577,6 +593,13 @@ sub idle {
 	# No idle processing during startup
 	return if $inInit;
 
+	return 1 if $::stop;
+
+	if ($reloadSettings) {
+		$reloadSettings = 0;
+		initSettings();
+	}
+
 	my $now = EV::now;
 
 	# check for time travel (i.e. If time skips backwards for DST or clock drift adjustments)
@@ -636,10 +659,11 @@ sub idleStreams {
 
 sub showUsage {
 	print <<EOF;
-Usage: $0 [--diag] [--daemon] [--stdio]
+Usage: $0 [--diag] [--daemon] [--stdio] [--quiet]
           [--cachedir <dirpath>] [--tmpdir <dirpath>]
           [--logdir <logpath>]
           [--logfile <logfilepath|syslog>]
+          [--logconfig <logconfigpath>]
           [--user <username>]
           [--group <groupname>]
           [--httpport <portnumber> [--httpaddr <listenip>]]
@@ -648,13 +672,14 @@ Usage: $0 [--diag] [--daemon] [--stdio]
           [--playeraddr <listenip>]
           [--priority <priority>]
           [--streamaddr <listenip>]
-          [--prefsdir <prefspath> [--pidfile <pidfilepath>]]
+          [--prefsdir <prefspath> [--prefsfile <filepath>] [--pidfile <pidfilepath>]]
           [--perfmon] [--perfwarn=<threshold> | --perfwarn <warn options>]
-          [--checkstrings] [--charset <charset>]
+          [--checkstrings] [--charset <charset>] [--dbtype <SQLite|MySQL>]
           [--noweb] [--notranscoding] [--nosb1slimp3sync] [--nostatistics] [--norestart]
-          [--nobrowsecache]
-          [--logging <logging-spec>] [--noinfolog | --nodebuglog]
-          [--localfile]
+          [--nosetup] [--noserver] [--failsafe] [--nobrowsecache]
+          [--logging <logging-spec>] [--debug <logging-spec>]
+          [--LogTimestamp | --noLogTimestamp] [--noinfolog | --nodebuglog]
+          [--localfile] [--d_startup]
 
     --help           => Show this usage information.
     --cachedir       => Directory for Lyrion Music Server to save cached music and web data
@@ -663,6 +688,7 @@ Usage: $0 [--diag] [--daemon] [--stdio]
                         Also slows down library processing considerably
     --logdir         => Specify folder location for log file
     --logfile        => Specify a file for error logging.  Specify 'syslog' to log to syslog.
+    --logconfig      => Specify a log4perl configuration file path
     --daemon         => Run the server in the background.
                         This may only work on Unix-like systems.
     --stdio          => Use standard in and out as a command line interface
@@ -683,6 +709,7 @@ Usage: $0 [--diag] [--daemon] [--stdio]
     --cliaddr        => Activate the command line interface TCP/IP
                         interface on the specified IP address.
     --prefsdir       => Specify the location of the preferences directory
+    --prefsfile      => Specify the path to the preferences file
     --pidfile        => Specify where a process ID file should be stored
     --quiet          => Minimize the amount of text output
     --playeraddr     => Specify the _server's_ IP address to use to connect
@@ -707,8 +734,12 @@ Usage: $0 [--diag] [--daemon] [--stdio]
     --checkstrings   => Enable reloading of changed string files for plugin development
     --charset        => Force a character set to be used, eg. utf8 on Linux devices
                         which don't have full utf8 locale installed
+    --dbtype         => Specify database backend (SQLite or MySQL)
     --logging        => Enable logging for the specified comma separated categories
+    --debug          => Synonym for --logging
+    --LogTimestamp   => Include timestamps in log messages (negate with --noLogTimestamp)
     --localfile      => Enable LocalFile protocol handling for locally connected squeezelite service
+    --d_startup      => Enable startup module loading diagnostics
 
 Commands may be sent to the server through standard in and will be echoed via
 standard out.  See complete documentation for details on the command syntax.
@@ -746,11 +777,13 @@ sub initOptions {
 		'streamaddr=s'  => \$localStreamAddr,
 		'prefsfile=s'   => \$prefsfile,
 		# prefsdir is parsed by Slim::Utils::Prefs prior to initOptions being run
+		'prefsdir=s'    => sub {},
 		'quiet'	        => \$quiet,
 		'norestart'     => \$norestart,
 		'nosetup'       => \$nosetup,
 		'noserver'      => \$noserver,
 		'failsafe'      => \$failsafe,
+		'perfmon'       => sub {},
 		'perfwarn=s'    => \$perfwarn,  # content parsed by PerfMon if set
 		'checkstrings'  => \$checkstrings,
 		'charset=s'     => \$charset,
@@ -763,6 +796,8 @@ sub initOptions {
 		'nosb1slimp3sync'=> sub {},
 		'notranscoding' => sub {},
 		'noweb'         => sub {},
+		'nobrowsecache' => sub {},
+		'localfile'     => sub {},
 	);
 
 	# make --logging and --debug synonyms, but prefer --logging
@@ -772,7 +807,17 @@ sub initOptions {
 
 	if ($help || !$gotOptions) {
 		showUsage();
-		exit(1);
+		exit($help ? 0 : 1);
+	}
+
+	if ($daemon && $stdio) {
+		die "--daemon and --stdio cannot be used together.\n";
+	}
+
+	if (defined $cliport) {
+		if ($cliport !~ /^\d+$/ || ($cliport != 0 && ($cliport < 1024 || $cliport > 65535))) {
+			die "Invalid --cliport '$cliport': must be 0 or 1024..65535.\n";
+		}
 	}
 }
 
@@ -839,23 +884,31 @@ sub daemonize {
 
 		# don't clean up the pidfile!
 		$pidfile = undef;
-		exit;
+		POSIX::_exit(0);
 	}
 
 	if (!setsid) {
 		die "Can't start a new session: $!";
 	}
 
-	open STDOUT, '>>/dev/null';
+	umask(0022);
+
+	my $devnull = File::Spec->devnull();
+	open(STDIN, '<', $devnull) or die "Can't reopen STDIN to $devnull: $!";
+	open(STDOUT, '>>', $devnull) or die "Can't reopen STDOUT to $devnull: $!";
+	my $stderr_tied = tied(*STDERR);
+	untie *STDERR if $stderr_tied;
+	open(STDERR, '>>', $devnull) or die "Can't reopen STDERR to $devnull: $!";
+	tie *STDERR, 'Slim::Utils::Log::Trapper' if $stderr_tied;
 
 	# Do not attempt to daemonize again.
-	@argv = grep { $_ ne '--daemon' } @argv;
+	@argv = grep { !/^--?daemon(?:=.*)?$/ } @argv;
 
 	# On Leopard, GD will crash because you can't run CoreServices code in a forked child,
 	# so we have to exec as well.
 	if ( $^O =~ /darwin/ ) {
-		exec $^X . ' "' . $0 . '" ' . join( ' ', @argv );
-		exit;
+		exec($^X, $0, @argv);
+		die "Failed to exec $^X $0: $!";
 	}
 }
 
@@ -898,12 +951,14 @@ sub changeEffectiveUserAndGroup {
 	}
 
 
-	# Get the supplementary groups to which $user belongs
+	# Get the supplementary groups to which $user belongs (exact member match)
 
 	setgrent();
 
 	while (my @grp = getgrent()) {
-		if ($grp[3] =~ m/\b$user\b/){ push @sgids, $grp[2] }
+		if (defined $grp[3] && grep { $_ eq $user } split(/\s+/, $grp[3])) {
+			push @sgids, $grp[2];
+		}
 	}
 
 	endgrent();
@@ -920,41 +975,39 @@ sub changeEffectiveUserAndGroup {
 		}
 	}
 
-	# Check that we're definately not trying to start as root, e.g. if
-	# we were passed '--user root' or any other used with uid 0.
+	# Check that we're definitely not trying to start as root, e.g. if
+	# we were passed '--user root' or any other user with uid 0.
 	if ($uid == 0) {
-		print STDERR "Lyrion Music Server must not be run as root! Only do this if you know what you're doing!!\n";
+		die "Lyrion Music Server must not be run as root (uid 0)! Aborting.\n";
 	}
 
-
-	# Change effective group. Need to do this while still root, so do group first
-
-	# $) is a space separated list that begins with the effective gid then lists
-	# any supplementary group IDs, so compare against that.  On some systems
-	# no supplementary group IDs are present at system startup or at all.
-
-	# We need to pass $pgid twice because setgroups only gets called if there's
-	# more than one value.  For example, if we did:
-	# $) = "1234"
-	# then the effective primary group would become 1234, but we'd retain any
-	# previously set supplementary groups.  To become a member of just 1234, the
-	# correct way is to do:
-	# $) = "1234 1234"
+	# Set supplementary groups while still root, then drop real & effective GID/UID
+	my %seen_gid = map { $_ => 1 } ($pgid, @sgids);
+	my @unique_sgids = sort { $a <=> $b } keys %seen_gid;
 
 	undef $!;
-	$) = "$pgid $pgid " . join (" ", @sgids);
+	$) = "$pgid $pgid " . join(' ', @unique_sgids);
 
 	if ( $! ) {
-		die "Unable to set effective group(s) to $group ($gid) is: $): $!\n";
+		die "Unable to set effective group(s) to ($)): $!\n";
 	}
 
-	# Finally, change effective user id.
+	if (!defined POSIX::setgid($pgid)) {
+		die "Unable to setgid($pgid): $!\n";
+	}
 
-	undef $!;
-	$> = $uid;
+	if (!defined POSIX::setuid($uid)) {
+		die "Unable to setuid($uid): $!\n";
+	}
 
-	if ( $! ) {
-		die "Unable to set effective user to $user, ($uid)!\n";
+	# Verify both real and effective UID/GID dropped cleanly
+	if ($< != $uid || $> != $uid) {
+		die "Privilege drop verification failed for uid $uid (real=$<, effective=$>)\n";
+	}
+	my ($rgid) = split(/\s+/, $();
+	my ($egid) = split(/\s+/, $));
+	if (!defined $rgid || !defined $egid || $rgid != $pgid || $egid != $pgid) {
+		die "Privilege drop verification failed for gid $pgid (real=" . ($rgid // 'undef') . ", effective=" . ($egid // 'undef') . ")\n";
 	}
 
 	logger('server')->info("Running as uid: $> / gid: $)");
@@ -1072,7 +1125,7 @@ sub cleanup {
 	}
 
 	main::DEBUGLOG && $log->is_debug && $log->debug("SQL cleanup.");
-	$sqlHelperClass->cleanup;
+	$sqlHelperClass->cleanup if $sqlHelperClass && $sqlHelperClass->can('cleanup');
 
 	remove_pid_file();
 }
@@ -1083,14 +1136,28 @@ sub save_pid_file {
 	logger('server')->info("Lyrion Music Server saving pid file.");
 
 	if (defined $pidfile) {
-		File::Slurp::write_file($pidfile, $process_id);
+		if (-l $pidfile) {
+			die "Refusing to write PID file '$pidfile': path is a symlink\n";
+		}
+		my $flags = O_WRONLY | O_CREAT | O_TRUNC | (eval { Fcntl::O_NOFOLLOW() } || 0);
+		sysopen(my $fh, $pidfile, $flags, 0644)
+			or die "Cannot open PID file '$pidfile': $!\n";
+		print {$fh} "$process_id\n";
+		close($fh) or die "Cannot close PID file '$pidfile': $!\n";
 	}
 }
 
 sub remove_pid_file {
-	 if (defined $pidfile) {
-	 	unlink $pidfile;
-	 }
+	if (defined $pidfile && -e $pidfile && !-l $pidfile) {
+		my $flags = O_RDONLY | (eval { Fcntl::O_NOFOLLOW() } || 0);
+		if (sysopen(my $fh, $pidfile, $flags)) {
+			my $content = do { local $/; <$fh> };
+			close($fh);
+			if (defined $content && $content =~ /^\s*(\d+)\s*$/ && $1 == $$) {
+				unlink $pidfile;
+			}
+		}
+	}
 }
 
 sub END {

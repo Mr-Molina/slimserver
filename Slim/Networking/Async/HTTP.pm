@@ -33,7 +33,7 @@ BEGIN {
 		};
 
 		if ($@) {
-			msg("Async::HTTP: Unable to load IO::Socket::SSL, will try connecting to SSL servers in non-SSL mode\n$@\n");
+			msg("Async::HTTP: Unable to load IO::Socket::SSL, HTTPS requests will fail\n$@\n");
 		}
 		# if we're using an outdated version of IO::Socket::SSL, log a warning
 		elsif (Slim::Utils::Versions->compareVersions(MIN_IO_SOCKET_SSL, $IO::Socket::SSL::VERSION) > 0) {
@@ -51,6 +51,7 @@ use HTTP::Request;
 use HTTP::Response;
 use HTTP::Cookies;
 use MIME::Base64 qw(encode_base64);
+use Socket qw(inet_aton inet_pton AF_INET AF_INET6);
 use URI;
 use File::Spec::Functions qw(catdir);
 
@@ -61,7 +62,8 @@ use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
 use Slim::Utils::Versions;
 
-use constant BUFSIZE   => 16 * 1024;
+use constant BUFSIZE               => 16 * 1024;
+use constant DEFAULT_MAX_BODY_SIZE => 32 * 1024 * 1024;
 
 my $prefs = preferences('server');
 
@@ -70,7 +72,7 @@ my $cookieJar;
 my $log = logger('network.asynchttp');
 
 __PACKAGE__->mk_accessor( rw => qw(
-	uri request response saveAs fh timeout maxRedirect socks options insecureHTTPS
+	uri request response saveAs fh timeout maxRedirect socks options insecureHTTPS _is_redirect _bytes_read
 ) );
 
 sub init {
@@ -95,9 +97,134 @@ sub new {
 	}
 
 	$self->options($args->{options});
-	$self->insecureHTTPS($prefs->get('insecureHTTPS') || $args->{insecureHTTPS});
+	$self->insecureHTTPS( defined $args->{insecureHTTPS} ? $args->{insecureHTTPS} : $prefs->get('insecureHTTPS') );
 
 	return $self;
+}
+
+sub _safe_uri_string {
+	my $uri = shift;
+	return '' unless defined $uri;
+
+	my $u = eval { ref($uri) ? $uri->clone : URI->new("$uri") };
+	if ( $u && $u->can('userinfo') && defined $u->userinfo ) {
+		$u->userinfo(undef);
+		return $u->as_string;
+	}
+	return $u->as_string if $u;
+
+	my $s = "$uri";
+	$s =~ s{^([a-z][a-z0-9+.\-]*://)[^/\@#?]+\@}{$1}i;
+	return $s;
+}
+
+sub _normalize_host {
+	my $host = shift;
+	return '' unless defined $host;
+	$host =~ s/^\s+|\s+$//g;
+	if ( $host =~ /^\[([^\]]+)\](?::\d+)?$/ ) {
+		$host = $1;
+	}
+	elsif ( $host !~ /:/ || $host =~ /^[^:]+:\d+$/ ) {
+		$host =~ s/:\d+$//;
+	}
+	$host =~ s/\.+$//;
+	return lc($host);
+}
+
+sub _is_metadata_host {
+	my $host = _normalize_host(shift);
+	return 0 unless length $host;
+
+	return 1 if $host eq '169.254.169.254'
+		|| $host eq '100.100.100.200'
+		|| $host eq 'fd00:ec2::254'
+		|| $host eq 'metadata.google.internal'
+		|| $host eq 'metadata.goog'
+		|| $host eq 'metadata'
+		|| $host eq 'instance-data';
+
+	return 0;
+}
+
+sub _is_blocked_ipv4_bytes {
+	my $bytes = shift;
+	return 0 unless defined $bytes && length($bytes) == 4;
+	my ($b0, $b1) = unpack('CC', $bytes);
+
+	return 1 if $b0 == 0;                                  # 0.0.0.0/8
+	return 1 if $b0 == 10;                                 # 10.0.0.0/8 (RFC1918)
+	return 1 if $b0 == 100 && $b1 >= 64 && $b1 <= 127;     # 100.64.0.0/10 (CGNAT)
+	return 1 if $b0 == 127;                                # 127.0.0.0/8 (loopback)
+	return 1 if $b0 == 169 && $b1 == 254;                  # 169.254.0.0/16 (link-local / metadata)
+	return 1 if $b0 == 172 && $b1 >= 16 && $b1 <= 31;      # 172.16.0.0/12 (RFC1918)
+	return 1 if $b0 == 192 && $b1 == 168;                  # 192.168.0.0/16 (RFC1918)
+	return 1 if $b0 >= 224;                                # 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+
+	return 0;
+}
+
+sub _is_blocked_ip {
+	my $ip = shift;
+	return 0 unless defined $ip && length $ip;
+
+	$ip = _normalize_host($ip);
+	$ip =~ s/%.+$//; # strip IPv6 zone ID
+
+	# Standard IPv4 or integer/octal/hex IPv4 literal (no DNS lookup)
+	if ( $ip =~ /^(?:0x[0-9a-f]+|0[0-7]*|\d+)(?:\.(?:0x[0-9a-f]+|0[0-7]*|\d+)){0,3}$/i ) {
+		my $packed = inet_aton($ip);
+		return 1 unless defined $packed;
+		return _is_blocked_ipv4_bytes($packed);
+	}
+
+	# IPv6 literal
+	if ( $ip =~ /:/ ) {
+		my $packed6 = inet_pton(AF_INET6, $ip);
+		return 1 unless defined $packed6 && length($packed6) == 16;
+
+		# :: (unspecified) and ::1 (loopback)
+		return 1 if $packed6 eq ("\x00" x 16);
+		return 1 if $packed6 eq (("\x00" x 15) . "\x01");
+
+		# IPv4-mapped IPv6 ::ffff:0:0/96 or IPv4-compatible ::/96
+		my $prefix12 = substr($packed6, 0, 12);
+		if ( $prefix12 eq (("\x00" x 10) . "\xff\xff") || $prefix12 eq ("\x00" x 12) ) {
+			return _is_blocked_ipv4_bytes(substr($packed6, 12, 4));
+		}
+
+		my ($w0) = unpack('n', $packed6);
+		return 1 if ($w0 & 0xfe00) == 0xfc00; # fc00::/7 unique local
+		return 1 if ($w0 & 0xffc0) == 0xfe80; # fe80::/10 link-local
+		return 1 if ($w0 & 0xff00) == 0xff00; # ff00::/8 multicast
+	}
+
+	return 0;
+}
+
+sub _is_blocked_redirect_host {
+	my $host = _normalize_host(shift);
+	return 1 unless length $host;
+
+	return 1 if $host eq 'localhost'
+		|| $host =~ /\.localhost$/
+		|| $host eq 'localhost.localdomain';
+	return 1 if _is_metadata_host($host);
+	return 1 if _is_blocked_ip($host);
+
+	return 0;
+}
+
+sub _is_same_origin {
+	my ($u1, $u2) = @_;
+	return 0 unless $u1 && $u2;
+	my $s1 = lc($u1->scheme // '');
+	my $s2 = lc($u2->scheme // '');
+	my $h1 = _normalize_host($u1->host);
+	my $h2 = _normalize_host($u2->host);
+	my $p1 = $u1->port;
+	my $p2 = $u2->port;
+	return ($s1 eq $s2 && $h1 eq $h2 && defined($p1) && defined($p2) && $p1 == $p2) ? 1 : 0;
 }
 
 sub new_socket {
@@ -105,6 +232,23 @@ sub new_socket {
 
 	# merge with user-defined socket parameters
 	push @_, %{$self->options} if $self->options;
+
+	my %args = @_;
+
+	# Validate resolved target IP/host across redirects and against metadata endpoints
+	if ( _is_metadata_host($args{Host}) || _is_metadata_host($args{PeerAddr}) ) {
+		$log->error("Blocked connection to metadata target");
+		$@ = "Blocked connection to metadata target";
+		return undef;
+	}
+
+	if ( $self->_is_redirect && !$self->use_proxy ) {
+		if ( _is_blocked_redirect_host($args{Host}) || (defined $args{PeerAddr} && _is_blocked_redirect_host($args{PeerAddr})) ) {
+			$log->error("Blocked redirect to restricted target: " . ($args{PeerAddr} || $args{Host} || 'unknown'));
+			$@ = "Blocked redirect to restricted target";
+			return undef;
+		}
+	}
 
 	if ( my $proxy = $self->use_proxy ) {
 
@@ -120,7 +264,7 @@ sub new_socket {
 	}
 
 	# Create SSL socket if URI is https
-	if ( $self->request->uri->scheme eq 'https' ) {
+	if ( lc($self->request->uri->scheme || '') eq 'https' ) {
 		if ( hasSSL() ) {
 			# From http://bugs.slimdevices.com/show_bug.cgi?id=18152:
 			# We increasingly find servers *requiring* use of the SNI extension to TLS.
@@ -131,10 +275,29 @@ sub new_socket {
 			# So we will probably need to explicitly set "SSL_hostname" if we are to succeed with such
 			# a server.
 
-			my %args = @_;
+			my $ssl_host = $args{SSL_hostname};
+			if ( !defined $ssl_host || !length $ssl_host ) {
+				$ssl_host = $args{Host};
+				$ssl_host = $self->request->uri->host if (!defined $ssl_host || !length $ssl_host) && $self->request && $self->request->uri;
+			}
+			if ( defined $ssl_host ) {
+				if ( $ssl_host =~ /^\[([^\]]+)\](?::\d+)?$/ ) {
+					$ssl_host = $1;
+				}
+				elsif ( $ssl_host !~ /:/ || $ssl_host =~ /^[^:]+:\d+$/ ) {
+					$ssl_host =~ s/:\d+$//;
+				}
+				$args{SSL_hostname} = $ssl_host if length $ssl_host;
+			}
 
-			$args{SSL_hostname} //= $args{Host};
-			$args{SSL_verify_mode} //= Net::SSLeay::VERIFY_NONE() if $self->insecureHTTPS;
+			if ( $self->insecureHTTPS ) {
+				$args{SSL_verify_mode} //= Net::SSLeay::VERIFY_NONE();
+			}
+			else {
+				$args{SSL_verify_mode}     //= IO::Socket::SSL::SSL_VERIFY_PEER();
+				$args{SSL_verifycn_scheme} //= 'http';
+				$args{SSL_verifycn_name}   //= $args{SSL_hostname} if defined $args{SSL_hostname};
+			}
 
 			if ($self->socks) {
 				return Slim::Networking::Async::Socket::HTTPSSocks->new( %{$self->socks}, %args );
@@ -144,19 +307,10 @@ sub new_socket {
 			}
 		}
 		else {
-			# change the request to port 80
-			$self->request->uri->scheme( 'http' );
-			$self->request->uri->port( 80 );
-
-			my %args = @_;
-			$args{PeerPort} = 80;
-
-			if ($self->socks) {
-				return Slim::Networking::Async::Socket::HTTPSocks->new( %{$self->socks}, %args );
-			}
-			else {
-				return Slim::Networking::Async::Socket::HTTP->new( %args );
-			}
+			# Fail closed: never downgrade HTTPS to plaintext HTTP port 80
+			$log->error("Cannot connect to https URL without IO::Socket::SSL");
+			$@ = "IO::Socket::SSL is required for HTTPS connections";
+			return undef;
 		}
 	}
 	elsif ($self->socks) {
@@ -174,7 +328,7 @@ sub use_proxy {
 	if ( my $proxy = $prefs->get('webproxy') ) {
 		my $host   = $self->request->uri->host;
 		my $scheme = $self->request->uri->scheme;
-		if ( $scheme ne 'https' && $host !~ /(?:localhost|127.0.0.1)/ ) {
+		if ( lc($scheme || '') ne 'https' && defined $host && $host !~ /^(?:localhost|127\.0\.0\.1|\[?::1\]?)$/i ) {
 			return $proxy;
 		}
 	}
@@ -187,6 +341,8 @@ sub send_request {
 
 	$self->maxRedirect( $args->{maxRedirect} // $prefs->get('maxRedirects') );
 	$self->response( undef ) unless $redirect;
+	$self->_is_redirect( $redirect ? 1 : 0 );
+	$self->_bytes_read( 0 );
 
 	if ( $args->{Timeout} ) {
 		$self->timeout( $args->{Timeout} );
@@ -204,8 +360,29 @@ sub send_request {
 	);
 
 	if ( $self->request->uri !~ /^https?:/i ) {
-		my $error = 'Cannot request non-HTTP URL ' . $self->request->uri;
+		my $error = 'Cannot request non-HTTP URL ' . _safe_uri_string($self->request->uri);
 		return $self->_http_error( $error, $args );
+	}
+
+	if ( lc($self->request->uri->scheme || '') eq 'https' && !hasSSL() ) {
+		my $error = "Can't connect to https URL lack of IO::Socket::SSL: " . _safe_uri_string($self->request->uri);
+		return $self->_http_error( $error, $args );
+	}
+
+	my $target_host = eval { $self->request->uri->host };
+	if ( _is_metadata_host($target_host) ) {
+		my $error = 'Blocked request to metadata target: ' . _safe_uri_string($self->request->uri);
+		return $self->_http_error( $error, $args );
+	}
+
+	if ( $redirect && _is_blocked_redirect_host($target_host) ) {
+		my $error = 'Blocked redirect to restricted target: ' . _safe_uri_string($self->request->uri);
+		return $self->_http_error( $error, $args );
+	}
+
+	if ( (defined $self->request->method && $self->request->method =~ /[\r\n\0]/)
+		|| $self->request->uri->as_string =~ /[\r\n\0]/ ) {
+		return $self->_http_error( 'Invalid control characters in HTTP request', $args );
 	}
 
 	if ( !$self->request->protocol ) {
@@ -264,7 +441,7 @@ sub add_headers {
 	}
 
 	# Add cookies
-	if ( !main::SCANNER ) {
+	if ( !main::SCANNER && $cookieJar ) {
 		$cookieJar->add_cookie_header( $self->request );
 	}
 }
@@ -285,11 +462,21 @@ sub _format_request {
 		$fullpath = $self->request->uri->as_string;
 	}
 
+	$fullpath =~ s/[\r\n\0]+//g;
+
+	my $method = $self->request->method;
+	$method =~ s/[\r\n\0]+//g;
+
 	my @h;
 	$self->request->headers->scan( sub {
 		my ($k, $v) = @_;
 		$k =~ s/^://;
-		$v =~ s/\n/ /g;
+		if ( $k !~ /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/ ) {
+			$log->warn("Skipping invalid HTTP header key");
+			return;
+		}
+		$v = '' unless defined $v;
+		$v =~ s/[\r\n\0]+/ /g;
 		push @h, $k, $v;
 	} );
 
@@ -307,7 +494,7 @@ sub _format_request {
 									$self->request->header('Connection') =~ /keep-alive/i;
 
 	my $request = $self->socket->format_request(
-		$self->request->method,
+		$method,
 		$fullpath,
 		@h,
 	);
@@ -320,6 +507,8 @@ sub _format_request {
 sub read_body {
 	my $self = shift;
 	my $args = shift;
+
+	$self->_bytes_read( 0 );
 
 	$self->socket->set( passthrough => [ $self, $args ] );
 
@@ -359,6 +548,7 @@ sub _http_socket_error {
 	my ( $socket, $self, $args ) = @_;
 
 	Slim::Utils::Timers::killTimers( $socket, \&_http_socket_error );
+	Slim::Utils::Timers::killTimers( $socket, \&_http_read_timeout );
 
 	$self->disconnect;
 
@@ -368,8 +558,14 @@ sub _http_socket_error {
 sub _http_error {
 	my ( $self, $error, $args ) = @_;
 
+	if ( my $socket = $self->socket ) {
+		Slim::Utils::Timers::killTimers( $socket, \&_http_socket_error );
+		Slim::Utils::Timers::killTimers( $socket, \&_http_read_timeout );
+	}
+
 	if ( $self->fh ) {
 		$self->fh->close;
+		$self->fh(undef);
 	}
 
 	$self->disconnect;
@@ -430,7 +626,7 @@ sub _http_read {
 		$self->response->request( $self->request );
 
 		# Save cookies
-		$cookieJar->extract_cookies( $self->response );
+		$cookieJar->extract_cookies( $self->response ) if !main::SCANNER && $cookieJar;
 
 		if ( main::DEBUGLOG && $log->is_debug ) {
 
@@ -452,14 +648,43 @@ sub _http_read {
 
 				$self->disconnect;
 
+				my $old_uri = $self->request->uri->clone;
+				my $new_uri = URI->new_abs( $location, $old_uri );
+
+				if ( !$new_uri || ($new_uri->scheme || '') !~ /^https?$/i ) {
+					return $self->_http_error( 'Blocked redirect to non-HTTP URL: ' . _safe_uri_string($new_uri || $location), $args );
+				}
+
+				if ( lc($old_uri->scheme || '') eq 'https' && lc($new_uri->scheme || '') ne 'https' ) {
+					return $self->_http_error( 'Blocked HTTPS to HTTP redirect: ' . _safe_uri_string($new_uri), $args );
+				}
+
+				if ( lc($new_uri->scheme || '') eq 'https' && !hasSSL() ) {
+					return $self->_http_error( "Can't connect to https URL lack of IO::Socket::SSL: " . _safe_uri_string($new_uri), $args );
+				}
+
+				if ( _is_blocked_redirect_host($new_uri->host) ) {
+					return $self->_http_error( 'Blocked redirect to restricted target: ' . _safe_uri_string($new_uri), $args );
+				}
+
+				# Strip sensitive headers on cross-origin redirects
+				if ( !_is_same_origin($old_uri, $new_uri) ) {
+					$self->request->headers->remove_header('Authorization', 'Proxy-Authorization', 'Cookie');
+				}
+
+				# Convert non-GET/HEAD requests to GET on 301, 302, 303
+				if ( $code =~ /^30[123]$/ && uc($self->request->method || '') !~ /^(?:GET|HEAD)$/ ) {
+					$self->request->method('GET');
+					$self->request->content('');
+					$self->request->headers->remove_header('Content-Length', 'Content-Type', 'Content-Encoding', 'Transfer-Encoding');
+				}
+
 				# change the request object to the new location
 				delete $args->{request};
-				$self->request->uri(
-					URI->new_abs( $location, $self->request->uri )
-				);
+				$self->request->uri( $new_uri );
 
 				if ( main::INFOLOG && $log->is_info ) {
-					$log->info(sprintf("Redirecting to %s", $self->request->uri->as_string));
+					$log->info(sprintf("Redirecting to %s", _safe_uri_string($self->request->uri)));
 				}
 
 				# Does the caller want to modify redirecting URLs?
@@ -479,7 +704,7 @@ sub _http_read {
 				my $error = 'Redirection without location';
 
 				if ($location) {
-					$error = ($location =~ /^https/ && !hasSSL()) ? "Can't connect to https URL lack of IO::Socket::SSL: $location" : 'Redirection limit exceeded';
+					$error = ($location =~ /^https/i && !hasSSL()) ? "Can't connect to https URL lack of IO::Socket::SSL: " . _safe_uri_string($location) : 'Redirection limit exceeded';
 				}
 
 				$log->warn($error);
@@ -495,11 +720,22 @@ sub _http_read {
 			}
 		}
 
+		# Enforce max body size before buffering large responses into memory
+		if ( !$self->saveAs && !$args->{onStream} && !$args->{readLimit} ) {
+			my $max_body = defined $args->{maxBodySize} ? $args->{maxBodySize} : DEFAULT_MAX_BODY_SIZE;
+			my $cl = $headers->content_length;
+			if ( $max_body && defined $cl && $cl =~ /^\d+$/ && $cl > $max_body ) {
+				return $self->_http_error( "Response Content-Length ($cl) exceeds maximum body size ($max_body)", $args );
+			}
+		}
+
 		# Does the caller want a callback on headers?
 		if ( my $cb = $args->{onHeaders} ) {
 			my $passthrough = $args->{passthrough} || [];
 			return $cb->( $self, @{$passthrough} );
 		}
+
+		$self->_bytes_read( 0 );
 
 		# if not, keep going and read the body
 		$self->socket->set( passthrough => [ $self, $args ] );
@@ -539,13 +775,26 @@ sub _http_read_body {
 	BODY_READ: {
 
 		my $result = $socket->read_entity_body( my $buf, BUFSIZE );
+		if ( !defined $result ) {
+			Slim::Utils::Timers::killTimers( $socket, \&_http_socket_error );
+			Slim::Utils::Timers::killTimers( $socket, \&_http_read_timeout );
+			return $self->_http_error( "Error reading body: $!", $args );
+		}
 		return if $result < 0;
 
 		Slim::Utils::Timers::killTimers( $socket, \&_http_socket_error );
 		Slim::Utils::Timers::killTimers( $socket, \&_http_read_timeout );
 
 		if ( $result ) {
+			$self->_bytes_read( ($self->_bytes_read || 0) + $result );
 			main::DEBUGLOG && $log->debug("Read body: [$result] bytes");
+		}
+
+		if ( !$self->saveAs && !$args->{onStream} ) {
+			my $max_body = defined $args->{maxBodySize} ? $args->{maxBodySize} : DEFAULT_MAX_BODY_SIZE;
+			if ( $max_body && ($self->_bytes_read || 0) > $max_body ) {
+				return $self->_http_error( "Response body exceeds maximum size ($max_body bytes)", $args );
+			}
 		}
 
 		# Are we saving directly to a file?
@@ -584,32 +833,45 @@ sub _http_read_body {
 		}
 		else {
 			# Add buffer to Response object
-			$self->response->add_content( $buf );
+			$self->response->add_content( $buf ) if $result;
 		}
 
 		# Does the caller want us to quit reading early (i.e. for mp3 frames)?
-		if ( $args->{readLimit} && length( $self->response->content ) >= $args->{readLimit} ) {
+		if ( $args->{readLimit} && ($self->_bytes_read || 0) >= $args->{readLimit} ) {
+
+			Slim::Utils::Timers::killTimers( $socket, \&_http_socket_error );
+			Slim::Utils::Timers::killTimers( $socket, \&_http_read_timeout );
+			if ( $self->fh ) {
+				$self->fh->close;
+				$self->fh(undef);
+			}
 
 			# close and remove the socket
 			$self->disconnect;
 
 			if ( main::DEBUGLOG && $log->is_debug ) {
-				$log->debug(sprintf("Body read (stopped after %d bytes)", length( $self->response->content )));
+				$log->debug(sprintf("Body read (stopped after %d bytes)", $self->_bytes_read || 0));
 			}
 
 			if ( my $cb = $args->{onBody} ) {
 				my $passthrough = $args->{passthrough} || [];
 				return $cb->( $self, @{$passthrough} );
 			}
+			return;
 		}
 
-		if ( (defined $result && $result == 0) || (defined $self->response->headers->header('Content-Length') && length($self->response->content) == $self->response->headers->header('Content-Length')) ) {
+		my $cl = $self->response->headers->header('Content-Length');
+		if ( (defined $result && $result == 0) || (defined $cl && $cl =~ /^\d+$/ && ($self->_bytes_read || 0) >= $cl) ) {
 			# if here, we've reached the end of the body
 
+			if ( $self->fh ) {
+				$self->fh->close;
+				$self->fh(undef);
+			}
+
 			# close and remove the socket if not keep-alive
-			if ( $self->response->headers->header('Connection') =~ /close/i ||
-				($self->request->headers->header('Connection') !~ /keep-alive/i && $self->request->protocol =~ m|HTTP/1.0|i) ) {
-				$self->fh->close if $self->fh;
+			if ( ($self->response->headers->header('Connection') || '') =~ /close/i ||
+				(($self->request->headers->header('Connection') || '') !~ /keep-alive/i && $self->request->protocol =~ m|HTTP/1.0|i) ) {
 				$self->disconnect;
 				main::DEBUGLOG && $log->debug("closing mode");
 			}
@@ -654,11 +916,16 @@ sub _http_read_timeout {
 
 	$log->warn("Timed out waiting for more body data, returning what we have");
 
+	Slim::Utils::Timers::killTimers( $socket, \&_http_socket_error );
+	Slim::Utils::Timers::killTimers( $socket, \&_http_read_timeout );
 	Slim::Networking::Select::removeError( $socket );
 	Slim::Networking::Select::removeRead( $socket );
 
 	# close and remove the socket
-	$self->fh->close if $self->fh;
+	if ( $self->fh ) {
+		$self->fh->close;
+		$self->fh(undef);
+	}
 	$self->disconnect;
 
 	if ( my $cb = $args->{onBody} ) {

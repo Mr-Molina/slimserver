@@ -10,5 +10,8 @@ lofty = { workspace = true }
 lms-cache = { path = "../lms-cache" }
 thiserror = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }

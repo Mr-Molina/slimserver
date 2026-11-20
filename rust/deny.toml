@@ -1,7 +1,12 @@
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro transitive dep of lofty 0.22.4, verified through upstream 0.25.5, zero CVEs, no upstream fix" },
+    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro (paste 1.0.15) transitive dep of lofty 0.21.1 (Cargo.toml pins 0.21), unmaintained crate with zero CVEs and no upstream fix in 0.21" },
 ]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
 
 [licenses]
 allow = [
@@ -17,3 +22,8 @@ allow = [
 
 [licenses.private]
 ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

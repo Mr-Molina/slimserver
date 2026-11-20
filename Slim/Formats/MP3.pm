@@ -106,6 +106,36 @@ Extract and return audio information & any embedded metadata found.
 
 =cut
 
+sub _strip_nuls_value {
+	my ($val) = @_;
+	if ( !ref $val ) {
+		$val =~ s/\x00//g if defined $val;
+		return $val;
+	}
+	if ( ref $val eq 'ARRAY' ) {
+		for my $elem ( @{$val} ) {
+			if ( !ref $elem ) {
+				$elem =~ s/\x00//g if defined $elem;
+			}
+			elsif ( ref $elem eq 'ARRAY' ) {
+				for my $sub ( @{$elem} ) {
+					$sub =~ s/\x00//g if !ref($sub) && defined $sub;
+				}
+			}
+		}
+	}
+	return $val;
+}
+
+sub _strip_nuls_tags {
+	my ($tags) = @_;
+	return unless ref $tags eq 'HASH';
+	for my $key ( keys %{$tags} ) {
+		next if $key eq 'APIC' || $key eq 'PIC';
+		$tags->{$key} = _strip_nuls_value( $tags->{$key} );
+	}
+}
+
 sub getTag {
 	my $class = shift;
 	my $file  = shift;
@@ -116,14 +146,15 @@ sub getTag {
 	}
 
 	my $s = Audio::Scan->scan( $file );
+	return unless ref $s eq 'HASH' && ref $s->{info} eq 'HASH';
 
-	if ( exists $s->{tags}->{GRP1} ) {
-		$s->{tags}->{GRP1} =~ s/\x0//g; # scanner is returning leading null in GRP1 tag, which messes things up.
-	}
 	my $info = $s->{info};
-	my $tags = $s->{tags};
+	my $tags = ref $s->{tags} eq 'HASH' ? $s->{tags} : {};
 
 	return unless $info->{song_length_ms};
+
+	# Strip NUL bytes across all ID3 text frames (including GRP1 arrayrefs)
+	_strip_nuls_tags($tags);
 
 	# map the existing tag names to the expected tag names
 	$class->doTagMapping($tags);
@@ -165,16 +196,20 @@ sub getCoverArt {
 	local $ENV{AUDIO_SCAN_NO_ARTWORK} = 0;
 
 	my $s = Audio::Scan->scan_tags($file);
+	return undef unless ref $s eq 'HASH' && ref $s->{tags} eq 'HASH';
 
 	my $tags = $s->{tags};
 
 	if ( my $pic = $tags->{APIC} ) {
-		if ( ref $pic->[0] eq 'ARRAY' ) {
-			# multiple images, return image with lowest image_type value
-			return ( sort { $a->[1] <=> $b->[1] } @{$pic} )[0]->[3];
-		}
-		else {
-			return $pic->[3];
+		if ( ref $pic eq 'ARRAY' && @{$pic} ) {
+			if ( ref $pic->[0] eq 'ARRAY' ) {
+				# multiple images, return image with lowest image_type value
+				my @valid = grep { ref $_ eq 'ARRAY' && defined $_->[1] && defined $_->[3] } @{$pic};
+				return @valid ? ( sort { $a->[1] <=> $b->[1] } @valid )[0]->[3] : undef;
+			}
+			else {
+				return $pic->[3];
+			}
 		}
 	}
 
@@ -188,24 +223,72 @@ sub getInitialAudioBlock {
 
 	# Only bother if not playing from the start
 	return if !$timeOffset;
+	return '' unless defined $track;
 
-	open my $localFh, '<&=', $fh;
+	my $audio_offset = eval { $track->audio_offset };
+	return '' unless defined $audio_offset && $audio_offset >= 0;
 
-	# Find the location of the next frame past the audio offset (uses negative offset for byte-based seeking)
-	my $offset = $track->audio_offset + 1;
-	my $second_frame = Audio::Scan->find_frame_fh( mp3 => $localFh, -$offset );
+	my $path = eval { $track->path };
+	if ( !defined $path && eval { $track->url } ) {
+		$path = eval { Slim::Utils::Misc::pathFromFileURL( $track->url ) };
+	}
 
-	# If unable to find the second frame for some reason, $second_frame will be -1
-	# We'll check for less than audio_offset to be safe although this should never happen
-	if ( $second_frame < $track->audio_offset ) {
+	my $localFh;
+	my $opened_local = 0;
+	my $saved_pos;
+
+	if ( defined $path && $path !~ /\0/ && -f $path ) {
+		open $localFh, '<', $path or return '';
+		binmode $localFh or do {
+			close $localFh;
+			return '';
+		};
+		$opened_local = 1;
+	}
+	elsif ( defined $fh ) {
+		$localFh   = $fh;
+		$saved_pos = tell($localFh);
+	}
+	else {
 		return '';
 	}
 
-	seek $localFh, $track->audio_offset, 0;
+	# Find the location of the next frame past the audio offset (uses negative offset for byte-based seeking)
+	my $offset = $audio_offset + 1;
+	my $second_frame = Audio::Scan->find_frame_fh( mp3 => $localFh, -$offset );
 
-	read $localFh, my $buffer, $second_frame - $track->audio_offset;
+	# If unable to find the second frame for some reason, $second_frame will be -1
+	if ( !defined $second_frame || $second_frame <= $audio_offset ) {
+		if ($opened_local) {
+			close $localFh;
+		}
+		elsif ( defined $saved_pos && $saved_pos >= 0 ) {
+			seek( $localFh, $saved_pos, SEEK_SET );
+		}
+		return '';
+	}
 
-	close $localFh;
+	if ( !seek( $localFh, $audio_offset, SEEK_SET ) ) {
+		if ($opened_local) {
+			close $localFh;
+		}
+		elsif ( defined $saved_pos && $saved_pos >= 0 ) {
+			seek( $localFh, $saved_pos, SEEK_SET );
+		}
+		return '';
+	}
+
+	my $to_read = $second_frame - $audio_offset;
+	my $n = read( $localFh, my $buffer, $to_read );
+
+	if ($opened_local) {
+		close $localFh;
+	}
+	elsif ( defined $saved_pos && $saved_pos >= 0 ) {
+		seek( $localFh, $saved_pos, SEEK_SET );
+	}
+
+	return '' unless defined $n && $n == $to_read;
 
 	return $buffer;
 }
@@ -224,7 +307,7 @@ sub findFrameBoundaries {
 	}
 
 	if ( defined $time ) {
-		$offset = int($time * 1000);
+		$offset = $time <= 0 ? 0 : int($time * 1000);
 	}
 	elsif ( $offset > 0 ) {
 		# Use negative offset for byte-based seeking
@@ -251,13 +334,15 @@ sub scanBitrate {
 	local $ENV{AUDIO_SCAN_NO_ARTWORK} = 0;
 
 	# Scan the header for info/tags
-	seek $fh, 0, 0;
+	return unless defined $fh && seek( $fh, 0, SEEK_SET );
 
 	my $s = Audio::Scan->scan_fh( mp3 => $fh );
+	return unless ref $s eq 'HASH' && ref $s->{info} eq 'HASH';
 
 	my $info = $s->{info};
-	my $tags = $s->{tags};
+	my $tags = ref $s->{tags} eq 'HASH' ? $s->{tags} : {};
 
+	_strip_nuls_tags($tags);
 	$class->doTagMapping($tags);
 
 	if ( $tags->{TITLE} ) {
@@ -283,23 +368,27 @@ sub scanBitrate {
 
 		# Save artwork if found
 		if ( my $pic = $tags->{APIC} ) {
-			if ( ref $pic->[0] eq 'ARRAY' ) {
-				# multiple images, use image with lowest image_type value
-				$pic = ( sort { $a->[1] <=> $b->[1] } @{$pic} )[0];
+			if ( ref $pic eq 'ARRAY' && @{$pic} ) {
+				if ( ref $pic->[0] eq 'ARRAY' ) {
+					# multiple images, use image with lowest image_type value
+					my @valid = grep { ref $_ eq 'ARRAY' && defined $_->[1] && defined $_->[3] } @{$pic};
+					$pic = @valid ? ( sort { $a->[1] <=> $b->[1] } @valid )[0] : undef;
+				}
+				if ( ref $pic eq 'ARRAY' && defined $pic->[3] ) {
+					$track->cover( length( $pic->[3] ) );
+					$track->update;
+
+					my $data = {
+						image => $pic->[3],
+						type  => $pic->[0] || 'image/jpeg',
+					};
+
+					my $cache = Slim::Utils::Cache->new();
+					$cache->set( "cover_$url", $data, 86400 * 7 );
+
+					main::DEBUGLOG && $scannerlog->is_debug && $scannerlog->debug( 'Found embedded cover art, saving for ' . $track->url );
+				}
 			}
-
-			$track->cover( length( $pic->[3] ) );
-			$track->update;
-
-			my $data = {
-				image => $pic->[3],
-				type  => $pic->[0] || 'image/jpeg',
-			};
-
-			my $cache = Slim::Utils::Cache->new();
-			$cache->set( "cover_$url", $data, 86400 * 7 );
-
-			main::DEBUGLOG && $scannerlog->is_debug && $scannerlog->debug( 'Found embedded cover art, saving for ' . $track->url );
 		}
 	}
 
@@ -312,26 +401,31 @@ sub scanBitrate {
 
 sub doTagMapping {
 	my ( $class, $tags, $no_overwrite ) = @_;
+	return unless ref $tags eq 'HASH';
+
+	_strip_nuls_tags($tags);
+
+	my %mapping = %tagMapping;
 
 	# Bug 8001, remap TPE2 if user wants it to mean Album Artist
-	# XXX: move this out to another function, no need to call it on every tag scan
 	if ( $prefs->get('useTPE2AsAlbumArtist') ) {
-		$tagMapping{TPE2} = 'ALBUMARTIST';
+		$mapping{TPE2} = 'ALBUMARTIST';
 	}
 	else {
-		$tagMapping{TPE2} = 'BAND';
+		$mapping{TPE2} = 'BAND';
 	}
 
 	if ( $prefs->get('useTIT1AsWork') ) {
-		$tagMapping{TIT1} = 'WORK';
-		$tagMapping{GRP1} = 'GROUPING';
+		$mapping{TIT1} = 'WORK';
+		$mapping{GRP1} = 'GROUPING';
 	}
 	else {
-		$tagMapping{TIT1} = 'GROUPING';
-		delete $tagMapping{GRP1};
+		$mapping{TIT1} = 'GROUPING';
+		delete $mapping{GRP1};
 	}
 
-	while ( my ($old, $new) = each %tagMapping ) {
+	keys %mapping;
+	while ( my ($old, $new) = each %mapping ) {
 		if ( exists $tags->{$old} ) {
 			# Caller can set $no_overwrite if ID3 tags should not replace
 			# existing tags, i.e. FLAC tags
@@ -348,7 +442,7 @@ sub doTagMapping {
 	if ( exists $tags->{MUSICBRAINZ_ID} && ref $tags->{MUSICBRAINZ_ID} eq 'ARRAY' ) {
 		# Sometimes UFID might be swapped, check every element
 		for my $id ( @{ delete $tags->{MUSICBRAINZ_ID} } ) {
-			if ( length($id) == 36 ) {
+			if ( defined $id && length($id) == 36 ) {
 				$tags->{MUSICBRAINZ_ID} = $id;
 				last;
 			}
@@ -359,30 +453,35 @@ sub doTagMapping {
 	if ( !$tags->{REPLAYGAIN_TRACK_GAIN} ) {
 		# Pull out Relative Volume Adjustment information
 		if ( my $rvad = delete $tags->{RVAD} ) {
-			# Assume right/left channels are the same
-			$tags->{REPLAYGAIN_TRACK_GAIN} = $rvad->[0];
+			if ( ref $rvad eq 'ARRAY' ) {
+				# Assume right/left channels are the same
+				$tags->{REPLAYGAIN_TRACK_GAIN} = $rvad->[0];
+			}
 		}
 		elsif ( my $rva2 = delete $tags->{RVA2} ) {
-			if ( ref $rva2->[0] eq 'ARRAY' ) {
-				# Multiple RVA2 tags, they look like this:
-				# RVA2 => [
-				#	 ["track", 1, "-7.478516 dB", "1.172028 dB"],
-				#	 ["album", 1, "-7.109375 dB", "1.258026 dB"],
-				#  ],
-				for my $rva ( @{$rva2} ) {
-					if ( lc( $rva->[0] ) eq 'track' ) {
-						$tags->{REPLAYGAIN_TRACK_GAIN} = $rva->[2];
-						$tags->{REPLAYGAIN_TRACK_PEAK} = $rva->[3];
-					}
-					elsif ( lc( $rva->[0] ) eq 'album' ) {
-						$tags->{REPLAYGAIN_ALBUM_GAIN} = $rva->[2];
-						$tags->{REPLAYGAIN_ALBUM_PEAK} = $rva->[3];
+			if ( ref $rva2 eq 'ARRAY' && @{$rva2} ) {
+				if ( ref $rva2->[0] eq 'ARRAY' ) {
+					# Multiple RVA2 tags, they look like this:
+					# RVA2 => [
+					#	 ["track", 1, "-7.478516 dB", "1.172028 dB"],
+					#	 ["album", 1, "-7.109375 dB", "1.258026 dB"],
+					#  ],
+					for my $rva ( @{$rva2} ) {
+						next unless ref $rva eq 'ARRAY' && defined $rva->[0];
+						if ( lc( $rva->[0] ) eq 'track' ) {
+							$tags->{REPLAYGAIN_TRACK_GAIN} = $rva->[2];
+							$tags->{REPLAYGAIN_TRACK_PEAK} = $rva->[3];
+						}
+						elsif ( lc( $rva->[0] ) eq 'album' ) {
+							$tags->{REPLAYGAIN_ALBUM_GAIN} = $rva->[2];
+							$tags->{REPLAYGAIN_ALBUM_PEAK} = $rva->[3];
+						}
 					}
 				}
-			}
-			else {
-				$tags->{REPLAYGAIN_TRACK_GAIN} = $rva2->[2];
-				$tags->{REPLAYGAIN_TRACK_PEAK} = $rva2->[3];
+				else {
+					$tags->{REPLAYGAIN_TRACK_GAIN} = $rva2->[2];
+					$tags->{REPLAYGAIN_TRACK_PEAK} = $rva2->[3];
+				}
 			}
 		}
 
@@ -394,7 +493,7 @@ sub doTagMapping {
 
 		# Sometimes iTunNORM is not in a comment tag
 		if ( $tags->{ITUNNORM} ) {
-			$tags->{COMMENT} ||= [];
+			$tags->{COMMENT} = [] unless ref $tags->{COMMENT} eq 'ARRAY';
 			push @{ $tags->{COMMENT} }, [ 'eng', 'iTunNORM', delete $tags->{ITUNNORM} ];
 		}
 
@@ -433,23 +532,28 @@ sub doTagMapping {
 	if ( $tags->{COMMENT} && ref $tags->{COMMENT} eq 'ARRAY' ) {
 		my $fixed = [];
 
-		if ( ref $tags->{COMMENT}->[0] eq 'ARRAY' ) {
-			for my $comment ( @{ $tags->{COMMENT} } ) {
-				if ( $comment->[1] ) {
-					# Comment has a description
-					push @{$fixed}, $comment->[1] . ': ' . $comment->[2];
+		if ( @{ $tags->{COMMENT} } ) {
+			if ( ref $tags->{COMMENT}->[0] eq 'ARRAY' ) {
+				for my $comment ( @{ $tags->{COMMENT} } ) {
+					next unless ref $comment eq 'ARRAY';
+					my $text = defined $comment->[2] ? $comment->[2] : '';
+					if ( defined $comment->[1] && length $comment->[1] ) {
+						# Comment has a description
+						push @{$fixed}, $comment->[1] . ': ' . $text;
+					}
+					elsif ( defined $comment->[2] ) {
+						push @{$fixed}, $text;
+					}
 				}
-				else {
-					push @{$fixed}, $comment->[2];
-				}
-			}
-		}
-		else {
-			if ( $tags->{COMMENT}->[1] ) {
-				push @{$fixed}, $tags->{COMMENT}->[1] . ': ' . $tags->{COMMENT}->[2];
 			}
 			else {
-				push @{$fixed}, $tags->{COMMENT}->[2];
+				my $text = defined $tags->{COMMENT}->[2] ? $tags->{COMMENT}->[2] : '';
+				if ( defined $tags->{COMMENT}->[1] && length $tags->{COMMENT}->[1] ) {
+					push @{$fixed}, $tags->{COMMENT}->[1] . ': ' . $text;
+				}
+				elsif ( defined $tags->{COMMENT}->[2] ) {
+					push @{$fixed}, $text;
+				}
 			}
 		}
 
@@ -458,22 +562,38 @@ sub doTagMapping {
 
 	# Clean up lyrics
 	if ( $tags->{LYRICS} && ref $tags->{LYRICS} eq 'ARRAY' ) {
-		$tags->{LYRICS} = $tags->{LYRICS}->[2];
+		if ( @{ $tags->{LYRICS} } ) {
+			if ( ref $tags->{LYRICS}->[0] eq 'ARRAY' ) {
+				$tags->{LYRICS} = $tags->{LYRICS}->[0]->[2];
+			}
+			else {
+				$tags->{LYRICS} = $tags->{LYRICS}->[2];
+			}
+		}
+		else {
+			$tags->{LYRICS} = undef;
+		}
 	}
 
 	# Flag if we have embedded cover art
 	if ( my $pic = $tags->{APIC} ) {
-		if ( ref $pic->[0] eq 'ARRAY' ) {
-			# multiple images, use image with lowest image_type value
-			# In 'no artwork' mode, ARTWORK is the length
-			$tags->{COVER_LENGTH} = $ENV{AUDIO_SCAN_NO_ARTWORK}
-				? ( sort { $a->[1] <=> $b->[1] } @{$pic} )[0]->[3]
-				: length( ( sort { $a->[1] <=> $b->[1] } @{$pic} )[0]->[3] );
-		}
-		else {
-			$tags->{COVER_LENGTH} = $ENV{AUDIO_SCAN_NO_ARTWORK}
-				? $pic->[3]
-				: length( $pic->[3] );
+		if ( ref $pic eq 'ARRAY' && @{$pic} ) {
+			if ( ref $pic->[0] eq 'ARRAY' ) {
+				# multiple images, use image with lowest image_type value
+				# In 'no artwork' mode, ARTWORK is the length
+				my @valid = grep { ref $_ eq 'ARRAY' && defined $_->[1] && defined $_->[3] } @{$pic};
+				if ( @valid ) {
+					my $best = ( sort { $a->[1] <=> $b->[1] } @valid )[0];
+					$tags->{COVER_LENGTH} = $ENV{AUDIO_SCAN_NO_ARTWORK}
+						? $best->[3]
+						: length( $best->[3] );
+				}
+			}
+			elsif ( defined $pic->[3] ) {
+				$tags->{COVER_LENGTH} = $ENV{AUDIO_SCAN_NO_ARTWORK}
+					? $pic->[3]
+					: length( $pic->[3] );
+			}
 		}
 	}
 }

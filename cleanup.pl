@@ -1,4 +1,4 @@
-#!/usr/bin/env perl -ICPAN
+#!/usr/bin/env perl
 
 # Logitech Media Server Copyright 2001-2024 Logitech.
 # Lyrion Music Server Copyright 2024 Lyrion Community.
@@ -14,12 +14,18 @@
 
 require 5.010;
 
+use FindBin qw($RealBin);
+use File::Spec ();
+use lib $RealBin, File::Spec->catdir($RealBin, 'CPAN');
+
 use Config;
 use constant ISWINDOWS    => ( $^O =~ /^m?s?win/i ) ? 1 : 0;
 use constant ISMAC        => ( $^O =~ /darwin/i ) ? 1 : 0;
 use constant ISACTIVEPERL => 0;
 
 use strict;
+use Errno ();
+use Fcntl ();
 use Socket;
 use utf8;
 
@@ -38,6 +44,8 @@ use constant LOCALFILE    => 0;
 use constant NOMYSB       => 1;
 
 # load these later, don't need them right now
+require Cwd;
+require File::Basename;
 require File::Path;
 require File::Spec::Functions;
 require Getopt::Long;
@@ -52,28 +60,38 @@ if (DEBUG && $@) {
 }
 
 my ($os);
+my $folderListErrors = 0;
+
+our $prefsdir;
 
 sub main {
+	my ($all, $cache, $filecache, $database, $prefs, $logs, $dryrun);
+
+	if ( !Getopt::Long::GetOptions(
+		'all'        => \$all,
+		'cache'      => \$cache,
+		'filecache'  => \$filecache,
+		'prefs'      => \$prefs,
+		'prefsdir=s' => \$prefsdir,
+		'logs'       => \$logs,
+		'database'   => \$database,
+		'dryrun'     => \$dryrun,
+	) ) {
+		usage();
+		exit 1;
+	}
+
+	unshift @ARGV, ('--prefsdir', $prefsdir) if defined $prefsdir && $prefsdir ne '';
+
 	Slim::Utils::OSDetect::init();
 	$os = Slim::Utils::OSDetect->getOS();
 
 	if (checkForSC()) {
 		print sprintf("\n%s\n\n", Slim::Utils::Light::string('CLEANUP_PLEASE_STOP_SC'));
-		exit;
+		exit 1;
 	}
 
-	my ($all, $cache, $filecache, $database, $prefs, $logs, $dryrun);
-
-	Getopt::Long::GetOptions(
-		'all'       => \$all,
-		'cache'     => \$cache,
-		'filecache' => \$filecache,
-		'prefs'     => \$prefs,
-		'logs'      => \$logs,
-		'database'  => \$database,
-		'dryrun'    => \$dryrun,
-	);
-
+	$folderListErrors = 0;
 	my $folders = getFolderList({
 		'all'       => $all,
 		'cache'     => $cache,
@@ -85,10 +103,16 @@ sub main {
 
 	unless (scalar @$folders) {
 		usage();
-		exit;
+		exit($folderListErrors ? 1 : 0);
 	}
 
-	cleanup($folders, $dryrun);
+	my $errors = cleanup($folders, $dryrun);
+	$errors += $folderListErrors;
+
+	if ($errors) {
+		warn "Cleanup completed with $errors error(s).\n";
+		exit 1;
+	}
 
 	print sprintf("\n%s\n\n", Slim::Utils::Light::string('CLEANUP_PLEASE_RESTART_SC'));
 }
@@ -124,15 +148,134 @@ EOF
 	);
 }
 
+sub _homeDirs {
+	my @homes;
+	for my $var (qw(HOME USERPROFILE)) {
+		push @homes, $ENV{$var} if defined $ENV{$var} && $ENV{$var} !~ /^\s*$/;
+	}
+	if (!ISWINDOWS) {
+		my $pw_dir = eval { (getpwuid($<))[7] };
+		push @homes, $pw_dir if defined $pw_dir && $pw_dir !~ /^\s*$/;
+	}
+
+	my %seen;
+	my @resolved;
+	for my $h (@homes) {
+		my $norm = File::Spec::Functions::canonpath($h);
+		my $real = (-e $norm) ? eval { Cwd::realpath($norm) } : undef;
+		for my $cand ($norm, $real) {
+			next unless defined $cand && $cand !~ /^\s*$/;
+			$cand =~ s{\\}{/}g if ISWINDOWS;
+			$cand =~ s{/+$}{} if length($cand) > 1;
+			my $key = ISWINDOWS ? lc($cand) : $cand;
+			push @resolved, $cand unless $seen{$key}++;
+		}
+	}
+	return @resolved;
+}
+
+sub _isRootOrHome {
+	my ($path) = @_;
+	return 1 if !defined $path || $path =~ /^\s*$/;
+
+	my $norm = File::Spec::Functions::canonpath($path);
+	return 1 if !defined $norm || $norm =~ /^\s*$/;
+
+	my $cmp = $norm;
+	$cmp =~ s{\\}{/}g if ISWINDOWS;
+
+	# Refuse filesystem root (/, //, C:/, C:\, \\server\share)
+	return 1 if $cmp =~ m{^/+$};
+	return 1 if $cmp =~ m{^[A-Za-z]:/*$};
+	return 1 if $cmp =~ m{^//[^/]+(?:/[^/]+)?/*$};
+	return 1 if File::Basename::dirname($norm) eq $norm;
+
+	my $cmp_trimmed = $cmp;
+	$cmp_trimmed =~ s{/+$}{} if length($cmp_trimmed) > 1;
+
+	for my $home (_homeDirs()) {
+		if (ISWINDOWS) {
+			return 1 if lc($cmp_trimmed) eq lc($home);
+		} else {
+			return 1 if $cmp_trimmed eq $home;
+		}
+	}
+
+	return 0;
+}
+
+sub _allowedCleanupRoots {
+	my @candidates;
+	push @candidates, Slim::Utils::Light::getPref('cachedir');
+	for my $key (qw(cache prefs oldprefs log)) {
+		push @candidates, $os->dirsFor($key) if $os;
+	}
+
+	my %seen;
+	my @roots;
+	for my $dir (@candidates) {
+		next if !defined $dir || $dir =~ /^\s*$/;
+		next if -l $dir;
+		next if _isRootOrHome($dir);
+		next unless -e $dir;
+
+		my $real = Cwd::realpath($dir);
+		next unless defined $real;
+		next if _isRootOrHome($real);
+
+		my $key = $real;
+		$key =~ s{\\}{/}g if ISWINDOWS;
+		$key =~ s{/+$}{};
+		$key = lc($key) if ISWINDOWS;
+		next if $seen{$key}++;
+
+		push @roots, $real;
+	}
+	return \@roots;
+}
+
+sub _isInsideAllowedRoots {
+	my ($real_target, $allowed_roots) = @_;
+	return 0 unless defined $real_target && $allowed_roots && @$allowed_roots;
+
+	my $t = $real_target;
+	$t =~ s{\\}{/}g if ISWINDOWS;
+	$t =~ s{/+$}{};
+
+	for my $root (@$allowed_roots) {
+		my $r = $root;
+		$r =~ s{\\}{/}g if ISWINDOWS;
+		$r =~ s{/+$}{};
+		next unless length $r;
+
+		if (ISWINDOWS) {
+			return 1 if lc($t) eq lc($r) || index(lc($t), lc("$r/")) == 0;
+		} else {
+			return 1 if $t eq $r || index($t, "$r/") == 0;
+		}
+	}
+	return 0;
+}
+
 sub getFolderList {
 	my $args = shift;
 
 	my @folders;
 	my $cacheFolder = Slim::Utils::Light::getPref('cachedir') || $os->dirsFor('cache');
+	my $cacheNeeded = ($args->{all} || $args->{prefs} || $args->{cache} || $args->{filecache} || $args->{logs} || $args->{database});
+	my $cacheSafe   = 1;
+
+	if ($cacheNeeded) {
+		if (!defined $cacheFolder || $cacheFolder =~ /^\s*$/ || -l $cacheFolder || _isRootOrHome($cacheFolder)) {
+			warn "Refusing unsafe cache directory target: " . (defined $cacheFolder ? $cacheFolder : '<undef>') . "\n";
+			$folderListErrors++;
+			$cacheSafe = 0;
+		}
+	}
 
 	push @folders, _target('cache', 'cache') if ($args->{all} || $args->{cache});
 
-	if ($args->{all} || $args->{prefs} || $args->{cache} || $args->{filecache} || $args->{logs} || $args->{database}) {
+	if ($cacheSafe && $cacheNeeded) {
 		push @folders, {
 			label   => 'some legacy files',
 			folders => [
@@ -154,7 +297,7 @@ sub getFolderList {
 		};
 	}
 
-	if ($args->{filecache}) {
+	if ($cacheSafe && $args->{filecache}) {
 		push @folders, {
 			label   => 'file cache (artwork, templates etc.)',
 			folders => [
@@ -186,7 +329,7 @@ sub getFolderList {
 		};
 	}
 
-	if ($args->{database}) {
+	if ($cacheSafe && $args->{database}) {
 		push @folders, {
 			label   => 'Musiclibrary data',
 			folders => [
@@ -218,6 +361,14 @@ sub _target {
 	my ($value, $label) = @_;
 
 	my $f = $os->dirsFor($value);
+	if (!defined $f || $f =~ /^\s*$/ || -l $f || _isRootOrHome($f)) {
+		warn "Refusing unsafe $label cleanup target: " . (defined $f ? $f : '<undef>') . "\n";
+		$folderListErrors++;
+		return {
+			label   => $label,
+			folders => [],
+		};
+	}
 
 	return {
 		label   => $label,
@@ -273,15 +424,122 @@ sub options {
 }
 
 sub checkForSC {
+	# 1. Check SlimProto TCP port on localhost
 	my $iaddr = inet_aton('127.0.0.1');
-	my $paddr = sockaddr_in(3483, $iaddr);
+	if ($iaddr) {
+		my $paddr = sockaddr_in(3483, $iaddr);
+		my $proto = getprotobyname('tcp');
+		$proto = eval { Socket::IPPROTO_TCP() } // 6 unless defined $proto;
 
-	socket(SSERVER, PF_INET, SOCK_STREAM, getprotobyname('tcp'));
+		my $sock;
+		if (socket($sock, PF_INET, SOCK_STREAM, $proto)) {
+			if (connect($sock, $paddr)) {
+				close($sock);
+				return 1;
+			}
+			close($sock);
+		} else {
+			warn "Warning: socket() failed checking server port 3483: $!\n";
+		}
+	}
 
-	if (connect(SSERVER, $paddr)) {
+	# 2. Check server/scanner PID files and Unix socket locks
+	my @check_dirs;
+	my $cacheFolder = Slim::Utils::Light::getPref('cachedir') || ($os ? $os->dirsFor('cache') : undef);
+	push @check_dirs, $cacheFolder if defined $cacheFolder;
+	if ($os) {
+		for my $key (qw(cache prefs log)) {
+			my $d = $os->dirsFor($key);
+			push @check_dirs, $d if defined $d;
+		}
+	}
+	push @check_dirs, (
+		'/var/run/lyrionmusicserver',
+		'/var/run/squeezeboxserver',
+		'/run/lyrionmusicserver',
+		'/run/squeezeboxserver',
+	);
 
-		close(SSERVER);
-		return 1;
+	my %seen_dir;
+	my @pid_names = qw(
+		slimserver.pid
+		squeezecenter.pid
+		squeezeboxserver.pid
+		lyrionmusicserver.pid
+		server.pid
+		scanner.pid
+		slimserver-scanner.pid
+		squeezecenter-mysql.pid
+	);
+
+	for my $dir (@check_dirs) {
+		next unless defined $dir && $dir !~ /^\s*$/ && -d $dir && !-l $dir;
+		next if $seen_dir{$dir}++;
+
+		for my $name (@pid_names) {
+			my $pid_path = File::Spec::Functions::catfile($dir, $name);
+			next unless -f $pid_path && !-l $pid_path;
+			if (open my $fh, '<', $pid_path) {
+				my $pid = <$fh>;
+				close $fh;
+				if (defined $pid && $pid =~ /^\s*(\d+)\s*$/) {
+					my $num_pid = $1;
+					return 1 if $num_pid > 0 && $num_pid != $$ && (kill(0, $num_pid) || $!{EPERM});
+				}
+			}
+		}
+
+		my $lock_path = File::Spec::Functions::catfile($dir, 'scanner.lock');
+		if (-f $lock_path && !-l $lock_path) {
+			my $mode = ISWINDOWS ? '+<' : '<';
+			if (open my $lfh, $mode, $lock_path) {
+				if (!flock($lfh, Fcntl::LOCK_EX() | Fcntl::LOCK_NB())) {
+					if ($!{EWOULDBLOCK} || $!{EAGAIN}) {
+						close $lfh;
+						return 1;
+					}
+				} else {
+					flock($lfh, Fcntl::LOCK_UN());
+				}
+				close $lfh;
+			}
+		}
+
+		if (!ISWINDOWS) {
+			my $sock_path = File::Spec::Functions::catfile($dir, 'squeezecenter-mysql.sock');
+			if (-S $sock_path && !-l $sock_path) {
+				my $usock;
+				if (socket($usock, PF_UNIX, SOCK_STREAM, 0)) {
+					if (connect($usock, sockaddr_un($sock_path))) {
+						close($usock);
+						return 1;
+					}
+					close($usock);
+				} else {
+					warn "Warning: Unix socket() failed checking '$sock_path': $!\n";
+				}
+			}
+		}
+	}
+
+	# 3. Check live scanner / server processes on /proc-based systems
+	if (!ISWINDOWS && -d '/proc' && opendir(my $dh, '/proc')) {
+		while (my $entry = readdir($dh)) {
+			next unless $entry =~ /^\d+$/;
+			next if $entry == $$;
+			my $cmdline_path = "/proc/$entry/cmdline";
+			next unless -r $cmdline_path;
+			if (open my $fh, '<:raw', $cmdline_path) {
+				local $/;
+				my $cmdline = <$fh>;
+				close $fh;
+				if (defined $cmdline && $cmdline =~ /(?:^|\0|\/)(?:(?:scanner|slimserver)\.pl|squeezeboxserver(?:-scanner)?|lyrionmusicserver(?:-scanner)?)(?:\0|$)/) {
+					closedir $dh;
+					return 1;
+				}
+			}
+		}
+		closedir $dh;
 	}
 
 	return 0;
@@ -289,26 +547,80 @@ sub checkForSC {
 
 sub cleanup {
 	my ($folders, $dryrun) = @_;
+	my $errors = 0;
+	my $allowed_roots = _allowedCleanupRoots();
 
 	for my $item (@$folders) {
 		print sprintf("\n%s %s...\n", Slim::Utils::Light::string('CLEANUP_DELETING'), $item->{label});
 
-		foreach ( @{$item->{folders}} ) {
-			next unless $_;
+		foreach my $target ( @{$item->{folders}} ) {
+			if (!defined $target || $target =~ /^\s*$/) {
+				warn "Refusing empty cleanup target.\n";
+				$errors++;
+				next;
+			}
 
-			print "-> $_\n" if -e $_;
+			if (_isRootOrHome($target)) {
+				warn "Refusing unsafe cleanup target '$target'.\n";
+				$errors++;
+				next;
+			}
+
+			if (-l $target) {
+				warn "Refusing symlink cleanup target '$target'.\n";
+				$errors++;
+				next;
+			}
+
+			next unless -e $target;
+
+			my $real_target = Cwd::realpath($target);
+			if (!defined $real_target || _isRootOrHome($real_target)) {
+				warn "Refusing unresolvable or unsafe cleanup target '$target'.\n";
+				$errors++;
+				next;
+			}
+
+			if (!_isInsideAllowedRoots($real_target, $allowed_roots)) {
+				warn "Refusing cleanup target outside allowed directories: '$target' (resolved: '$real_target').\n";
+				$errors++;
+				next;
+			}
+
+			print "-> $target\n";
 
 			next if $dryrun;
 
-			if (-d $_) {
-				File::Path::rmtree($_);
+			if (-d $real_target) {
+				my $rmtree_err;
+				eval { File::Path::rmtree($real_target, { error => \$rmtree_err }); };
+				if ($@) {
+					warn "Error removing directory '$real_target': $@\n";
+					$errors++;
+				}
+				if ($rmtree_err && @$rmtree_err) {
+					for my $diag (@$rmtree_err) {
+						my ($file, $message) = %$diag;
+						if ($file eq '') {
+							warn "Error removing directory '$real_target': $message\n";
+						} else {
+							warn "Error removing '$file': $message\n";
+						}
+					}
+					$errors++;
+				}
 			}
 
-			elsif (-f $_) {
-				unlink $_;
+			elsif (-f $real_target || -S $real_target) {
+				if (!unlink $real_target) {
+					warn "Error removing file '$real_target': $!\n";
+					$errors++;
+				}
 			}
 		}
 	}
+
+	return $errors;
 }
 
 main();
