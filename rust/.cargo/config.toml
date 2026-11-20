@@ -1,2 +1,5 @@
 # Use baseline portable CPU targets (no global target-cpu override) so x86_64
 # and aarch64 cross-compilation builds run cleanly without SIGILL.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

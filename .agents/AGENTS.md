@@ -4,6 +4,11 @@
 
 This document defines the multi-agent roles, responsibilities, and delegation structures for this environment.
 
+## Orchestrator Execution Contract (Invariants 33, 34 & 66)
+- **Real-Time Narration (Invariant 66)**: Emit a concise 1–2 sentence status update on every tool turn; silent tool chaining is forbidden.
+- **3-Operation Cap (Invariant 33)**: Max 3 non-exempt main-thread tool calls (`read_file`/`view_file`, `run_command`, grep/search, dir listings, probes, post-`/wakeup` discovery) per wave. Exempt: required `SKILL.md` reads, delegation/messaging (`invoke_subagent`, `send_message`, `schedule`, `manage_subagents`, `manage_task`), and artifact writes. Delegate Op 4+ via `invoke_subagent`.
+- **Micro-Subagent Delegation (Invariants 34 & 68)**: Delegate discovery (`Discovery Scout`), research (`Research Specialist`), CVE scans (`Reconnaissance Lookout`), and cleanups (`Cleanup Specialist`) to bounded micro-subagents (`<= 1–3 files`, `<= 4 tasks`, `<= 15 steps / 90s`, 60s timer).
+
 ## Standard Roles
 
 ### 1. Reconnaissance Lookout

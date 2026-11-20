@@ -1,0 +1,19 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro transitive dep of lofty 0.22.4, verified through upstream 0.25.5, zero CVEs, no upstream fix" },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[licenses.private]
+ignore = true

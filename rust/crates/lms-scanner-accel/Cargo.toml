@@ -2,6 +2,7 @@
 name = "lms-scanner-accel"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 lms-cache = { path = "../lms-cache" }
